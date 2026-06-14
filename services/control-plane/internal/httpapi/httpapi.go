@@ -138,6 +138,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/orgs/{org_id}/plugins/{plugin_id}", s.requireKindeSession(s.handleV1InstallPlugin))
 	mux.HandleFunc("DELETE /v1/orgs/{org_id}/plugins/{plugin_id}", s.requireKindeSession(s.handleV1UninstallPlugin))
 
+	// Federated plugin sources (desktop shell). Kinde-authenticated.
+	mux.HandleFunc("GET /v1/sources", s.requireKindeSession(s.handleListSources))
+	mux.HandleFunc("POST /v1/sources", s.requireKindeSession(s.handleAddSource))
+	mux.HandleFunc("DELETE /v1/sources", s.requireKindeSession(s.handleDeleteSource))
+
 	return mux
 }
 

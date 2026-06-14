@@ -40,6 +40,16 @@ pub struct AppConfig {
     /// Repo root — used to find the instance-bootstrap source (go run),
     /// lib-metrics, and the dev secret. Resolved from REPO_DIR or CWD/../..
     pub repo_dir: PathBuf,
+    /// Directory holding the data-plane definitions (postgres init SQL,
+    /// risingwave DDL + apply.sh). In a packaged app (and `tauri dev`) this is
+    /// the staged Tauri resource <resource_dir>/dataplane; it falls back to
+    /// <repo_dir>/dataplane for an unbundled source run.
+    pub dataplane_dir: PathBuf,
+    /// Directory holding bundled artifact tarballs (postgres/risingwave/grafana),
+    /// staged into the app at release-build time (<resource_dir>/artifacts). When
+    /// present, the data plane extracts these instead of downloading (fully
+    /// offline). None in dev / unbundled runs → the download path is used.
+    pub artifacts_dir: Option<PathBuf>,
     /// Per-platform grafana-server tarball URL (dl.grafana.com).
     pub grafana_download_url: String,
     /// Per-platform numbat CLI tarball URL (sharkdp/numbat releases).
@@ -71,6 +81,10 @@ impl AppConfig {
         // default, so a packaged build (no shell env) reads config.json while
         // `tauri dev` still overrides via the shell.
         let file = load_config_file(resource_dir);
+        let dataplane_dir = resolve_dataplane_dir(resource_dir, &repo_dir);
+        let artifacts_dir = resource_dir
+            .map(|rd| rd.join("artifacts"))
+            .filter(|p| p.exists());
         AppConfig {
             control_plane_url: pick("CONTROL_PLANE_URL", file.get("control_plane_url"), "http://localhost:18080"),
             kinde_domain: pick("KINDE_DOMAIN", file.get("kinde_domain"), "https://tickviewer.kinde.com"),
@@ -96,12 +110,13 @@ impl AppConfig {
                 &default_runtime_dir().to_string_lossy(),
             )),
             repo_dir,
+            dataplane_dir,
+            artifacts_dir,
             grafana_download_url: env_or("GRAFANA_DOWNLOAD_URL", default_grafana_url()),
             numbat_download_url: env_or("NUMBAT_DOWNLOAD_URL", default_numbat_url()),
-            local_data_plane: matches!(
-                env::var("LOCAL_DATA_PLANE").ok().as_deref(),
-                Some("1") | Some("true")
-            ),
+            // Fully-local desktop: the shell supervises the data plane by default.
+            // Resolves env LOCAL_DATA_PLANE > config.json local_data_plane > true.
+            local_data_plane: pick_bool("LOCAL_DATA_PLANE", file.get("local_data_plane"), true),
             risingwave_artifact_url: env_or("RISINGWAVE_ARTIFACT_URL", default_risingwave_artifact_url()),
             postgres_download_url: env_or("POSTGRES_DOWNLOAD_URL", default_postgres_url()),
             wsl_rootfs_url: env_or("WSL_ROOTFS_URL", default_wsl_rootfs_url()),
@@ -158,6 +173,42 @@ fn pick(env_key: &str, file_val: Option<&String>, default: &str) -> String {
         }
     }
     default.to_string()
+}
+
+/// pick_bool resolves a boolean setting: env var > config.json > default.
+/// Recognises 1/true/yes/on and 0/false/no/off (case-insensitive); an
+/// unrecognised value at a level is treated as unset and falls through.
+fn pick_bool(env_key: &str, file_val: Option<&String>, default: bool) -> bool {
+    if let Ok(v) = env::var(env_key) {
+        if let Some(b) = parse_bool(&v) {
+            return b;
+        }
+    }
+    if let Some(b) = file_val.and_then(|v| parse_bool(v)) {
+        return b;
+    }
+    default
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// resolve_dataplane_dir prefers the bundled Tauri resource
+/// (<resource_dir>/dataplane, present in a packaged app and in `tauri dev`),
+/// falling back to <repo_dir>/dataplane for an unbundled source run.
+fn resolve_dataplane_dir(resource_dir: Option<&std::path::Path>, repo_dir: &std::path::Path) -> PathBuf {
+    if let Some(rd) = resource_dir {
+        let p = rd.join("dataplane");
+        if p.exists() {
+            return p;
+        }
+    }
+    repo_dir.join("dataplane")
 }
 
 fn home_dir() -> PathBuf {

@@ -151,16 +151,28 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
 
 // --- Go services (control-plane, gateway, read-gateway) --------------------
 
-/// ensure_service resolves a pre-staged service binary. No fallback: in dev
-/// they are `go build`-staged into runtime_dir/services/<name>; production
-/// bundles/downloads them (a follow-up). Missing -> hard error.
-fn ensure_service(cfg: &AppConfig, name: &str) -> Result<PathBuf, String> {
-    let p = cfg.runtime_dir.join("services").join(name);
-    if p.exists() {
-        Ok(p)
-    } else {
-        Err(format!("service binary `{name}` missing at {} (dev: GOOS=darwin GOARCH=arm64 go build into runtime_dir/services/)", p.display()))
+/// ensure_service resolves a Go service binary bundled as a Tauri externalBin
+/// sidecar next to the app executable — the same mechanism as the compute
+/// sidecar (see compute::resolve_compute_bin), built + staged by
+/// `make dataplane-stage`. Tauri strips the `-<triple>` suffix when staging next
+/// to the app binary in a bundle; fall back to the suffixed name for unbundled
+/// dev layouts where the stager left it as `<name>-<triple>`.
+fn ensure_service(_cfg: &AppConfig, name: &str) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dir = exe.parent().ok_or("exe has no parent dir")?;
+    let plain = dir.join(name);
+    if plain.exists() {
+        return Ok(plain);
     }
+    let triple = env!("TARGET_TRIPLE");
+    let suffixed = dir.join(format!("{name}-{triple}"));
+    if suffixed.exists() {
+        return Ok(suffixed);
+    }
+    Err(format!(
+        "service binary `{name}` not found next to {} (looked for `{name}` and `{name}-{triple}`; run `make dataplane-stage`)",
+        exe.display(),
+    ))
 }
 
 fn spawn_control_plane(bin: &Path, cfg: &AppConfig) -> Result<Child, String> {
@@ -240,7 +252,7 @@ fn bootstrap_control_db<F: Fn(&str)>(pg: &PgPaths, cfg: &AppConfig, progress: &F
     }
     progress("Bootstrapping control_db…");
     psql_run(&psql, "postgres", &["-c", "CREATE DATABASE control_db;"])?;
-    let schema = cfg.repo_dir.join("dataplane/postgres/init/01-schema.sql");
+    let schema = cfg.dataplane_dir.join("postgres/init/01-schema.sql");
     psql_run(&psql, "control_db", &["-v", "ON_ERROR_STOP=1", "-f", &schema.to_string_lossy()])?;
     Ok(())
 }
@@ -262,9 +274,9 @@ fn psql_run(psql: &Path, db: &str, extra: &[&str]) -> Result<(), String> {
 /// source at the local postgres via CDC_PG_HOST.
 fn apply_rw_schema<F: Fn(&str)>(pg: &PgPaths, cfg: &AppConfig, progress: &F) -> Result<(), String> {
     progress("Applying RisingWave schema (local packaging)…");
-    let apply = cfg.repo_dir.join("dataplane/risingwave/apply.sh");
+    let apply = cfg.dataplane_dir.join("risingwave/apply.sh");
     if !apply.exists() {
-        return Err(format!("apply.sh missing at {} (dev needs the repo tree)", apply.display()));
+        return Err(format!("apply.sh missing at {} (run `make dataplane-stage`)", apply.display()));
     }
     let path = format!(
         "{}:{}",
@@ -312,14 +324,13 @@ fn ensure_risingwave<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<RwPat
     let marker = dest.join(".ready");
     let want = &cfg.risingwave_artifact_url;
     if fs::read_to_string(&marker).ok().as_deref().map(str::trim) != Some(want) {
-        progress("Downloading RisingWave (first launch only)…");
-        let tarball = runtime::download(want, &cfg.runtime_dir, "risingwave.tar.gz")?;
-        progress("Extracting RisingWave…");
+        let art = runtime::resolve_artifact(cfg.artifacts_dir.as_deref(), "risingwave.tar.gz", want, &cfg.runtime_dir)?;
+        progress(if art.owned { "Downloading RisingWave (first launch only)…" } else { "Unpacking bundled RisingWave…" });
         let staging = cfg.runtime_dir.join(".rw-staging");
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-        runtime::untar(&tarball, &staging)?;
-        let _ = fs::remove_file(&tarball);
+        runtime::untar(&art.path, &staging)?;
+        if art.owned { let _ = fs::remove_file(&art.path); }
         let inner = runtime::single_subdir(&staging)?;
         let _ = fs::remove_dir_all(&dest);
         fs::rename(&inner, &dest).map_err(|e| format!("place risingwave: {e}"))?;
@@ -379,14 +390,13 @@ fn ensure_postgres<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<PgPaths
     let marker = dest.join(".ready");
     let want = &cfg.postgres_download_url;
     if fs::read_to_string(&marker).ok().as_deref().map(str::trim) != Some(want) {
-        progress("Downloading PostgreSQL (first launch only)…");
-        let tarball = runtime::download(want, &cfg.runtime_dir, "postgres.tar.gz")?;
-        progress("Extracting PostgreSQL…");
+        let art = runtime::resolve_artifact(cfg.artifacts_dir.as_deref(), "postgres.tar.gz", want, &cfg.runtime_dir)?;
+        progress(if art.owned { "Downloading PostgreSQL (first launch only)…" } else { "Unpacking bundled PostgreSQL…" });
         let staging = cfg.runtime_dir.join(".pg-staging");
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-        runtime::untar(&tarball, &staging)?;
-        let _ = fs::remove_file(&tarball);
+        runtime::untar(&art.path, &staging)?;
+        if art.owned { let _ = fs::remove_file(&art.path); }
         // theseus tarballs may unpack flat (bin/ at root) or under one dir.
         let root = locate_pg_root(&staging)?;
         let _ = fs::remove_dir_all(&dest);

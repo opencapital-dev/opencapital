@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "CONTROL_PLANE_URL=http://localhost:18080 PLUGIN_GATEWAY_URL=http://localhost:8090 PLUGIN_READ_GATEWAY_URL=http://localhost:8095 PLUGIN_OTLP_ENDPOINT=http://localhost:4317 tauri",
+    "tauri": "tauri",
     "test": "vitest run",
     "clean:local": "rm -rf \"$HOME/.opencapital\" && for p in 5432 4566 18080 8090 8095 1420; do lsof -ti tcp:$p 2>/dev/null | xargs kill 2>/dev/null || true; done && echo 'clean:local done — removed ~/.opencapital and freed data-plane ports. Quit any running OpenCapital app/dev first.'"
   },

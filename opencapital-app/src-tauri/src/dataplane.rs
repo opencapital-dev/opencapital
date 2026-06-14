@@ -49,7 +49,11 @@ const CONTROL_DB_DSN: &str = "postgres://control_plane:control_plane_pw@127.0.0.
 const GATEWAY_REPLICA_DSN: &str = "postgres://postgres@127.0.0.1:5432/control_db?sslmode=disable";
 const RW_DSN: &str = "postgres://root@127.0.0.1:4566/dev?sslmode=disable";
 const CONTROL_PLANE_URL: &str = "http://127.0.0.1:18080";
-const LOCAL_TOKEN: &str = "localbootstrap";
+/// Operator/admin token for the locally-spawned control-plane. The shell passes
+/// this as ADMIN_BOOTSTRAP_TOKEN here and uses the SAME value as its
+/// bootstrap_token (see config::load) so the reconciler can mint instance tokens
+/// — no synced repo secret needed in the fully-local data plane.
+pub(crate) const LOCAL_TOKEN: &str = "localbootstrap";
 
 /// start brings the local data plane up on a background thread (so app boot is
 /// not blocked) when enabled. No-op otherwise. Emits `dataplane-*` events.
@@ -100,7 +104,7 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
 
     // 3. control-plane — auto-migrates control_db on boot (creates portfolios +
     //    the rw_v6_pub publication the RW CDC source needs).
-    let cp = ensure_service(cfg, "control-plane")?;
+    let cp = sidecar_bin("control-plane")?;
     {
         let c = cp.clone();
         *shared.cp_child.lock().unwrap() = Some(spawn_control_plane(&cp, cfg)?);
@@ -125,7 +129,7 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
     apply_rw_schema(&pg, cfg, &progress)?;
 
     // 6. gateway (SINK_MODE=rw — writes pgwire DML into RW).
-    let gw = ensure_service(cfg, "gateway")?;
+    let gw = sidecar_bin("gateway")?;
     {
         let c = gw.clone();
         *shared.gw_child.lock().unwrap() = Some(spawn_gateway(&gw, cfg)?);
@@ -136,7 +140,7 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
     }
 
     // 7. read-gateway (sole RW reader).
-    let rg = ensure_service(cfg, "read-gateway")?;
+    let rg = sidecar_bin("read-gateway")?;
     {
         let c = rg.clone();
         *shared.rg_child.lock().unwrap() = Some(spawn_read_gateway(&rg, cfg)?);
@@ -151,13 +155,14 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
 
 // --- Go services (control-plane, gateway, read-gateway) --------------------
 
-/// ensure_service resolves a Go service binary bundled as a Tauri externalBin
-/// sidecar next to the app executable — the same mechanism as the compute
-/// sidecar (see compute::resolve_compute_bin), built + staged by
-/// `make dataplane-stage`. Tauri strips the `-<triple>` suffix when staging next
-/// to the app binary in a bundle; fall back to the suffixed name for unbundled
-/// dev layouts where the stager left it as `<name>-<triple>`.
-fn ensure_service(_cfg: &AppConfig, name: &str) -> Result<PathBuf, String> {
+/// sidecar_bin resolves a Go binary bundled as a Tauri externalBin sidecar next
+/// to the app executable — the same mechanism as the compute sidecar (see
+/// compute::resolve_compute_bin), built + staged by `make dataplane-stage`.
+/// Tauri strips the `-<triple>` suffix when staging next to the app binary in a
+/// bundle; fall back to the suffixed name for unbundled layouts where the stager
+/// left it as `<name>-<triple>`. Shared by the data-plane services and the
+/// grafana reconciler (instance-bootstrap) so neither shells out to `go`.
+pub(crate) fn sidecar_bin(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = exe.parent().ok_or("exe has no parent dir")?;
     let plain = dir.join(name);
@@ -170,7 +175,7 @@ fn ensure_service(_cfg: &AppConfig, name: &str) -> Result<PathBuf, String> {
         return Ok(suffixed);
     }
     Err(format!(
-        "service binary `{name}` not found next to {} (looked for `{name}` and `{name}-{triple}`; run `make dataplane-stage`)",
+        "sidecar binary `{name}` not found next to {} (looked for `{name}` and `{name}-{triple}`; run `make dataplane-stage`)",
         exe.display(),
     ))
 }
@@ -180,8 +185,14 @@ fn spawn_control_plane(bin: &Path, cfg: &AppConfig) -> Result<Child, String> {
     // logs into, so /v1/me/orgs (the desktop login -> org flow) works.
     let domain = cfg.kinde_domain.trim_end_matches('/');
     let jwks = format!("{domain}/.well-known/jwks.json");
+    // Per-(plugin,org) plugin state dir. control-plane defaults to the system
+    // path /var/lib/plugins (root-owned, unwritable for a desktop app → install
+    // 500s); point it at the persistent shell base dir instead. control-plane
+    // MkdirAll's the subtree, so ~/.opencapital just needs to exist (it does).
+    let plugins_root = cfg.base_dir().join("plugins").to_string_lossy().into_owned();
     spawn_svc(bin, cfg, "control-plane.log", &[
         ("LISTEN_ADDR", ":18080"),
+        ("PLUGINS_ROOT", plugins_root.as_str()),
         ("CONTROL_DB_DSN", CONTROL_DB_DSN),
         ("IDP_STATIC_USERS", r#"[{"user_id":"admin","token":"localbootstrap"}]"#),
         ("ADMIN_BOOTSTRAP_TOKEN", LOCAL_TOKEN),
@@ -191,15 +202,9 @@ fn spawn_control_plane(bin: &Path, cfg: &AppConfig) -> Result<Child, String> {
         ("KINDE_AUDIENCE", cfg.kinde_audience.as_str()),
         // RW DSN: plugin install creates the per-(plugin,org) RW schema/role.
         ("RISINGWAVE_DSN", RW_DSN),
-        // GHCR plugin registry (matches the cloud control-plane). Plugins are
-        // PUBLIC, so anonymous pull — no REGISTRY_USERNAME/PASSWORD.
-        ("REGISTRY_INTERNAL_URL", "https://ghcr.io"),
-        ("REGISTRY_PUBLIC_URL", "https://ghcr.io"),
-        ("REGISTRY_NAMESPACE", "plugins"),
-        ("REGISTRY_STAGING_NAMESPACE", "plugins-staging"),
-        ("REGISTRY_OWNER", "opencapital-dev"),
-        // Marketplace catalog reads the validated set from the PUBLIC manifest
-        // (no GitHub token — anonymous blob pulls cover install).
+        // Catalog coords come from each per-plugin manifest; the local
+        // control-plane's staging janitor no-ops without creds. Only the
+        // curated marketplace list URL is needed.
         ("PLUGINS_MANIFEST_URL", "https://raw.githubusercontent.com/opencapital-dev/opencapital/main/plugins.json"),
     ])
 }
@@ -242,12 +247,14 @@ fn spawn_svc(bin: &Path, cfg: &AppConfig, log_name: &str, env: &[(&str, &str)]) 
 /// via the existence check). control-plane then auto-migrates it on boot.
 fn bootstrap_control_db<F: Fn(&str)>(pg: &PgPaths, cfg: &AppConfig, progress: &F) -> Result<(), String> {
     let psql = pg.bindir.join("psql");
-    let exists = Command::new(&psql)
-        .args(["-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "postgres", "-tAc",
-            "SELECT 1 FROM pg_database WHERE datname='control_db'"])
-        .output()
-        .map_err(|e| format!("psql exists check: {e}"))?;
-    if String::from_utf8_lossy(&exists.stdout).trim() == "1" {
+    // health_tcp(PG_PORT) only proved the port is open: postgres opens its
+    // listener BEFORE finishing crash recovery, during which it rejects every
+    // query with "the database system is starting up". Querying in that window
+    // made the existence check below see empty output (read as "absent") and the
+    // subsequent CREATE DATABASE fail with "already exists", aborting bring_up so
+    // control-plane never started. Wait for postgres to actually answer a query.
+    let exists = wait_control_db_exists(&psql, HEALTH_TIMEOUT)?;
+    if exists {
         return Ok(());
     }
     progress("Bootstrapping control_db…");
@@ -255,6 +262,33 @@ fn bootstrap_control_db<F: Fn(&str)>(pg: &PgPaths, cfg: &AppConfig, progress: &F
     let schema = cfg.dataplane_dir.join("postgres/init/01-schema.sql");
     psql_run(&psql, "control_db", &["-v", "ON_ERROR_STOP=1", "-f", &schema.to_string_lossy()])?;
     Ok(())
+}
+
+/// wait_control_db_exists polls postgres until it ACCEPTS a query (not just until
+/// the TCP port is open), then returns whether control_db exists. A failed psql
+/// invocation means postgres is still in recovery ("starting up") — retry until
+/// the deadline rather than misreading it as "database absent". Only a query
+/// that postgres actually answered is trusted, so the caller's CREATE DATABASE
+/// runs only when control_db is genuinely missing.
+fn wait_control_db_exists(psql: &Path, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::new(psql)
+            .args(["-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "postgres", "-tAc",
+                "SELECT 1 FROM pg_database WHERE datname='control_db'"])
+            .output()
+            .map_err(|e| format!("psql exists check: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).trim() == "1");
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "postgres not query-ready within {timeout:?}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn psql_run(psql: &Path, db: &str, extra: &[&str]) -> Result<(), String> {
@@ -324,13 +358,12 @@ fn ensure_risingwave<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<RwPat
     let marker = dest.join(".ready");
     let want = &cfg.risingwave_artifact_url;
     if fs::read_to_string(&marker).ok().as_deref().map(str::trim) != Some(want) {
-        let art = runtime::resolve_artifact(cfg.artifacts_dir.as_deref(), "risingwave.tar.gz", want, &cfg.runtime_dir)?;
-        progress(if art.owned { "Downloading RisingWave (first launch only)…" } else { "Unpacking bundled RisingWave…" });
+        let tarball = runtime::resolve_artifact(cfg.artifacts_dir.as_deref(), "risingwave.tar.gz")?;
+        progress("Unpacking bundled RisingWave…");
         let staging = cfg.runtime_dir.join(".rw-staging");
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-        runtime::untar(&art.path, &staging)?;
-        if art.owned { let _ = fs::remove_file(&art.path); }
+        runtime::untar(&tarball, &staging)?;
         let inner = runtime::single_subdir(&staging)?;
         let _ = fs::remove_dir_all(&dest);
         fs::rename(&inner, &dest).map_err(|e| format!("place risingwave: {e}"))?;
@@ -366,6 +399,11 @@ fn spawn_risingwave(p: &RwPaths, cfg: &AppConfig) -> Result<Child, String> {
     let err = log.try_clone().map_err(|e| format!("clone log: {e}"))?;
     Command::new(&p.bin)
         .arg("single-node")
+        // RisingWave's meta secret manager creates a secret dir relative to the
+        // working directory. A .app launched via `open` inherits CWD=/ (read-only
+        // on macOS), so RW panics with EROFS at boot. Run it from runtime_dir
+        // (writable, where RW lives) so its relative paths land there.
+        .current_dir(&cfg.runtime_dir)
         .env("PYTHONHOME", &p.python_home)
         .env("CONNECTOR_LIBS_PATH", &p.connector_libs)
         .env("RW_SINGLE_NODE_CONFIG_PATH", &p.config_path)
@@ -390,13 +428,12 @@ fn ensure_postgres<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<PgPaths
     let marker = dest.join(".ready");
     let want = &cfg.postgres_download_url;
     if fs::read_to_string(&marker).ok().as_deref().map(str::trim) != Some(want) {
-        let art = runtime::resolve_artifact(cfg.artifacts_dir.as_deref(), "postgres.tar.gz", want, &cfg.runtime_dir)?;
-        progress(if art.owned { "Downloading PostgreSQL (first launch only)…" } else { "Unpacking bundled PostgreSQL…" });
+        let tarball = runtime::resolve_artifact(cfg.artifacts_dir.as_deref(), "postgres.tar.gz")?;
+        progress("Unpacking bundled PostgreSQL…");
         let staging = cfg.runtime_dir.join(".pg-staging");
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-        runtime::untar(&art.path, &staging)?;
-        if art.owned { let _ = fs::remove_file(&art.path); }
+        runtime::untar(&tarball, &staging)?;
         // theseus tarballs may unpack flat (bin/ at root) or under one dir.
         let root = locate_pg_root(&staging)?;
         let _ = fs::remove_dir_all(&dest);

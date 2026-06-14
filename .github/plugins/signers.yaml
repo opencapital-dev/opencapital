@@ -1,0 +1,10 @@
+# signers.yaml -- trusted signer identities (cosign verify allowlist).
+# A staged artifact is promotable only if its cosign signature verifies AND
+# the signing identity matches an entry here.
+#
+# Cloud-only promotion: only first-party GitHub Actions signing identities.
+# Local Dex identities are NOT included — promotion requires a reviewed git
+# change (PR merge), which is a cloud-only path.
+signers:
+  - issuer: "https://token.actions.githubusercontent.com"
+    identity_regexp: "^https://github.com/opencapital-dev/.+/.github/workflows/.+@refs/tags/v.+$"

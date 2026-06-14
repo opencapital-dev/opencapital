@@ -123,16 +123,16 @@ func (s *Server) handleV1InstanceToken(w http.ResponseWriter, r *http.Request) {
 // --- GET /v1/marketplace/catalog?org_id=X -----------------------------------
 
 type marketplaceEntry struct {
-	PluginID               string               `json:"plugin_id"`
-	GrafanaSlug            string               `json:"grafana_slug"`
-	DisplayName            string               `json:"display_name"`
-	Description            string               `json:"description"`
-	Type                   string               `json:"type"`
-	Required               bool                 `json:"required"`
-	Installed              bool                 `json:"installed"`
-	InstalledAt            string               `json:"installed_at,omitempty"`
-	LatestValidatedVersion string               `json:"latest_validated_version,omitempty"`
-	Source                 registry.SourceInfo  `json:"source"`
+	PluginID               string              `json:"plugin_id"`
+	GrafanaSlug            string              `json:"grafana_slug"`
+	DisplayName            string              `json:"display_name"`
+	Description            string              `json:"description"`
+	Type                   string              `json:"type"`
+	Required               bool                `json:"required"`
+	Installed              bool                `json:"installed"`
+	InstalledAt            string              `json:"installed_at,omitempty"`
+	LatestValidatedVersion string              `json:"latest_validated_version,omitempty"`
+	Source                 registry.SourceInfo `json:"source"`
 }
 
 type marketplaceCatalogResponse struct {

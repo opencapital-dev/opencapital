@@ -19,6 +19,15 @@ func TestAddSourceRejectsEmpty(t *testing.T) {
 	}
 }
 
+func TestAddSourceRejectsNonHTTPURL(t *testing.T) {
+	s := &Server{cfg: config.Config{}, logger: slog.Default()}
+	rr := httptest.NewRecorder()
+	s.handleAddSource(rr, httptest.NewRequest(http.MethodPost, "/v1/sources", strings.NewReader(`{"manifest_url":"ftp://evil/x.json"}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("non-http(s) url: got %d, want 400", rr.Code)
+	}
+}
+
 func TestDeleteSourceRequiresURL(t *testing.T) {
 	s := &Server{cfg: config.Config{}, logger: slog.Default()}
 	rr := httptest.NewRecorder()

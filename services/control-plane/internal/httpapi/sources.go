@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/portfolio-management/control-plane/internal/manifest"
@@ -39,6 +40,10 @@ func (s *Server) handleAddSource(w http.ResponseWriter, r *http.Request) {
 	var req addSourceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ManifestURL == "" {
 		http.Error(w, "manifest_url required", http.StatusBadRequest)
+		return
+	}
+	if u, perr := url.Parse(req.ManifestURL); perr != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		http.Error(w, "manifest_url must be an http(s) URL", http.StatusBadRequest)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)

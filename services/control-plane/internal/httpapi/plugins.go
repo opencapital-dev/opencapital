@@ -23,12 +23,12 @@ import (
 // See ADR-0050 for the design.
 
 type catalogEntry struct {
-	PluginID    string              `json:"plugin_id"`
-	DisplayName string              `json:"display_name"`
-	Description string              `json:"description"`
-	Required    bool                `json:"required"`
-	Installed   bool                `json:"installed"`
-	InstalledAt string              `json:"installed_at,omitempty"`
+	PluginID    string `json:"plugin_id"`
+	DisplayName string `json:"display_name"`
+	Description string `json:"description"`
+	Required    bool   `json:"required"`
+	Installed   bool   `json:"installed"`
+	InstalledAt string `json:"installed_at,omitempty"`
 	// UninstallState surfaces an in-flight uninstall so the UI can
 	// disable controls until the worker finishes. Empty when the
 	// plugin isn't being uninstalled.

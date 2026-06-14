@@ -56,7 +56,10 @@ func (s *StagingClient) WithEnumerator(e RepoEnumerator) *StagingClient { s.enum
 
 // WithGHCRDelete wires the GitHub Packages REST deleter used by DeleteStagingTag.
 // Required when targeting GHCR (which does not support OCI manifest-DELETE).
-func (s *StagingClient) WithGHCRDelete(token string) *StagingClient { s.deleter = NewGHCRDeleter(token); return s }
+func (s *StagingClient) WithGHCRDelete(token string) *StagingClient {
+	s.deleter = NewGHCRDeleter(token)
+	return s
+}
 
 // CanPruneStaging reports whether the janitor has a delete capability wired. When
 // false, the janitor still computes + logs its prune decisions but performs no deletes.

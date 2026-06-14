@@ -771,8 +771,3 @@ func (s *Store) DeletePluginSource(ctx context.Context, url string) (bool, error
 	}
 	return tag.RowsAffected() > 0, nil
 }
-
-func (s *Store) UpdateSourcePublisher(ctx context.Context, url, publisher string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE plugin_sources SET publisher = $2 WHERE manifest_url = $1`, url, publisher)
-	return err
-}

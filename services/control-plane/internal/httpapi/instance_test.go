@@ -22,9 +22,9 @@ func (stubProvider) Plugins(context.Context) ([]*registry.PluginRef, error) { re
 
 // TestInstanceListVersions_AuthGuard calls handleInstanceListVersions directly
 // (no HTTP server needed). It verifies:
-//  - no bearer → 401
-//  - wrong bearer → 401
-//  - correct bearer → not 401 (may be 503 because the registry is a stub)
+//   - no bearer → 401
+//   - wrong bearer → 401
+//   - correct bearer → not 401 (may be 503 because the registry is a stub)
 func TestInstanceListVersions_AuthGuard(t *testing.T) {
 	const token = "test-bootstrap-token"
 
@@ -35,8 +35,8 @@ func TestInstanceListVersions_AuthGuard(t *testing.T) {
 	reg := registry.NewCatalog(stubProvider{}, nil)
 
 	s := &Server{
-		cfg:    config.Config{AdminBootstrapToken: token},
-		logger: slog.Default(),
+		cfg:      config.Config{AdminBootstrapToken: token},
+		logger:   slog.Default(),
 		registry: reg,
 	}
 

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::config::AppConfig;
 
@@ -295,7 +295,18 @@ pub async fn marketplace_catalog(
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
+    catalog_req(cfg.inner(), session.inner(), &org_id).await
+}
+
+/// catalog_req fetches the marketplace catalog for an org (each entry carries
+/// plugin_id, required, installed). Reusable by the marketplace_catalog command
+/// and the launch-time selection reconcile.
+pub async fn catalog_req(
+    cfg: &AppConfig,
+    session: &Session,
+    org_id: &str,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(session)?;
     let resp = reqwest::Client::new()
         .get(format!("{}/v1/marketplace/catalog", cfg.control_plane_url))
         .query(&[("org_id", &org_id)])
@@ -306,16 +317,81 @@ pub async fn marketplace_catalog(
     read_json(resp, "/v1/marketplace/catalog").await
 }
 
-/// install_plugin installs one plugin for an org (idempotent). Version
-/// selection is local (set_plugin_pin); the control plane installs latest.
+/// list_sources returns the user-added plugin manifest URLs (GET /v1/sources).
+/// Global (not org-scoped); the official set is implicit in the catalog.
 #[tauri::command]
-pub async fn install_plugin(
-    org_id: String,
-    plugin_id: String,
+pub async fn list_sources(
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
     let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v1/sources", cfg.control_plane_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("call GET /v1/sources: {e}"))?;
+    read_json(resp, "GET /v1/sources").await
+}
+
+#[derive(serde::Serialize)]
+struct AddSourceRequest<'a> {
+    manifest_url: &'a str,
+}
+
+/// add_source validates + persists a user-added per-plugin manifest URL
+/// (POST /v1/sources). Surfaces the control-plane validation error (422) verbatim
+/// so the UI can show "manifest unreachable or invalid: …".
+#[tauri::command]
+pub async fn add_source(
+    manifest_url: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/sources", cfg.control_plane_url))
+        .bearer_auth(token)
+        .json(&AddSourceRequest { manifest_url: &manifest_url })
+        .send()
+        .await
+        .map_err(|e| format!("call POST /v1/sources: {e}"))?;
+    read_json(resp, "POST /v1/sources").await
+}
+
+/// remove_source deletes a user-added source (DELETE /v1/sources?manifest_url=…).
+#[tauri::command]
+pub async fn remove_source(
+    manifest_url: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<(), String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .delete(format!("{}/v1/sources", cfg.control_plane_url))
+        .query(&[("manifest_url", &manifest_url)])
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("call DELETE /v1/sources: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("DELETE /v1/sources {status}: {body}"));
+    }
+    Ok(())
+}
+
+/// install_req installs one plugin for an org (idempotent). The control plane
+/// installs the latest validated version; local version pins are honored by the
+/// reconciler, not here.
+pub async fn install_req(
+    cfg: &AppConfig,
+    session: &Session,
+    org_id: &str,
+    plugin_id: &str,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(session)?;
     let resp = reqwest::Client::new()
         .post(format!(
             "{}/v1/orgs/{}/plugins/{}",
@@ -326,6 +402,100 @@ pub async fn install_plugin(
         .await
         .map_err(|e| format!("install {plugin_id}: {e}"))?;
     read_json(resp, "install plugin").await
+}
+
+/// uninstall_req removes one (non-required) plugin from an org.
+pub async fn uninstall_req(
+    cfg: &AppConfig,
+    session: &Session,
+    org_id: &str,
+    plugin_id: &str,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(session)?;
+    let resp = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/orgs/{}/plugins/{}",
+            cfg.control_plane_url, org_id, plugin_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("uninstall {plugin_id}: {e}"))?;
+    read_json(resp, "uninstall plugin").await
+}
+
+/// reconcile_plugin_selection is the SINGLE install/uninstall/self-heal path,
+/// run at launch before the grafana reconcile. It makes the org's installed set
+/// equal `required ∪ local-selection`: required plugins are always installed
+/// (self-heals an org whose onboarding missed them), user-selected optionals are
+/// installed, and deselected optionals are uninstalled. The plugins view only
+/// edits the local selection; it never installs. A failed REQUIRED plugin is
+/// fatal; a failed optional is logged and skipped so one bad plugin can't block
+/// launch.
+pub async fn reconcile_plugin_selection(
+    app: &tauri::AppHandle,
+    cfg: &AppConfig,
+    session: &Session,
+    org_id: &str,
+) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    // marketplace_catalog returns { org_id, plugins: [...] }.
+    let catalog = catalog_req(cfg, session, org_id).await?;
+    let entries = catalog
+        .get("plugins")
+        .and_then(|v| v.as_array())
+        .ok_or("catalog: missing plugins array")?;
+
+    let mut catalog_ids = BTreeSet::new();
+    let mut required = BTreeSet::new();
+    let mut installed = BTreeSet::new();
+    for e in entries {
+        let Some(id) = e.get("plugin_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        catalog_ids.insert(id.to_string());
+        if e.get("required").and_then(|v| v.as_bool()).unwrap_or(false) {
+            required.insert(id.to_string());
+        }
+        if e.get("installed").and_then(|v| v.as_bool()).unwrap_or(false) {
+            installed.insert(id.to_string());
+        }
+    }
+
+    // First time we reconcile an org (no selection file yet), seed the selection
+    // from the optional plugins already installed — otherwise desired-state would
+    // uninstall plugins a user installed under the old immediate-install UI.
+    let base = cfg.base_dir();
+    if !crate::config::selection_exists_in(&base, org_id) {
+        let seed: Vec<String> = installed.difference(&required).cloned().collect();
+        crate::config::write_selection_in(&base, org_id, &seed)?;
+    }
+    let selection: BTreeSet<String> = crate::config::read_selection_in(&base, org_id)?
+        .into_iter()
+        .collect();
+    // Desired = required ∪ selection, restricted to plugins the catalog offers
+    // (a stale selection for a withdrawn plugin can't be installed).
+    let mut desired: BTreeSet<String> = required.union(&selection).cloned().collect();
+    desired.retain(|id| catalog_ids.contains(id));
+
+    for id in desired.difference(&installed) {
+        let _ = app.emit("reconcile-progress", format!("Installing plugin {id}…"));
+        if let Err(e) = install_req(cfg, session, org_id, id).await {
+            if required.contains(id) {
+                return Err(format!("install required plugin {id}: {e}"));
+            }
+            let _ = app.emit("reconcile-progress", format!("WARN: install {id} failed, skipping: {e}"));
+        }
+    }
+    // installed ⊆ catalog_ids, and required ⊆ desired, so this never uninstalls a
+    // required plugin.
+    for id in installed.difference(&desired) {
+        let _ = app.emit("reconcile-progress", format!("Uninstalling plugin {id}…"));
+        if let Err(e) = uninstall_req(cfg, session, org_id, id).await {
+            let _ = app.emit("reconcile-progress", format!("WARN: uninstall {id} failed: {e}"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -374,27 +544,49 @@ pub async fn plugin_versions(
         .collect()
 }
 
-/// uninstall_plugin removes one (non-required) plugin from an org. The
-/// control plane runs the teardown async; the shell re-reconciles on next
-/// launch to drop the symlink.
+/// get_plugin_selection returns the org's desired OPTIONAL plugins (the local
+/// selection the plugins view writes). Required plugins are always installed at
+/// launch regardless and are not part of this list.
 #[tauri::command]
-pub async fn uninstall_plugin(
+pub fn get_plugin_selection(
+    org_id: String,
+    cfg: State<'_, AppConfig>,
+) -> Result<Vec<String>, String> {
+    crate::config::read_selection_in(&cfg.base_dir(), &org_id)
+}
+
+/// seed_plugin_selection initializes an org's selection from the plugins already
+/// installed (passed by the caller) the FIRST time — i.e. only when no selection
+/// file exists yet. This migrates an org installed under the old immediate-install
+/// UI so the plugins view and launch agree that those plugins stay selected. A
+/// no-op once a selection exists (so a deliberately-empty selection is honored).
+/// Launch performs the same seed via config helpers; both go through
+/// selection_exists_in + write_selection_in, so the rule lives in one place.
+#[tauri::command]
+pub fn seed_plugin_selection(
+    org_id: String,
+    installed: Vec<String>,
+    cfg: State<'_, AppConfig>,
+) -> Result<(), String> {
+    let base = cfg.base_dir();
+    if !crate::config::selection_exists_in(&base, &org_id) {
+        crate::config::write_selection_in(&base, &org_id, &installed)?;
+    }
+    Ok(())
+}
+
+/// set_plugin_selection records whether the user wants `plugin_id` installed.
+/// This does NOT install — launch reconciles installed == required ∪ selection
+/// (see grafana::reconcile_plugin_selection). Selecting/deselecting takes effect
+/// on the next launch.
+#[tauri::command]
+pub fn set_plugin_selection(
     org_id: String,
     plugin_id: String,
+    selected: bool,
     cfg: State<'_, AppConfig>,
-    session: State<'_, Session>,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .delete(format!(
-            "{}/v1/orgs/{}/plugins/{}",
-            cfg.control_plane_url, org_id, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("uninstall {plugin_id}: {e}"))?;
-    read_json(resp, "uninstall plugin").await
+) -> Result<(), String> {
+    crate::config::set_selection_in(&cfg.base_dir(), &org_id, &plugin_id, selected)
 }
 
 /// get_show_preview returns the global preview-version toggle from shell settings.

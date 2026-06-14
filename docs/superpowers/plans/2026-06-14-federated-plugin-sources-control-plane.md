@@ -698,7 +698,66 @@ func (c *Client) ResolveArtifact(ctx context.Context, id, version, platform stri
 	}
 	return nil, false, nil
 }
+
+// Get returns one plugin at its latest version (highest validated, else highest
+// preview), reading from the appropriate namespace. found=false if the id is
+// unknown across all sources. Used by install/onboarding/instance resolution.
+func (c *Client) Get(ctx context.Context, id string) (Plugin, bool, error) {
+	ref, ok, err := c.findRef(ctx, id)
+	if err != nil || !ok {
+		return Plugin{}, false, err
+	}
+	version, ns, _ := pick(ref)
+	if version == "" {
+		return Plugin{}, false, nil
+	}
+	repo, err := ref.Reg.repo(ns, id, c.anonAuth)
+	if err != nil {
+		return Plugin{}, false, err
+	}
+	p, found, err := c.read(ctx, repo, ref, version)
+	if err != nil || !found {
+		return Plugin{}, found, err
+	}
+	p.Source = ref.sourceInfo()
+	return p, true, nil
+}
+
+// GetVersion returns footprint+platforms for an exact tag, trusted namespace
+// first then staging. found=false when the tag exists in neither.
+func (c *Client) GetVersion(ctx context.Context, id, tag string) (Plugin, bool, error) {
+	ref, ok, err := c.findRef(ctx, id)
+	if err != nil || !ok {
+		return Plugin{}, false, err
+	}
+	nss := []string{ref.Reg.Namespace}
+	if ref.Reg.StagingNamespace != "" {
+		nss = append(nss, ref.Reg.StagingNamespace)
+	}
+	for _, ns := range nss {
+		repo, err := ref.Reg.repo(ns, id, c.anonAuth)
+		if err != nil {
+			return Plugin{}, false, err
+		}
+		p, found, err := c.read(ctx, repo, ref, tag)
+		if err != nil {
+			return Plugin{}, false, err
+		}
+		if found {
+			p.Source = ref.sourceInfo()
+			return p, true, nil
+		}
+	}
+	return Plugin{}, false, nil
+}
 ```
+
+These preserve the `s.registry.Get`/`GetVersion` call sites in `plugins.go`
+(`resolvePluginVersion`, `handleInstallPlugin`), `instance.go`
+(`handleInstanceListPlugins`), `httpapi.go`, and `onboarding.go` — so `httpapi`
+keeps compiling unchanged. The OLD `Get`/`GetVersion` (registry.go `Client`
+methods reading `c.namespace`) are still deleted in Step 2; these are their
+provider-based replacements on the catalog `Client`.
 
 Add imports to `catalog.go`: `fmt`, `sort`, `ocispec "github.com/opencontainers/image-spec/specs-go/v1"` is not needed here (only via helpers). Ensure `fetchManifest`, `fetchFootprint`, `repoAbsent`, `normSemver`, `sortSemverDesc`, `platformAnnotation`, `Plugin`, `Artifact`, `VersionStatus` remain in `registry.go`/`semver.go`.
 

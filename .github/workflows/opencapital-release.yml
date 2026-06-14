@@ -25,10 +25,15 @@ jobs:
             # app = updater .app.tar.gz; dmg = installer for the landing-page download.
             # bundle_dmg.sh is flaky on headless runners, so the build step retries.
             bundle_args: "--bundles app,dmg"
+            # macOS bundles the offline data-plane artifacts (Postgres/RisingWave/
+            # Grafana tarballs) via the extra config — same as `make app`.
+            bundle_config: "--config src-tauri/tauri.bundle.conf.json"
           - os: windows-latest
             platform_key: windows-x86_64
             # NSIS only (the updater target); skip the unused MSI.
             bundle_args: "--bundles nsis"
+            # Windows runs the plane via the bundled WSL distro — no extra config.
+            bundle_config: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +55,14 @@ jobs:
           cache-dependency-path: opencapital-app/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # Go builds the 3 data-plane service sidecars (control-plane, gateway,
+      # read-gateway) on macOS — see `make dataplane-stage`. Windows runs the
+      # plane via the bundled WSL distro, so it needs no native Go build.
+      - uses: actions/setup-go@v5
+        if: runner.os == 'macOS'
+        with:
+          go-version: "1.26"
 
       # Caches ~/.cargo + the src-tauri target/ deps. The dominant build cost
       # (~4 min of crate compilation) drops to <1 min on a warm hit.
@@ -79,12 +92,15 @@ jobs:
         run: npm ci
 
       # --- compute sidecar (native per-platform; pyinstaller can't cross-compile) ---
-      - name: Compute build deps (venv)
+      # macOS uses the SAME make path as a local build: `make compute-sidecar-stage`
+      # creates .venv (compute-venv), freezes, and stages. Windows can't use that
+      # bash path (.venv/Scripts, compute.exe), so it builds the venv inline below.
+      - name: Compute build deps (venv) (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           python -m venv .venv
-          if [ "$RUNNER_OS" = "Windows" ]; then PY=.venv/Scripts/python; else PY=.venv/bin/python; fi
-          "$PY" -m pip install -r services/compute/freeze-requirements.txt
+          .venv/Scripts/python -m pip install -r services/compute/freeze-requirements.txt
 
       - name: Freeze + stage compute sidecar (macOS)
         if: runner.os == 'macOS'
@@ -100,6 +116,27 @@ jobs:
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 1; done
           test "$(curl -fsS http://127.0.0.1:8765/health)" = "ok"
           kill $pid
+
+      # Build the 3 Go service sidecars + stage the dataplane/ tree as a Tauri
+      # resource — the SAME `make` path as a local build. macOS only (Windows
+      # uses the WSL distro). Tauri picks these up via tauri.macos.conf.json.
+      - name: Stage data plane (Go sidecars + dataplane tree) (macOS)
+        if: runner.os == 'macOS'
+        run: make dataplane-stage
+
+      # Bundle the heavy data-plane artifacts (Postgres/RisingWave/Grafana) so the
+      # release .app is fully offline. Cached (~700MB) keyed on the pinned
+      # versions; bump the key when the URLs in the Makefile change. macOS only.
+      - name: Cache bundled artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: opencapital-app/src-tauri/resources/artifacts
+          key: artifacts-darwin-aarch64-pg17.10.0-rw2.8.0-grafana13.0.2
+
+      - name: Stage bundled artifacts (Postgres/RisingWave/Grafana) (macOS)
+        if: runner.os == 'macOS'
+        run: make artifacts-stage
 
       - name: Freeze + stage compute sidecar (Windows)
         if: runner.os == 'Windows'
@@ -118,6 +155,9 @@ jobs:
           path: _overlay
           key: overlay-${{ hashFiles('opencapital-app/grafana-overlay.pin') }}
 
+      # Behaviorally identical to `make grafana-overlay-pull` (the local build
+      # path); kept inline here for the actions/cache hit above and the
+      # Windows-tar workaround below.
       - name: Pull pinned Grafana overlay
         shell: bash
         env:
@@ -154,7 +194,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           n=0
-          until npx tauri build ${{ matrix.bundle_args }}; do
+          until npx tauri build ${{ matrix.bundle_config }} ${{ matrix.bundle_args }}; do
             n=$((n+1))
             [ "$n" -ge 3 ] && { echo "::error::tauri build failed after $n attempts"; exit 1; }
             echo "build attempt $n failed (likely flaky bundle_dmg.sh) — retrying"

@@ -59,14 +59,24 @@ fn ensure_grafana<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<PathBuf,
     if fs::read_to_string(&marker).ok().as_deref().map(str::trim) == Some(GRAFANA_VERSION) {
         return Ok(dest);
     }
-    progress(&format!("Downloading grafana-server {GRAFANA_VERSION} (first launch only)…"));
-    let tarball = download(&cfg.grafana_download_url, &cfg.runtime_dir, "grafana.tar.gz")?;
-    progress("Extracting grafana-server…");
+    let art = resolve_artifact(
+        cfg.artifacts_dir.as_deref(),
+        "grafana.tar.gz",
+        &cfg.grafana_download_url,
+        &cfg.runtime_dir,
+    )?;
+    progress(if art.owned {
+        "Downloading grafana-server (first launch only)…"
+    } else {
+        "Unpacking bundled grafana-server…"
+    });
     let staging = cfg.runtime_dir.join(".grafana-staging");
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-    untar(&tarball, &staging)?;
-    let _ = fs::remove_file(&tarball);
+    untar(&art.path, &staging)?;
+    if art.owned {
+        let _ = fs::remove_file(&art.path);
+    }
 
     // The tarball extracts to a single grafana-<ver> dir; move it to dest.
     let inner = single_subdir(&staging)?;
@@ -158,6 +168,34 @@ fn ensure_numbat<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<(PathBuf,
         return Err(format!("numbat binary missing at {}", bin.display()));
     }
     Ok((bin, modules))
+}
+
+/// An artifact tarball resolved either from the app bundle (offline) or a
+/// download. `owned` is true when we downloaded it into runtime_dir (caller
+/// should delete after extract); false for a read-only bundled resource.
+pub(crate) struct Artifact {
+    pub path: PathBuf,
+    pub owned: bool,
+}
+
+/// resolve_artifact prefers the bundled tarball `<artifacts_dir>/<name>` (staged
+/// into a release build so the app is fully offline) and falls back to
+/// downloading `url` into `runtime_dir`. Same artifact either way — the caller's
+/// extract + version-marker logic is unchanged.
+pub(crate) fn resolve_artifact(
+    artifacts_dir: Option<&Path>,
+    name: &str,
+    url: &str,
+    runtime_dir: &Path,
+) -> Result<Artifact, String> {
+    if let Some(dir) = artifacts_dir {
+        let bundled = dir.join(name);
+        if bundled.exists() {
+            return Ok(Artifact { path: bundled, owned: false });
+        }
+    }
+    let path = download(url, runtime_dir, name)?;
+    Ok(Artifact { path, owned: true })
 }
 
 /// download fetches url to dir/name (blocking) and returns the path.

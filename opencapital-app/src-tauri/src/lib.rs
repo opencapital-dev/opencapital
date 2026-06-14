@@ -37,14 +37,25 @@ fn kill_stray_compute() {
 /// data-plane children, which then hold the fixed ports 5432/4566).
 fn kill_stray_dataplane() {
     #[cfg(not(windows))]
-    for pat in [
-        "/.opencapital/runtime/risingwave/bin/risingwave",
-        "/.opencapital/runtime/postgres/bin/postgres",
-        "/.opencapital/runtime/services/control-plane",
-        "/.opencapital/runtime/services/gateway",
-        "/.opencapital/runtime/services/read-gateway",
-    ] {
-        let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
+    {
+        // Postgres + RisingWave still run from runtime_dir (downloaded artifacts).
+        for pat in [
+            "/.opencapital/runtime/risingwave/bin/risingwave",
+            "/.opencapital/runtime/postgres/bin/postgres",
+        ] {
+            let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
+        }
+        // Go service sidecars run next to the app exe (externalBin), named
+        // `<name>` in a bundle or `<name>-<triple>` in dev. Scope the match to
+        // this exe's dir so we only kill our own orphans, matching both layouts.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for name in ["control-plane", "gateway", "read-gateway"] {
+                    let pat = format!("{}/{}", dir.display(), name);
+                    let _ = std::process::Command::new("pkill").args(["-f", &pat]).status();
+                }
+            }
+        }
     }
     // Windows: the whole plane is one WSL distro — terminate it wholesale.
     #[cfg(windows)]

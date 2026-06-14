@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": [
+      "binaries/compute",
+      "binaries/control-plane",
+      "binaries/gateway",
+      "binaries/read-gateway"
+    ],
+    "resources": {
+      "resources/grafana-public": "grafana-public",
+      "resources/config.json": "config.json",
+      "resources/dataplane": "dataplane"
+    }
+  }
+}

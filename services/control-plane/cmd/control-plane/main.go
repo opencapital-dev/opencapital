@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/portfolio-management/control-plane/internal/migrate"
 	"github.com/portfolio-management/control-plane/internal/registry"
 	"github.com/portfolio-management/control-plane/internal/signing"
+	"github.com/portfolio-management/control-plane/internal/sources"
 	"github.com/portfolio-management/control-plane/internal/store"
 )
 
@@ -131,34 +133,25 @@ func main() {
 		logger.Info("GRAFANA_BASE_URL unset; /api/onboarding/* routes disabled")
 	}
 
-	reg := registry.New(
-		cfg.RegistryInternalURL, cfg.RegistryPublicURL, cfg.RegistryNamespace,
-		cfg.RegistryStagingNamespace,
-		registry.DefaultRequired,
-		os.Getenv("REGISTRY_USERNAME"), os.Getenv("REGISTRY_PASSWORD"),
-	)
-	// GHCR mode: when a GHCR token (REGISTRY_PASSWORD) + owner are set, enumerate
-	// and prune plugin packages via the GitHub Packages REST API (GHCR has no usable
-	// /v2/_catalog and no OCI manifest-DELETE).
+	if cfg.PluginsManifestURL == "" {
+		logger.Error("PLUGINS_MANIFEST_URL is required (curated marketplace list)")
+		os.Exit(1)
+	}
+	// Federated catalog: official list ∪ user-added DB rows → per-plugin
+	// manifests. One cached PluginClient per URL behind a small adapter.
+	listClient := manifest.NewListClient(cfg.PluginsManifestURL, nil, manifest.DefaultTTL, logger)
+	pf := &pluginFetcher{ttl: manifest.DefaultTTL, log: logger, clients: map[string]*manifest.PluginClient{}}
+	provider := sources.New(st, listClient, pf)
+	reg := registry.NewCatalog(provider, registry.DefaultRequired)
+	logger.Info("federated plugin catalog ready", "marketplace_list", cfg.PluginsManifestURL)
+
+	// Staging janitor client (publish/prune path; its own coords + creds).
+	staging := registry.NewStaging(cfg.RegistryInternalURL, cfg.RegistryNamespace,
+		cfg.RegistryStagingNamespace, os.Getenv("REGISTRY_USERNAME"), os.Getenv("REGISTRY_PASSWORD"))
 	if ghToken := os.Getenv("REGISTRY_PASSWORD"); ghToken != "" && cfg.RegistryOwner != "" {
-		reg = reg.WithEnumerator(registry.NewGHCREnumerator(ghToken)).WithGHCRDelete(ghToken)
-		logger.Info("registry enumeration via GitHub Packages REST", "owner", cfg.RegistryOwner)
+		staging = staging.WithEnumerator(registry.NewGHCREnumerator(ghToken)).WithGHCRDelete(ghToken)
+		logger.Info("staging janitor REST enumeration", "owner", cfg.RegistryOwner)
 	}
-	// Marketplace catalog source of truth. With PLUGINS_MANIFEST_URL set, the
-	// catalog reads the validated-version set from the PUBLIC manifest (GitHub
-	// Pages) instead of enumerating the trusted namespace via the GitHub
-	// Packages REST API. When unset we leave the manifest unwired, so List /
-	// VersionsWithStatus fall back to the legacy trusted-namespace enumeration
-	// (a misconfigured deploy serves a catalog, not a blank one).
-	if cfg.PluginsManifestURL != "" {
-		reg = reg.WithManifest(manifest.New(cfg.PluginsManifestURL, nil, manifest.DefaultTTL, logger))
-		logger.Info("marketplace catalog from public plugins manifest", "url", cfg.PluginsManifestURL)
-	} else {
-		logger.Warn("PLUGINS_MANIFEST_URL unset; marketplace catalog falls back to trusted-namespace enumeration")
-	}
-	logger.Info("plugin registry client ready",
-		"internal", cfg.RegistryInternalURL, "public", cfg.RegistryPublicURL,
-		"namespace", cfg.RegistryNamespace, "staging_namespace", cfg.RegistryStagingNamespace)
 
 	server := httpapi.New(cfg, keys, st, grafanaJWKS, kindeJWKS, installer, reg, grafanaClient, logger)
 	// Install the tombstone client closure NOW that Server exists. The
@@ -184,8 +177,8 @@ func main() {
 	// tags are retained forever (promotion now happens in CI). Delete via GHCR
 	// REST API when REGISTRY_PASSWORD is set; logs decisions but skips deletes
 	// otherwise. Bound to ctx; runs one sweep a bit after boot.
-	jan := janitor.New(reg, logger)
-	logger.Info("staging janitor ready", "delete_enabled", reg.CanPruneStaging())
+	jan := janitor.New(staging, logger)
+	logger.Info("staging janitor ready", "delete_enabled", staging.CanPruneStaging())
 	go jan.Run(ctx)
 
 	srv := &http.Server{
@@ -209,4 +202,24 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown", "err", err)
 	}
+}
+
+// pluginFetcher adapts per-URL manifest.PluginClient instances to
+// sources.PluginFetcher, reusing one cached client per URL.
+type pluginFetcher struct {
+	ttl     time.Duration
+	log     *slog.Logger
+	mu      sync.Mutex
+	clients map[string]*manifest.PluginClient
+}
+
+func (f *pluginFetcher) Fetch(ctx context.Context, url string) (*manifest.PluginManifest, error) {
+	f.mu.Lock()
+	c, ok := f.clients[url]
+	if !ok {
+		c = manifest.NewPluginClient(url, nil, f.ttl, f.log)
+		f.clients[url] = c
+	}
+	f.mu.Unlock()
+	return c.Fetch(ctx)
 }

@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+.eslintcache
+
+# Rust / Tauri
+target/
+
+# Build output
+dist/
+artifacts/
+!lib/pluginclient/artifacts/
+work/
+ci/
+services/compute/dist/
+
+# Logs / runtime
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+pids
+*.pid
+*.seed
+*.pid.lock
+coverage
+lib-cov
+
+# e2e test output
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# Local dev secrets (bootstrap token etc.). The directory is tracked via
+# .gitkeep so a fresh checkout has the path; contents are local-only.
+secrets/*
+!secrets/.gitkeep
+
+# Compiled instance-bootstrap binary — built on demand, never committed.
+lib/instance-bootstrap/instance-bootstrap
+
+# Editor / OS
+.idea
+.DS_Store
+
+# Claude / skill scratch (local tooling, not repo source).
+.claude/worktrees/
+.impeccable/
+
+# Compiled command binaries (built on demand from cmd/*).
+services/gateway/rekey-portfolio-events

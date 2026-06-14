@@ -1,0 +1,37 @@
+{
+  "name": "opencapital-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "CONTROL_PLANE_URL=http://localhost:18080 PLUGIN_GATEWAY_URL=http://localhost:8090 PLUGIN_READ_GATEWAY_URL=http://localhost:8095 PLUGIN_OTLP_ENDPOINT=http://localhost:4317 tauri",
+    "test": "vitest run",
+    "clean:local": "rm -rf \"$HOME/.opencapital\" && for p in 5432 4566 18080 8090 8095 1420; do lsof -ti tcp:$p 2>/dev/null | xargs kill 2>/dev/null || true; done && echo 'clean:local done — removed ~/.opencapital and freed data-plane ports. Quit any running OpenCapital app/dev first.'"
+  },
+  "dependencies": {
+    "@emotion/css": "^11.13.5",
+    "@grafana/data": "^12.3.0",
+    "@grafana/ui": "^12.3.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2",
+    "@tauri-apps/plugin-updater": "^2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "overrides": {
+    "react-data-grid": "7.0.0-beta.44"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^18.3.29",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4",
+    "vitest": "^4.1.8"
+  }
+}

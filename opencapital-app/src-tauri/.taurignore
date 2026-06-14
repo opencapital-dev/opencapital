@@ -1,0 +1,5 @@
+# Paths the `tauri dev` file watcher must NOT rebuild on. The shell writes
+# per-(plugin, org) platform tokens under secrets/<org_id>/ at runtime; without
+# this, every secret write retriggers a full rebuild -> app restart loop (which
+# also churns the local data plane).
+secrets/

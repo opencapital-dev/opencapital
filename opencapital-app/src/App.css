@@ -1,0 +1,44 @@
+/* Theme + global resets come from @grafana/ui <GlobalStyles /> plus the
+   <ThemeProvider> in main.tsx. Per-component styles live in getStyles (App.tsx). */
+
+/* The shell owns its own scroll regions, so the document itself never scrolls.
+   Without this the webview shows permanent (empty) page scrollbars. */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Thin, overlay-style scrollbars that only show while scrolling — the default
+   chunky webview scrollbars read as cheap. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(204, 204, 220, 0.2) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: rgba(204, 204, 220, 0.2);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(204, 204, 220, 0.35);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}

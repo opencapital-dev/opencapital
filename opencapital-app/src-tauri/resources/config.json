@@ -1,0 +1,11 @@
+{
+  "control_plane_url": "https://control-plane.opencapital.dev",
+  "gateway_url": "https://gateway.opencapital.dev",
+  "read_gateway_url": "https://read-gateway.opencapital.dev",
+  "otlp_endpoint": "https://otlp.opencapital.dev",
+  "risingwave_dsn": "",
+  "kinde_domain": "https://tickviewer.kinde.com",
+  "kinde_audience": "https://tickviewer.io/api",
+  "kinde_client_id": "729cbedc064a482b83f32c6971c3872e",
+  "kinde_redirect_uri": "http://localhost:3000"
+}

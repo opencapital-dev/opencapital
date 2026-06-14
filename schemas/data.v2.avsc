@@ -1,0 +1,37 @@
+{
+  "type": "record",
+  "name": "Data",
+  "namespace": "com.firm.data.v2",
+  "doc": "v6 unified external-observations envelope. Adds required org_id; all data is org-scoped in v6. Otherwise carries v1's envelope shape unchanged. Strict Avro on the envelope (the routing surface); payload remains a plugin-owned JSON string. See docs/v6/07-avro-v2-envelope.md and ADR-0037.",
+  "fields": [
+    {"name": "org_id", "type": "string",
+     "doc": "Server-injected org UUID. Verified by the gateway from the JWT claim; clients MUST NOT supply it. Becomes part of every downstream partition key. Non-null, non-empty. ADR-0033 + ADR-0038."},
+
+    {"name": "source_namespace", "type": "string",
+     "doc": "Plugin namespace claim, e.g. 'prices.quote', 'prices.ohlcv', 'polymarket', 'weather'. Indexed in RW (data.source_namespace column). Plugins declare ownership in their plugin.toml; convention is one producer per (namespace, source_id)."},
+
+    {"name": "source_id", "type": "string",
+     "doc": "Entity id within the namespace: 'AAPL' for prices, 'trump-2024' for Polymarket, 'NYC' for weather. Forms part of the upsert PK alongside namespace + observed_at."},
+
+    {"name": "observed_at", "type": {"type": "long", "logicalType": "timestamp-micros"},
+     "doc": "When the observation occurred in the world (not when we recorded it). Part of the upsert PK."},
+
+    {"name": "ingest_ts", "type": {"type": "long", "logicalType": "timestamp-micros"},
+     "doc": "When we recorded this version. Refreshed on every upsert. Gateway-stamped in v6. Late corrections refresh ingest_ts so downstream MVs see the new row."},
+
+    {"name": "source", "type": "string",
+     "doc": "Producer identifier (e.g. 'yfinance-ingestor@1.4.0', 'polymarket-ingestor@0.1.0'). Used for trace/audit."},
+
+    {"name": "plugin_id", "type": ["null", "string"], "default": null,
+     "doc": "v6 Phase 8: ID of the plugin that originated the write (e.g. 'yfinance-app'). Gateway-stamped from the validated session JWT's plugin_id claim; plugins cannot forge this. Used by the self-service uninstall path to scope tombstones. NULL for events published before this field was added. ADR-0050."},
+
+    {"name": "portfolio_id", "type": ["null", "string"], "default": null,
+     "doc": "Server-verified portfolio UUID this record is scoped to, or null for org-scoped data. When non-null the gateway verifies the portfolio belongs to the JWT's org before producing. Part of the upsert key so the same source_id under two portfolios is two distinct rows. Track 2c."},
+
+    {"name": "trace_id", "type": ["null", "string"], "default": null,
+     "doc": "OpenTelemetry trace id."},
+
+    {"name": "payload", "type": "string",
+     "doc": "Plugin-specific JSON (UTF-8). Shape documented per-plugin in infra/risingwave/plugins/<name>/payload_schema.json (advisory only — no runtime validation). Consuming MVs cast at query time: (payload::jsonb ->> 'value')::DOUBLE PRECISION etc."}
+  ]
+}

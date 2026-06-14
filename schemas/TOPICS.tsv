@@ -1,0 +1,12 @@
+# Topic ↔ schema ↔ key format manifest.
+# Fields per line (whitespace separated):
+#   <topic>  <schema-relpath>  <key-format>  <cleanup-policy>
+
+# v6 core ingest topics (hard cutover from v1; docs/v6/07-avro-v2-envelope.md,
+# ADR-0037). The v2 envelopes add a required `org_id` field. No dual-write.
+portfolio_events.v2  portfolio_events.v2.avsc  scope  delete
+data.v2              data.v2.avsc              scope  delete
+
+# Metric topics + per-output Avro schemas are auto-registered at plugin
+# bootstrap (lib/runtime/bootstrap.py); they don't appear here. Each
+# plugin's outputs land on `metrics.<snake_name>.v1`.

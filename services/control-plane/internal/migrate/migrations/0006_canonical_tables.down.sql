@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS instruments;
+DROP TABLE IF EXISTS portfolios;

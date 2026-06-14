@@ -1,0 +1,451 @@
+// Kinde PKCE login + the v8 Option A instance-token exchange.
+//
+// Flow: the shell holds a Kinde access token (from the browser PKCE login
+// below). It exchanges that at the control plane for a short-lived
+// instance token (POST /v1/instance/token), which it later hands to
+// plugins. The shell never gives the Kinde token to Grafana or plugins.
+
+use std::sync::Mutex;
+
+use base64::Engine;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+use tauri::State;
+
+use crate::config::AppConfig;
+
+/// Session holds the live Kinde access token in memory. No refresh token
+/// is stored (offline scope is off for now); the user re-logs in when the
+/// access token expires. `email` comes from Kinde's userinfo endpoint at login
+/// (falling back to the id_token email claim) so the UI shows a human identity.
+#[derive(Default)]
+pub struct Session {
+    pub access_token: Mutex<Option<String>>,
+    pub email: Mutex<Option<String>>,
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn random_b64url(n: usize) -> String {
+    let mut buf = vec![0u8; n];
+    rand::thread_rng().fill_bytes(&mut buf);
+    b64url(&buf)
+}
+
+/// PKCE S256: challenge = base64url(sha256(verifier)).
+fn code_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    b64url(&digest)
+}
+
+/// kinde_login runs the full browser PKCE flow and stores the access token.
+#[tauri::command]
+pub async fn kinde_login(cfg: State<'_, AppConfig>, session: State<'_, Session>) -> Result<(), String> {
+    let cfg = cfg.inner().clone();
+    let verifier = random_b64url(48);
+    let challenge = code_challenge(&verifier);
+    let state = random_b64url(16);
+
+    let mut auth = url::Url::parse(&format!("{}/oauth2/auth", cfg.kinde_domain))
+        .map_err(|e| format!("bad kinde_domain: {e}"))?;
+    {
+        let mut q = auth.query_pairs_mut();
+        q.append_pair("response_type", "code");
+        q.append_pair("client_id", &cfg.kinde_client_id);
+        q.append_pair("redirect_uri", &cfg.kinde_redirect_uri);
+        q.append_pair("audience", &cfg.kinde_audience);
+        q.append_pair("state", &state);
+        q.append_pair("code_challenge", &challenge);
+        q.append_pair("code_challenge_method", "S256");
+        if !cfg.kinde_scope.is_empty() {
+            q.append_pair("scope", &cfg.kinde_scope);
+        }
+    }
+
+    let port = cfg.redirect_port();
+    let expected_state = state.clone();
+    // tiny_http is blocking; run the one-shot callback listener off the
+    // async runtime and await the result.
+    let listener = tokio::task::spawn_blocking(move || wait_for_code(port, &expected_state));
+
+    open::that(auth.as_str()).map_err(|e| format!("open browser: {e}"))?;
+
+    let code = listener
+        .await
+        .map_err(|e| format!("callback task: {e}"))??;
+
+    let tokens = exchange_code(&cfg, &code, &verifier).await?;
+    // Prefer Kinde's userinfo preferred_email (reliable even when the id_token
+    // omits the email claim); fall back to the id_token email claim.
+    let email = fetch_kinde_email(&cfg, &tokens.access_token)
+        .await
+        .or_else(|| tokens.id_token.as_deref().and_then(email_from_id_token));
+    *session.email.lock().unwrap() = email;
+    *session.access_token.lock().unwrap() = Some(tokens.access_token);
+    Ok(())
+}
+
+/// fetch_kinde_email calls Kinde's userinfo endpoint with the access token and
+/// returns `preferred_email`. More reliable than the id_token's `email` claim,
+/// which Kinde omits unless it's explicitly added to the token. Returns None on
+/// any failure so the caller can fall back to the id_token.
+async fn fetch_kinde_email(cfg: &AppConfig, access_token: &str) -> Option<String> {
+    let url = format!("{}/oauth2/user_profile", cfg.kinde_domain);
+    let v = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    v.get("preferred_email")
+        .or_else(|| v.get("email"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// email_from_id_token reads the `email` claim out of a JWT id_token without
+/// verifying the signature — the token came straight from Kinde over TLS in
+/// the PKCE exchange, so it's trusted; we only need the claim for display.
+fn email_from_id_token(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// wait_for_code blocks on a one-request loopback server, returning the
+/// authorization code once Kinde redirects back. Rejects on state mismatch.
+fn wait_for_code(port: u16, expected_state: &str) -> Result<String, String> {
+    let server = tiny_http::Server::http(("127.0.0.1", port))
+        .map_err(|e| format!("bind callback :{port}: {e}"))?;
+    for request in server.incoming_requests() {
+        let url = format!("http://localhost{}", request.url());
+        let parsed = url::Url::parse(&url).map_err(|e| format!("parse callback: {e}"))?;
+        let mut code = None;
+        let mut got_state = None;
+        for (k, v) in parsed.query_pairs() {
+            match k.as_ref() {
+                "code" => code = Some(v.into_owned()),
+                "state" => got_state = Some(v.into_owned()),
+                _ => {}
+            }
+        }
+        let body = "<html><body>Login complete. You can close this tab.</body></html>";
+        let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap();
+        let _ = request.respond(tiny_http::Response::from_string(body).with_header(header));
+
+        if got_state.as_deref() != Some(expected_state) {
+            return Err("oauth state mismatch".into());
+        }
+        return code.ok_or_else(|| "no code in callback".into());
+    }
+    Err("callback server closed without a request".into())
+}
+
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    /// Present when the `openid` scope is requested; carries identity claims.
+    id_token: Option<String>,
+}
+
+/// exchange_code swaps the authorization code for tokens (PKCE, public client
+/// — no secret). Returns the access token plus the id_token (for email).
+async fn exchange_code(
+    cfg: &AppConfig,
+    code: &str,
+    verifier: &str,
+) -> Result<TokenResponse, String> {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/oauth2/token", cfg.kinde_domain))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", cfg.kinde_client_id.as_str()),
+            ("code", code),
+            ("redirect_uri", cfg.kinde_redirect_uri.as_str()),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("token exchange: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("token exchange {status}: {body}"));
+    }
+    resp.json().await.map_err(|e| format!("decode token: {e}"))
+}
+
+/// me_orgs returns the orgs the logged-in user belongs to.
+#[tauri::command]
+pub async fn me_orgs(
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v1/me/orgs", cfg.control_plane_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("call /v1/me/orgs: {e}"))?;
+    read_json(resp, "/v1/me/orgs").await
+}
+
+/// me_profile returns the human identity decoded from the id_token at login.
+/// `preferred_email` is empty when the id_token carried no email claim (e.g.
+/// the openid/email scopes weren't granted).
+#[tauri::command]
+pub fn me_profile(session: State<'_, Session>) -> serde_json::Value {
+    let email = session.email.lock().unwrap().clone().unwrap_or_default();
+    serde_json::json!({ "preferred_email": email })
+}
+
+/// logout clears the in-memory Kinde session. No refresh token is stored, so
+/// this is a full sign-out; the next action needs a fresh browser login.
+#[tauri::command]
+pub fn logout(session: State<'_, Session>) {
+    *session.access_token.lock().unwrap() = None;
+    *session.email.lock().unwrap() = None;
+}
+
+#[derive(serde::Serialize)]
+struct InstanceTokenRequest<'a> {
+    org_id: &'a str,
+}
+
+/// instance_token exchanges the Kinde session for a control-plane instance
+/// token scoped to one org (Option A). Plugins present this to /jwt/mint.
+#[tauri::command]
+pub async fn instance_token(
+    org_id: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    mint_instance_token(cfg.inner(), session.inner(), &org_id).await
+}
+
+/// mint_instance_token is the shared implementation: POST the Kinde session
+/// to /v1/instance/token and return the JSON {token, exp, org_id}. Used by
+/// the instance_token command and the grafana launch flow (which stores the
+/// token on the loopback for plugins to fetch).
+pub async fn mint_instance_token(
+    cfg: &AppConfig,
+    session: &Session,
+    org_id: &str,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(session)?;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/instance/token", cfg.control_plane_url))
+        .bearer_auth(token)
+        .json(&InstanceTokenRequest { org_id })
+        .send()
+        .await
+        .map_err(|e| format!("call /v1/instance/token: {e}"))?;
+    read_json(resp, "/v1/instance/token").await
+}
+
+#[derive(serde::Serialize)]
+struct CreateOrgRequest<'a> {
+    name: &'a str,
+    base_currency: &'a str,
+}
+
+/// create_org onboards a logged-in user with no workspace: control-plane
+/// creates the org, makes the caller admin, and installs required plugins.
+#[tauri::command]
+pub async fn create_org(
+    name: String,
+    base_currency: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/orgs", cfg.control_plane_url))
+        .bearer_auth(token)
+        .json(&CreateOrgRequest {
+            name: &name,
+            base_currency: &base_currency,
+        })
+        .send()
+        .await
+        .map_err(|e| format!("call /v1/orgs: {e}"))?;
+    read_json(resp, "/v1/orgs").await
+}
+
+/// marketplace_catalog lists the plugins available to an org with their
+/// installed state (Kinde-authed).
+#[tauri::command]
+pub async fn marketplace_catalog(
+    org_id: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v1/marketplace/catalog", cfg.control_plane_url))
+        .query(&[("org_id", &org_id)])
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("call /v1/marketplace/catalog: {e}"))?;
+    read_json(resp, "/v1/marketplace/catalog").await
+}
+
+/// install_plugin installs one plugin for an org (idempotent). Version
+/// selection is local (set_plugin_pin); the control plane installs latest.
+#[tauri::command]
+pub async fn install_plugin(
+    org_id: String,
+    plugin_id: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/orgs/{}/plugins/{}",
+            cfg.control_plane_url, org_id, plugin_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("install {plugin_id}: {e}"))?;
+    read_json(resp, "install plugin").await
+}
+
+#[derive(serde::Serialize)]
+pub struct VersionStatus {
+    pub version: String,
+    pub validated: bool,
+}
+
+/// plugin_versions lists the published versions of a plugin with their
+/// validation status, newest first.
+#[tauri::command]
+pub async fn plugin_versions(
+    plugin_id: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<Vec<VersionStatus>, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/marketplace/plugins/{}/versions",
+            cfg.control_plane_url, plugin_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("list versions {plugin_id}: {e}"))?;
+    let body = read_json(resp, "plugin versions").await?;
+    let arr = body
+        .get("versions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "plugin versions: missing versions array".to_string())?;
+    arr.iter()
+        .map(|v| {
+            Ok(VersionStatus {
+                version: v
+                    .get("version")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                validated: v
+                    .get("validated")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// uninstall_plugin removes one (non-required) plugin from an org. The
+/// control plane runs the teardown async; the shell re-reconciles on next
+/// launch to drop the symlink.
+#[tauri::command]
+pub async fn uninstall_plugin(
+    org_id: String,
+    plugin_id: String,
+    cfg: State<'_, AppConfig>,
+    session: State<'_, Session>,
+) -> Result<serde_json::Value, String> {
+    let token = current_token(&session)?;
+    let resp = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/orgs/{}/plugins/{}",
+            cfg.control_plane_url, org_id, plugin_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("uninstall {plugin_id}: {e}"))?;
+    read_json(resp, "uninstall plugin").await
+}
+
+/// get_show_preview returns the global preview-version toggle from shell settings.
+#[tauri::command]
+pub fn get_show_preview(cfg: State<'_, AppConfig>) -> Result<bool, String> {
+    crate::config::read_show_preview_in(&cfg.base_dir())
+}
+
+/// set_show_preview persists the global preview-version toggle.
+#[tauri::command]
+pub fn set_show_preview(on: bool, cfg: State<'_, AppConfig>) -> Result<(), String> {
+    crate::config::set_show_preview_in(&cfg.base_dir(), on)
+}
+
+/// get_plugin_pin returns the locally-pinned version for one (org, plugin) pair,
+/// or None if no pin is set (meaning "use latest validated").
+#[tauri::command]
+pub fn get_plugin_pin(
+    org_id: String,
+    plugin_id: String,
+    cfg: State<'_, AppConfig>,
+) -> Result<Option<String>, String> {
+    let pins = crate::config::read_pins_in(&cfg.base_dir(), &org_id)?;
+    Ok(pins.get(&plugin_id).cloned())
+}
+
+/// set_plugin_pin writes or removes a local version pin for one (org, plugin) pair.
+#[tauri::command]
+pub fn set_plugin_pin(
+    org_id: String,
+    plugin_id: String,
+    version: Option<String>,
+    cfg: State<'_, AppConfig>,
+) -> Result<(), String> {
+    crate::config::set_pin_in(&cfg.base_dir(), &org_id, &plugin_id, version.as_deref())
+}
+
+fn current_token(session: &Session) -> Result<String, String> {
+    session
+        .access_token
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "not logged in".to_string())
+}
+
+async fn read_json(resp: reqwest::Response, what: &str) -> Result<serde_json::Value, String> {
+    let status = resp.status();
+    let body = resp.bytes().await.map_err(|e| format!("read {what}: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("{what} {status}: {}", String::from_utf8_lossy(&body)));
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("decode {what}: {e}"))
+}

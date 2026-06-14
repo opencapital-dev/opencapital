@@ -1,0 +1,232 @@
+name: opencapital-release
+
+# Builds the OpenCapital desktop app for macOS (Apple Silicon) + Windows x64,
+# signs with minisign, and publishes a Release + latest.json to the public
+# opencapital repo. The Grafana frontend overlay is NOT built here —
+# it is pulled as a pinned release asset from the fork (see grafana-overlay.pin
+# and the fork's opencapital-overlay workflow). The compute sidecar IS built
+# per-platform (pyinstaller can't cross-compile).
+
+on:
+  push:
+    tags: ["opencapital-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform_key: darwin-aarch64
+            # app = updater .app.tar.gz; dmg = installer for the landing-page download.
+            # bundle_dmg.sh is flaky on headless runners, so the build step retries.
+            bundle_args: "--bundles app,dmg"
+          - os: windows-latest
+            platform_key: windows-x86_64
+            # NSIS only (the updater target); skip the unused MSI.
+            bundle_args: "--bundles nsis"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert tag matches tauri.conf.json version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#opencapital-v}"
+          cfg=$(node -p "require('./opencapital-app/src-tauri/tauri.conf.json').version")
+          echo "tag=$tag config=$cfg"
+          if [ "$tag" != "$cfg" ]; then
+            echo "::error::tag $tag != tauri.conf.json version $cfg"; exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: opencapital-app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo + the src-tauri target/ deps. The dominant build cost
+      # (~4 min of crate compilation) drops to <1 min on a warm hit.
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: opencapital-app/src-tauri
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: services/compute/freeze-requirements.txt
+
+      # Cache node_modules directly so a hit skips `npm ci` entirely (setup-node's
+      # cache: npm only caches the download). Keyed per-OS (native binaries) + lockfile.
+      - name: Cache node_modules
+        id: node-modules
+        uses: actions/cache@v4
+        with:
+          path: opencapital-app/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('opencapital-app/package-lock.json') }}
+
+      - name: Install frontend deps
+        if: steps.node-modules.outputs.cache-hit != 'true'
+        working-directory: opencapital-app
+        run: npm ci
+
+      # --- compute sidecar (native per-platform; pyinstaller can't cross-compile) ---
+      - name: Compute build deps (venv)
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ "$RUNNER_OS" = "Windows" ]; then PY=.venv/Scripts/python; else PY=.venv/bin/python; fi
+          "$PY" -m pip install -r services/compute/freeze-requirements.txt
+
+      - name: Freeze + stage compute sidecar (macOS)
+        if: runner.os == 'macOS'
+        run: make compute-sidecar-stage
+
+      - name: Smoke compute sidecar (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bin=opencapital-app/src-tauri/binaries/compute-aarch64-apple-darwin
+          COMPUTE_HOST=127.0.0.1 COMPUTE_PORT=8765 "$bin" &
+          pid=$!
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 1; done
+          test "$(curl -fsS http://127.0.0.1:8765/health)" = "ok"
+          kill $pid
+
+      - name: Freeze + stage compute sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ( cd services/compute && ../../.venv/Scripts/pyinstaller compute.spec --distpath dist --workpath "$RUNNER_TEMP/compute-build" --noconfirm )
+          mkdir -p opencapital-app/src-tauri/binaries
+          cp services/compute/dist/compute.exe opencapital-app/src-tauri/binaries/compute-x86_64-pc-windows-msvc.exe
+
+      # --- pinned Grafana overlay (built in the fork; pulled here) ---
+      # Cache the overlay tarball keyed on the pin — re-download only when the
+      # pin changes.
+      - name: Cache pinned overlay
+        uses: actions/cache@v4
+        with:
+          path: _overlay
+          key: overlay-${{ hashFiles('opencapital-app/grafana-overlay.pin') }}
+
+      - name: Pull pinned Grafana overlay
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use a RELATIVE dir (no drive letter) — GNU tar on Windows treats a
+          # path like "D:\..." as a remote host ("Cannot connect to D").
+          pin=$(tr -d '[:space:]' < opencapital-app/grafana-overlay.pin)
+          echo "overlay pin: $pin"
+          mkdir -p _overlay
+          if [ ! -f _overlay/grafana-overlay.tar.gz ]; then
+            gh release download "$pin" --repo opencapital-dev/grafana --pattern grafana-overlay.tar.gz --dir _overlay
+          else
+            echo "overlay cache hit"
+          fi
+          dst=opencapital-app/src-tauri/resources/grafana-public
+          mkdir -p "$dst"
+          tar xzf _overlay/grafana-overlay.tar.gz -C "$dst"
+          ls "$dst"
+
+      # Build + minisign-sign directly via the tauri CLI. `npx tauri` bypasses the
+      # `tauri` npm script (which carries a bash-only localhost env prefix for dev
+      # and would break on Windows cmd). createUpdaterArtifacts=true in
+      # tauri.conf.json emits the .app.tar.gz / .nsis.zip + .sig.
+      # Minisign (updater) signing only. Apple OS-signing env is intentionally
+      # NOT passed in interim no-cert mode — a defined-but-empty APPLE_CERTIFICATE
+      # makes tauri attempt `security import ""` and fail. Re-add the APPLE_*
+      # env (conditionally, only when the secrets exist) once certs are set up.
+      - name: Build + sign app bundles
+        working-directory: opencapital-app
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          n=0
+          until npx tauri build ${{ matrix.bundle_args }}; do
+            n=$((n+1))
+            [ "$n" -ge 3 ] && { echo "::error::tauri build failed after $n attempts"; exit 1; }
+            echo "build attempt $n failed (likely flaky bundle_dmg.sh) — retrying"
+            sleep 5
+          done
+
+      - name: Collect bundles + signatures
+        shell: bash
+        run: |
+          mkdir -p staging
+          find opencapital-app/src-tauri/target -path '*/release/bundle/*' \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \
+               -o -name '*-setup.exe' -o -name '*-setup.exe.sig' \) \
+            -exec cp {} staging/ \;
+          ls -la staging
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.platform_key }}
+          path: staging/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build latest.json and publish to opencapital
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          RELEASES_REPO: opencapital-dev/opencapital
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#opencapital-v}"
+          tag="v${version}"
+          base="https://github.com/${RELEASES_REPO}/releases/download/${tag}"
+          cd artifacts
+
+          mac_bundle=$(ls *.app.tar.gz 2>/dev/null | head -n1 || true)
+          mac_sig=$(ls *.app.tar.gz.sig 2>/dev/null | head -n1 || true)
+          win_bundle=$(ls *-setup.exe 2>/dev/null | head -n1 || true)
+          win_sig=$(ls *-setup.exe.sig 2>/dev/null | head -n1 || true)
+
+          platforms="{}"
+          if [ -n "$mac_bundle" ] && [ -n "$mac_sig" ]; then
+            platforms=$(echo "$platforms" | jq \
+              --arg sig "$(cat "$mac_sig")" --arg url "${base}/${mac_bundle}" \
+              '. + {"darwin-aarch64": {signature: $sig, url: $url}}')
+          fi
+          if [ -n "$win_bundle" ] && [ -n "$win_sig" ]; then
+            platforms=$(echo "$platforms" | jq \
+              --arg sig "$(cat "$win_sig")" --arg url "${base}/${win_bundle}" \
+              '. + {"windows-x86_64": {signature: $sig, url: $url}}')
+          fi
+
+          jq -n --arg v "$version" --arg notes "OpenCapital $version" \
+                --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "$platforms" \
+            '{version: $v, notes: $notes, pub_date: $date, platforms: $p}' > latest.json
+          cat latest.json
+
+          # Gather assets via find (ls with multiple globs exits non-zero on any
+          # missing pattern, which aborts under `set -e`).
+          assets=()
+          while IFS= read -r f; do assets+=("$f"); done < <(find . -maxdepth 1 -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \
+               -o -name '*-setup.exe' -o -name '*-setup.exe.sig' -o -name 'latest.json' \))
+          echo "assets: ${assets[*]}"
+          gh release create "$tag" --repo "$RELEASES_REPO" \
+            --title "OpenCapital $version" --notes "OpenCapital $version" "${assets[@]}"

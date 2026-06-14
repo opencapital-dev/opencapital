@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "prices plugin payloads",
+  "description": "JSON shapes for the prices.quote, prices.ohlcv, and prices.option_mark namespaces on data.v1. These are advisory — no runtime validation. Consumers cast at read time.",
+  "oneOf": [
+    {
+      "title": "prices.option_mark",
+      "description": "End-of-period close mark for an option contract (v3). instrument_id = canonical OCC string (e.g. 'BMY 20JUN25 45 P'). observed_at = statement period end. Producer: reference-admin (statement-import path; ADR-0019). A future real-options vendor writes here without view changes.",
+      "type": "object",
+      "required": ["close", "currency"],
+      "properties": {
+        "close":    { "type": "number", "description": "per-contract close price in native currency. NOT multiplied by contract_multiplier — kernel/dense MV applies multiplier from instruments table (ADR-0017). Matches IBKR statement Open Positions.Close Price verbatim." },
+        "currency": { "type": "string", "description": "contract trade currency, ISO 4217. Should match instruments.currency for the same instrument_id." }
+      }
+    },
+    {
+      "title": "prices.quote",
+      "description": "Bid/ask quote at observed_at. instrument_id = source_id. mid = (bid + ask) / 2 is what the core `prices` VIEW exposes.",
+      "type": "object",
+      "required": ["bid_price", "ask_price", "currency"],
+      "properties": {
+        "bid_price": { "type": "number", "description": "best bid in native currency" },
+        "bid_size":  { "type": "number", "description": "size at best bid" },
+        "ask_price": { "type": "number", "description": "best ask in native currency" },
+        "ask_size":  { "type": "number", "description": "size at best ask" },
+        "currency":  { "type": "string", "description": "quote currency, ISO 4217 (e.g. 'USD', 'EUR')" },
+        "venue":     { "type": "string", "description": "publishing venue (e.g. 'NYSE', 'NASDAQ')" }
+      }
+    },
+    {
+      "title": "prices.ohlcv",
+      "description": "OHLCV bar covering [observed_at - bar_cadence, observed_at]. instrument_id = source_id. `close` is what the core `prices` VIEW exposes.",
+      "type": "object",
+      "required": ["open", "high", "low", "close", "currency", "bar_cadence"],
+      "properties": {
+        "open":        { "type": "number" },
+        "high":        { "type": "number" },
+        "low":         { "type": "number" },
+        "close":       { "type": "number" },
+        "volume":      { "type": "number" },
+        "trade_count": { "type": "integer" },
+        "bar_cadence": { "type": "string", "enum": ["1s", "1m", "1h", "1d"], "description": "bar duration" },
+        "currency":    { "type": "string" },
+        "venue":       { "type": "string" }
+      }
+    }
+  ]
+}

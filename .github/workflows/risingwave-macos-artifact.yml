@@ -1,0 +1,228 @@
+name: risingwave-macos-artifact
+
+# Builds a SELF-CONTAINED RisingWave single-node binary for macOS arm64 that the
+# OpenCapital desktop app downloads on first launch (grafana-style), then
+# publishes it to the public opencapital repo.
+#
+# Why this exists: RisingWave ships NO portable macOS binary. The vendor's only
+# macOS path is `brew install`, which downloads a Homebrew *bottle* whose binary
+# dynamically links four absolute Homebrew dylibs and is therefore NOT runnable
+# without Homebrew:
+#   @@HOMEBREW_PREFIX@@/opt/python@3.12/Frameworks/Python.framework/.../Python  (embedded-UDF runtime; fold_kernel needs it)
+#   @@HOMEBREW_PREFIX@@/opt/openssl@3/lib/libssl.3.dylib
+#   @@HOMEBREW_PREFIX@@/opt/openssl@3/lib/libcrypto.3.dylib
+#   @@HOMEBREW_PREFIX@@/opt/llvm/lib/libomp.dylib
+# This job downloads that bottle, vendors those deps (openssl@3 + libomp from
+# brew on the runner; CPython 3.12 from python-build-standalone, which is
+# purpose-built to be relocatable), rewrites the binary's load commands to
+# @rpath via install_name_tool, and emits a self-contained tarball.
+#
+# Signing/notarization is the SAME Apple Developer ID cert used for the app (one
+# membership covers both artifacts). It runs only when the APPLE_* secrets exist;
+# until then the artifact ships unsigned (interim, mirrors opencapital-release).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rw_version:
+        description: RisingWave version (must match a tap bottle + cloud image)
+        required: true
+        default: "2.8.0"
+      python_version:
+        description: CPython 3.12.x patch (python-build-standalone)
+        required: true
+        default: "3.12.11"
+      publish:
+        description: Publish the artifact to opencapital
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple Silicon (arm64)
+    env:
+      RW_VERSION: ${{ inputs.rw_version }}
+      PY_VERSION: ${{ inputs.python_version }}
+      # arm64_sonoma is the only macOS bottle the tap ships; it runs on
+      # sonoma+ (incl. tahoe). Apple Silicon only — no Intel-mac bottle exists.
+      BOTTLE: risingwave-${{ inputs.rw_version }}.arm64_sonoma.bottle.tar.gz
+      DIST: risingwave-${{ inputs.rw_version }}-macos-arm64
+      # Signing/notary secrets at JOB level so steps can gate on them via the
+      # env context in `if:` (a step's own env block is not in scope for its
+      # own if). The SAME Developer ID cert signs the app + this artifact.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+    steps:
+      - name: Download the RisingWave bottle
+        run: |
+          set -euo pipefail
+          url="https://github.com/risingwavelabs/homebrew-risingwave/releases/download/risingwave-${RW_VERSION}/${BOTTLE}"
+          echo "fetching $url"
+          curl -fL "$url" -o bottle.tar.gz
+          mkdir -p bottle && tar -xzf bottle.tar.gz -C bottle
+          # The bottle unpacks to risingwave/<ver>/{bin,libexec}; bin/risingwave
+          # is a wrapper, libexec/bin/risingwave is the real Mach-O.
+          rw="$(find bottle -path '*libexec/bin/risingwave' -type f)"
+          test -n "$rw" || { echo "real risingwave binary not found in bottle"; exit 1; }
+          echo "RW_REAL=$rw" >> "$GITHUB_ENV"
+          echo "RW_LIBEXEC=$(dirname "$(dirname "$rw")")/libexec" >> "$GITHUB_ENV"
+
+      - name: Vendor openssl@3 + libomp (from brew on the runner)
+        run: |
+          set -euo pipefail
+          brew install openssl@3 libomp >/dev/null
+          mkdir -p "$DIST/lib"
+          cp -L "$(brew --prefix openssl@3)/lib/libssl.3.dylib"    "$DIST/lib/"
+          cp -L "$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" "$DIST/lib/"
+          cp -L "$(brew --prefix libomp)/lib/libomp.dylib"          "$DIST/lib/"
+          chmod u+w "$DIST"/lib/*.dylib
+
+      - name: Vendor relocatable CPython 3.12 (python-build-standalone)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # install_only = a relocatable unix-layout prefix (bin/, lib/libpython3.12.dylib, lib/python3.12 stdlib).
+          # Discover the asset in the latest release. Each dated release ships
+          # exactly one cpython-3.12.x for aarch64-apple-darwin install_only; RW
+          # links 3.12, so the minor must be 3.12 (patch floats). Pure jq
+          # endswith/contains (no regex, no grep|head — which can SIGPIPE-fail
+          # under pipefail). endswith excludes the _stripped variant.
+          url="$(gh api repos/astral-sh/python-build-standalone/releases/latest \
+            --jq '[.assets[].browser_download_url
+                   | select(endswith("aarch64-apple-darwin-install_only.tar.gz"))
+                   | select(contains("cpython-3.12."))]
+                  | first // empty')"
+          test -n "$url" || { echo "no cpython-3.12 aarch64-apple-darwin install_only asset in latest release"; exit 1; }
+          echo "fetching $url"
+          curl -fL "$url" -o python.tar.gz
+          tar -xzf python.tar.gz # unpacks to ./python
+          rm -rf "$DIST/python" && mv python "$DIST/python"
+          test -f "$DIST/python/lib/libpython3.12.dylib" || { echo "libpython3.12.dylib missing"; exit 1; }
+
+      - name: Assemble + relink to @rpath (install_name_tool)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST/bin" "$DIST/libexec"
+          cp "$RW_REAL" "$DIST/bin/risingwave"; chmod u+w "$DIST/bin/risingwave"
+          cp -R "$RW_LIBEXEC/." "$DIST/libexec/" || true
+
+          P="@@HOMEBREW_PREFIX@@"
+
+          # Vendored dylibs: id -> @rpath/<base>; rewrite any homebrew inter-dep.
+          # `|| true`: grep exits 1 when a dylib has no homebrew deps (e.g.
+          # libcrypto/libomp), which would abort the pipeline under pipefail.
+          for f in "$DIST"/lib/*.dylib; do
+            base="$(basename "$f")"
+            install_name_tool -id "@rpath/$base" "$f"
+            otool -L "$f" | awk 'NR>1{print $1}' | grep -E "^($P|/opt/homebrew)" | while read -r dep; do
+              install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$f"
+            done || true
+          done
+
+          # The RW binary: point each absolute dep at @rpath, and add the two
+          # rpaths that resolve them (lib/ for openssl+libomp, python/lib for libpython).
+          bin="$DIST/bin/risingwave"
+          install_name_tool \
+            -change "$P/opt/openssl@3/lib/libssl.3.dylib"    "@rpath/libssl.3.dylib" \
+            -change "$P/opt/openssl@3/lib/libcrypto.3.dylib" "@rpath/libcrypto.3.dylib" \
+            -change "$P/opt/llvm/lib/libomp.dylib"            "@rpath/libomp.dylib" \
+            -change "$P/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/Python" "@rpath/libpython3.12.dylib" \
+            "$bin"
+          install_name_tool -add_rpath "@executable_path/../lib" "$bin"
+          install_name_tool -add_rpath "@executable_path/../python/lib" "$bin"
+
+      - name: Verify self-containment (no homebrew refs anywhere)
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r m; do
+            if otool -L "$m" 2>/dev/null | grep -nE '@@HOMEBREW_PREFIX@@|/opt/homebrew'; then
+              echo "FORBIDDEN homebrew reference in: $m"; bad=1
+            fi
+          done < <(find "$DIST" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \) -exec sh -c 'file "$1" | grep -q Mach-O && echo "$1"' _ {} \;)
+          test "$bad" -eq 0 || { echo "relink incomplete — homebrew refs remain"; exit 1; }
+          echo "OK: no homebrew references"
+
+      - name: Sign (Developer ID when cert present; otherwise ad-hoc)
+        run: |
+          set -euo pipefail
+          # install_name_tool invalidated signatures; arm64 refuses to LOAD an
+          # invalidly-signed Mach-O, so signing is mandatory — not gated on a
+          # cert. With a Developer ID cert we sign everything + hardened runtime
+          # (for notarization); without, we ad-hoc sign the relinked binaries so
+          # they at least load.
+          if [ -n "${MACOS_CERT_P12:-}" ]; then
+            kc=build.keychain; pw=ci-temp
+            security create-keychain -p "$pw" "$kc"
+            security default-keychain -s "$kc"
+            security unlock-keychain -p "$pw" "$kc"
+            echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+            security import cert.p12 -k "$kc" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc"
+            find "$DIST" -type f \( -name '*.dylib' -o -name '*.so' \) -exec \
+              codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" {} +
+            codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$DIST/bin/risingwave"
+          else
+            codesign --force --sign - "$DIST"/lib/*.dylib
+            codesign --force --sign - "$DIST/bin/risingwave"
+          fi
+
+      - name: Package + checksum
+        run: |
+          set -euo pipefail
+          cat > "$DIST/MANIFEST.txt" <<EOF
+          risingwave ${RW_VERSION} — self-contained macOS arm64
+          Run: set these env, then exec bin/risingwave
+            PYTHONHOME=<extracted>/python
+            CONNECTOR_LIBS_PATH=<extracted>/libexec
+          Dylibs resolve via baked @rpath (../lib, ../python/lib); no DYLD_* needed.
+          EOF
+          tar -czf "${DIST}.tar.gz" "$DIST"
+          shasum -a 256 "${DIST}.tar.gz" | tee "${DIST}.tar.gz.sha256"
+
+      - name: Notarize the tarball — only when notary secrets present
+        if: ${{ env.AC_API_KEY_ID != '' }}
+        run: |
+          set -euo pipefail
+          # Notarize the binaries (submit a zip of the signed Mach-O). Loose
+          # binaries can't be stapled, so Gatekeeper validates online on first
+          # run — fine, the app is online when it downloads RW.
+          echo "$AC_API_KEY_P8" | base64 --decode > key.p8
+          ditto -c -k --keepParent "$DIST" notarize.zip
+          xcrun notarytool submit notarize.zip \
+            --key key.p8 --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait
+
+      - name: Upload build artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DIST }}
+          path: |
+            ${{ env.DIST }}.tar.gz
+            ${{ env.DIST }}.tar.gz.sha256
+
+      - name: Publish to opencapital
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          RELEASES_REPO: opencapital-dev/opencapital
+        run: |
+          set -euo pipefail
+          tag="${DIST}"
+          # --prerelease so this artifact release never becomes the repo's
+          # `releases/latest` — that endpoint feeds the desktop updater's
+          # latest.json and must resolve to the app's v* release.
+          gh release create "$tag" --repo "$RELEASES_REPO" --prerelease \
+            --title "RisingWave ${RW_VERSION} (macOS arm64)" \
+            --notes "Self-contained RisingWave single-node for the OpenCapital desktop data plane." \
+            "${DIST}.tar.gz" "${DIST}.tar.gz.sha256" \
+          || gh release upload "$tag" --repo "$RELEASES_REPO" --clobber \
+            "${DIST}.tar.gz" "${DIST}.tar.gz.sha256"
+          echo "Published https://github.com/${RELEASES_REPO}/releases/download/${tag}/${DIST}.tar.gz"

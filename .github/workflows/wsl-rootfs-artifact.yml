@@ -1,0 +1,96 @@
+name: wsl-rootfs-artifact
+
+# Builds the OpenCapital WSL distro rootfs — the headless data plane (RisingWave
+# single-node + control-plane + gateway + read-gateway + postgres-17 + python)
+# as one flat root-filesystem tar that the desktop app feeds to `wsl --import`
+# on first launch (Windows), then publishes it to the public opencapital
+# repo. The Windows analog of risingwave-macos-artifact.yml.
+#
+# Why a rootfs: RisingWave ships no Windows binary, so on Windows the whole
+# headless plane runs inside one bundled WSL2 distro (the host runs Grafana +
+# plugins natively for the per-IP / broker-creds constraints). The rootfs is the
+# official RisingWave Linux image (connector libs + embedded-python UDF already
+# wired) with postgres, the Go services, the infra tree, and the in-distro
+# supervisor layered on top (dataplane/wsl/Dockerfile.rootfs).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rw_version:
+        description: RisingWave version (image tag, must match the cloud image)
+        required: true
+        default: "v2.8.0"
+      publish:
+        description: Publish the rootfs to opencapital
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RW_VERSION: ${{ inputs.rw_version }}
+      # x86_64 only in v0 — WSL2 on arm64 Windows is a follow-up. The version in
+      # the artifact name tracks the RW version it is built around.
+      DIST: opencapital-wsl-rootfs-${{ inputs.rw_version }}-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the rootfs image. Context = repo root (Go modules use
+      # `replace => ../../lib/X`). Load into the local daemon so we can `create`
+      # + `export` a container from it.
+      - name: Build rootfs image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dataplane/wsl/Dockerfile.rootfs
+          build-args: RW_VERSION=${{ inputs.rw_version }}
+          tags: oc-wsl-rootfs:${{ inputs.rw_version }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # `docker export` flattens the image filesystem to the tar `wsl --import`
+      # wants (image *layers* are not importable; a container export is).
+      - name: Export + compress rootfs
+        run: |
+          set -euo pipefail
+          cid=$(docker create oc-wsl-rootfs:${RW_VERSION})
+          docker export "$cid" | gzip -9 > "${DIST}.tar.gz"
+          docker rm "$cid"
+          sha256sum "${DIST}.tar.gz" | awk '{print $1}' > "${DIST}.tar.gz.sha256"
+          ls -lh "${DIST}.tar.gz"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DIST }}
+          path: |
+            ${{ env.DIST }}.tar.gz
+            ${{ env.DIST }}.tar.gz.sha256
+          retention-days: 7
+
+      - name: Publish to opencapital
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          RELEASES_REPO: opencapital-dev/opencapital
+        run: |
+          set -euo pipefail
+          tag="wsl-rootfs-${RW_VERSION}-amd64"
+          # --prerelease so this artifact release never becomes the repo's
+          # `releases/latest` — that endpoint is the desktop updater's
+          # latest.json source and must resolve to the app's v* release.
+          gh release create "$tag" --repo "$RELEASES_REPO" --prerelease \
+            --title "OpenCapital WSL rootfs (${RW_VERSION}, amd64)" \
+            --notes "Self-contained headless data-plane rootfs for the OpenCapital desktop on Windows (wsl --import)." \
+            "${DIST}.tar.gz" "${DIST}.tar.gz.sha256" \
+          || gh release upload "$tag" --repo "$RELEASES_REPO" --clobber \
+            "${DIST}.tar.gz" "${DIST}.tar.gz.sha256"
+          echo "Published https://github.com/${RELEASES_REPO}/releases/download/${tag}/${DIST}.tar.gz"

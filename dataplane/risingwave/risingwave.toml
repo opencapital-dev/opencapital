@@ -1,0 +1,13 @@
+# RisingWave cluster configuration for the dev stack.
+#
+# Embedded Python UDF is disabled by default in 2.8.x for security. v5 fold
+# kernel runs as an embedded Python UDAF; the smoke tests in
+# docs/risingwave/v5/smoke-tests/ validated the architecture using JavaScript
+# UDAFs (enabled by default) but the production port is Python.
+
+[udf]
+enable_embedded_python_udf = true
+
+# pg-wire is plaintext on the v6 single-host `platform` bridge — see
+# ADR-00xx-sops-centralized-secrets. Per-(plugin, org) role auth is
+# OAuth/JWT against control-plane JWKS; root uses the static password.

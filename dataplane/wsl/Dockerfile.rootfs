@@ -49,9 +49,9 @@ RUN set -eux; \
 # Data-plane payload. Run the supervisor as a non-root user (postgres + RW
 # refuse to run as root); it owns /data (state) + /opt/opencapital (binaries).
 COPY --from=gobuild /out/control-plane /out/gateway /out/read-gateway /opt/opencapital/bin/
-COPY infra/risingwave /opt/opencapital/infra/risingwave
-COPY infra/postgres/init /opt/opencapital/infra/postgres/init
-COPY infra/wsl/supervisor.sh /opt/opencapital/supervisor.sh
+COPY dataplane/risingwave /opt/opencapital/infra/risingwave
+COPY dataplane/postgres/init /opt/opencapital/infra/postgres/init
+COPY dataplane/wsl/supervisor.sh /opt/opencapital/supervisor.sh
 RUN set -eux; \
     install -d /opt/opencapital/risingwave /opt/opencapital/logs /data; \
     printf '[udf]\nenable_embedded_python_udf = true\n' > /opt/opencapital/risingwave/config.toml; \

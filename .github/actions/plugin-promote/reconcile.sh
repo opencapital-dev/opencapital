@@ -124,13 +124,19 @@ staging_repo() { printf '%s/%s/%s/%s' "$REGISTRY" "$OWNER" "$STAGING_NS" "$1"; }
 # repo-not-found is empty: a transient registry 5xx / network error must NOT
 # read as "no trusted tags" (in reconcile mode that mis-drives toAdd/toRemove),
 # so any other non-zero oras exit fails loudly.
+#
+# cosign signatures/attestations are stored as `sha256-<digest>[.sig|.att|...]`
+# pseudo-tags alongside the version tags. These are NOT plugin versions: counting
+# them would (1) plan their deletion as "not in manifest" — stripping signatures
+# off live trusted versions — and (2) make the ownership map try to read a
+# footprint from a signature manifest (it has none) and fail closed. Exclude them.
 if ! declare -F current_tags >/dev/null; then
 current_tags() {
   local out err rc
   err="$(mktemp)"
   if out="$(oras repo tags "$(trusted_repo "$1")" 2>"$err")"; then
     rm -f "$err"
-    printf '%s\n' "$out" | grep -v '^[[:space:]]*$' || true
+    printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | grep -v '^sha256-' || true
     return 0
   fi
   rc=$?

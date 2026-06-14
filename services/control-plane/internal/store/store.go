@@ -727,3 +727,52 @@ func coalesceMap(m map[string]any) map[string]any {
 	}
 	return m
 }
+
+// PluginSource is one user-added per-plugin manifest URL.
+type PluginSource struct {
+	ManifestURL string
+	Publisher   string
+	Enabled     bool
+	AddedAt     time.Time
+}
+
+func (s *Store) ListPluginSources(ctx context.Context) ([]PluginSource, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT manifest_url, publisher, enabled, added_at FROM plugin_sources ORDER BY added_at`)
+	if err != nil {
+		return nil, fmt.Errorf("list plugin_sources: %w", err)
+	}
+	defer rows.Close()
+	var out []PluginSource
+	for rows.Next() {
+		var p PluginSource
+		if err := rows.Scan(&p.ManifestURL, &p.Publisher, &p.Enabled, &p.AddedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CreatePluginSource(ctx context.Context, url, publisher string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO plugin_sources (manifest_url, publisher) VALUES ($1, $2)`, url, publisher)
+	if err != nil {
+		return fmt.Errorf("create plugin_source: %w", err)
+	}
+	return nil
+}
+
+// DeletePluginSource removes a user-added source. Returns (deleted, error).
+func (s *Store) DeletePluginSource(ctx context.Context, url string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM plugin_sources WHERE manifest_url = $1`, url)
+	if err != nil {
+		return false, fmt.Errorf("delete plugin_source: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Store) UpdateSourcePublisher(ctx context.Context, url, publisher string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE plugin_sources SET publisher = $2 WHERE manifest_url = $1`, url, publisher)
+	return err
+}

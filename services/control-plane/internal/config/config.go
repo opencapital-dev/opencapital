@@ -39,30 +39,18 @@ type Config struct {
 	KindeIssuer   string
 	KindeAudience string
 
-	// v8 plugin registry (GHCR). Control-plane reads plugin artifacts +
-	// self-describing footprints from this registry at runtime (no hardcoded
-	// manifests). RegistryInternalURL is how control-plane reaches the registry.
-	// RegistryPublicURL is the host-reachable base stamped into reconciler blob
-	// URLs. RegistryNamespace is the repository prefix plugins are published under.
-	RegistryInternalURL string
-	RegistryPublicURL   string
-	RegistryNamespace   string
-
-	// RegistryStagingNamespace is the repository prefix freshly-published
-	// (unverified) plugin artifacts land under before the promotion gate
-	// signature-verifies them and copies them into RegistryNamespace.
+	// Janitor / staging publish path ONLY (not federated discovery): the GHCR
+	// host, trusted + staging namespaces, and owner the staging janitor prunes.
+	// The catalog reads registry coordinates from each per-plugin manifest, not
+	// from these. REGISTRY_USERNAME/PASSWORD are read directly in main.go.
+	RegistryInternalURL      string
+	RegistryNamespace        string
 	RegistryStagingNamespace string
+	RegistryOwner            string
 
-	// RegistryOwner is the GHCR owner/org; required in GHCR mode — used by the
-	// Packages REST enumerator/deleter.
-	RegistryOwner string
-
-	// PluginsManifestURL is the PUBLIC plugins manifest (GitHub Pages) the
-	// marketplace catalog reads its validated-version set from, replacing the
-	// GitHub Packages REST enumeration of the trusted namespace. When empty,
-	// main.go falls back to the legacy trusted-namespace enumeration so a
-	// misconfigured deploy serves a (stale-shaped) catalog rather than a blank
-	// one. Loaded from PLUGINS_MANIFEST_URL.
+	// PluginsManifestURL is the curated marketplace LIST (array of per-plugin
+	// manifest URLs) the catalog seeds the official set from. Loaded from
+	// PLUGINS_MANIFEST_URL.
 	PluginsManifestURL string
 
 	// v6 Phase 3 install endpoint targets. The control plane is the only
@@ -155,7 +143,6 @@ func Load() (Config, error) {
 	cfg.KindeAudience = os.Getenv("KINDE_AUDIENCE")
 
 	cfg.RegistryInternalURL = strings.TrimRight(os.Getenv("REGISTRY_INTERNAL_URL"), "/")
-	cfg.RegistryPublicURL = strings.TrimRight(os.Getenv("REGISTRY_PUBLIC_URL"), "/")
 	cfg.RegistryNamespace = envOrDefault("REGISTRY_NAMESPACE", "plugins")
 	cfg.RegistryStagingNamespace = envOrDefault("REGISTRY_STAGING_NAMESPACE", "plugins-staging")
 	cfg.RegistryOwner = os.Getenv("REGISTRY_OWNER")

@@ -5,6 +5,7 @@ import { Login } from "./components/Login";
 import { AppShell, NavKey } from "./components/AppShell";
 import { LaunchView } from "./components/LaunchView";
 import { PluginsView } from "./components/PluginsView";
+import { SourcesView } from "./components/SourcesView";
 import { CreateWorkspaceModal } from "./components/CreateWorkspaceModal";
 import { SettingsView } from "./components/SettingsView";
 import { UpdatePrompt } from "./components/UpdatePrompt";
@@ -108,6 +109,7 @@ function App() {
         {selectedOrg && nav === "plugins" && (
           <PluginsView key={selectedOrg.org_id} org={selectedOrg} />
         )}
+        {selectedOrg && nav === "sources" && <SourcesView />}
         {selectedOrg && nav === "settings" && (
           <SettingsView
             state={updater.state}

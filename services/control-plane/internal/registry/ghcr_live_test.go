@@ -17,9 +17,9 @@ func TestGHCRLive_EnumerateStaging(t *testing.T) {
 	if owner == "" || token == "" {
 		t.Skip("set GHCR_OWNER and GHCR_TOKEN to run")
 	}
-	c := New("https://ghcr.io", "https://ghcr.io", "plugins", "plugins-staging",
-		nil, owner, token).WithEnumerator(NewGHCREnumerator(token))
-	ids, err := c.ListStagingPluginIDs(context.Background())
+	s := NewStaging("https://ghcr.io", "plugins", "plugins-staging", owner, token).
+		WithEnumerator(NewGHCREnumerator(token))
+	ids, err := s.ListStagingPluginIDs(context.Background())
 	if err != nil {
 		t.Fatalf("enumerate staging on GHCR: %v", err)
 	}

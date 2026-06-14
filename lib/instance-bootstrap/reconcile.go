@@ -91,6 +91,11 @@ func install(ctx context.Context, cfg Config, p Plugin) error {
 
 	if cacheValid(cacheDir, p.Artifact.Sha256) {
 		emit(cfg, progressEvent{Event: "plugin", Plugin: p.PluginID, Status: "cached"})
+		// Re-assert the backend exec bit: a cache entry extracted before this
+		// fix (or by an older build) still has the gpx_* binary at 0644.
+		if err := ensureBackendExecutable(cacheDir); err != nil {
+			return err
+		}
 		return linkPlugin(linkPath, cacheDir)
 	}
 
@@ -114,6 +119,9 @@ func install(ctx context.Context, cfg Config, p Plugin) error {
 	if err := extractInto(tmpFile, cacheDir); err != nil {
 		return err
 	}
+	if err := ensureBackendExecutable(cacheDir); err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(cacheDir, markerFile), []byte(p.Artifact.Sha256), 0o644); err != nil {
 		return fmt.Errorf("write marker: %w", err)
 	}
@@ -123,6 +131,48 @@ func install(ctx context.Context, cfg Config, p Plugin) error {
 		return err
 	}
 	emit(cfg, progressEvent{Event: "plugin", Plugin: p.PluginID, Status: "done"})
+	return nil
+}
+
+// ensureBackendExecutable sets the exec bit on a backend plugin's binary.
+// OCI plugin artifacts pack the gpx_* backend binary with tar mode 0644, which
+// extractInto faithfully preserves — so Grafana's fork/exec of the backend
+// fails with "permission denied" and the plugin is reported "not installed".
+// Grafana names the backend file <executable>_<os>_<arch>[.exe], so chmod +x
+// every file whose name starts with the plugin.json "executable" prefix. No-op
+// for frontend-only plugins (backend=false or no executable).
+func ensureBackendExecutable(dir string) error {
+	b, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
+	if os.IsNotExist(err) {
+		return nil // no manifest → nothing to mark executable (Grafana validates plugin.json)
+	}
+	if err != nil {
+		return fmt.Errorf("read plugin.json: %w", err)
+	}
+	var pj struct {
+		Backend    bool   `json:"backend"`
+		Executable string `json:"executable"`
+	}
+	if err := json.Unmarshal(b, &pj); err != nil {
+		return fmt.Errorf("parse plugin.json: %w", err)
+	}
+	if !pj.Backend || pj.Executable == "" {
+		return nil
+	}
+	prefix := filepath.Base(pj.Executable)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if err := os.Chmod(path, 0o755); err != nil {
+			return fmt.Errorf("chmod %s: %w", path, err)
+		}
+	}
 	return nil
 }
 

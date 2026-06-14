@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Required by the compute sidecar: it is a PyInstaller one-file binary that
+    unpacks an embedded Python.framework to a temp dir and dlopen()s it at
+    runtime. The embedded framework is signed separately from the outer
+    binary, so with the hardened runtime's library validation enabled the load
+    is rejected ("different Team IDs"). This entitlement is on Apple's allowed
+    list and is the standard, notarization-compatible way to ship an embedded
+    interpreter. Tauri applies these entitlements to the app and the bundled
+    sidecars, signing inside-out — so this stays correct once a Developer ID
+    cert + notarization are added (only the signing identity/secrets change).
+  -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

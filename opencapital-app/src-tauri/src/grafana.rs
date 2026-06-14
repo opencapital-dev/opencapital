@@ -19,7 +19,7 @@ use crate::compute;
 use crate::config::AppConfig;
 use crate::kinde::{self, Session};
 use crate::proxy::{self, Shared};
-use crate::runtime::{self, RuntimePaths};
+use crate::runtime;
 
 /// emit a launch-progress event the frontend renders as a status line.
 fn emit(app: &AppHandle, status: &str, detail: &str) {
@@ -62,6 +62,15 @@ pub async fn launch_grafana(
     let shared_arc = shared.inner().clone();
     proxy::start(shared_arc.clone())?;
     *shared_arc.instance_token.lock().unwrap() = Some(token);
+
+    // 1b. Reconcile the org's installed plugins to (required ∪ local selection):
+    //     the single install/uninstall/self-heal path. Required plugins are
+    //     ensured every launch (self-heals an org whose onboarding missed them);
+    //     the plugins view only edits the selection, never installs. Runs here in
+    //     the async context so it finishes before the blocking grafana reconcile
+    //     provisions whatever is now installed.
+    emit(&app, "reconcile", "Reconciling plugin selection…");
+    kinde::reconcile_plugin_selection(&app, cfg.inner(), session.inner(), &org_id).await?;
 
     // 2. Heavy lifting (downloads, reconcile, spawn) off the async runtime.
     let cfg_owned = cfg.inner().clone();
@@ -136,7 +145,7 @@ pub fn launch(
     let compute_port = compute::start(app, cfg, shared)?;
     let compute_url = format!("http://127.0.0.1:{}", compute_port);
 
-    emit(app, "runtime", "Checking grafana + numbat runtime…");
+    emit(app, "runtime", "Checking grafana runtime…");
     let rt = runtime::ensure(cfg, |m| emit(app, "runtime", m))?;
 
     // Overlay our customized Grafana frontend (bundled `grafana-public` resource)
@@ -189,7 +198,6 @@ pub fn launch(
         needs_subcmd: rt.grafana_needs_server_subcmd,
         homepath: rt.grafana_homepath.clone(),
         config: ini.clone(),
-        numbat_modules: rt.numbat_modules.clone(),
         log_path: inst.join("logs/grafana.log"),
         rw_host: rw_host.clone(),
         rw_port: rw_port.clone(),
@@ -282,11 +290,14 @@ fn dsn_field(dsn: &str, field: &str) -> Option<String> {
 
 // --- reconcile ---------------------------------------------------------------
 
-/// instance_bootstrap_command builds a `go run ./cmd/instance-bootstrap`
-/// invocation pre-loaded with the shared Config env that both subcommands
-/// (reconcile + library-panels) read. The caller appends the subcommand arg
-/// and any step-specific env (e.g. GRAFANA_URL for library-panels). stdout +
-/// stderr are piped so progress can be streamed line by line.
+/// instance_bootstrap_command builds an invocation of the bundled
+/// `instance-bootstrap` sidecar binary (resolved next to the app exe, the same
+/// way as the data-plane services — built + staged by `make dataplane-stage`),
+/// pre-loaded with the shared Config env that both subcommands (reconcile +
+/// library-panels) read. The caller appends the subcommand arg and any
+/// step-specific env (e.g. GRAFANA_URL for library-panels). stdout + stderr are
+/// piped so progress can be streamed line by line. Returns an error if the
+/// sidecar is missing (a packaging bug — the app never shells out to `go`).
 #[allow(clippy::too_many_arguments)]
 fn instance_bootstrap_command(
     cfg: &AppConfig,
@@ -298,16 +309,14 @@ fn instance_bootstrap_command(
     rw_host: &str,
     rw_port: &str,
     compute_url: &str,
-) -> Command {
-    let boot_dir = cfg.repo_dir.join("lib/instance-bootstrap");
+) -> Result<Command, String> {
+    let bin = crate::dataplane::sidecar_bin("instance-bootstrap")?;
     // Writable SQLite root stamped into every plugin's jsonData as pluginsRoot.
     // Grafana sanitizes the plugin subprocess env, so this must travel as data,
     // not as a PLUGINS_ROOT env on grafana-server.
     let plugin_state = cfg.runtime_dir.join("plugin-state");
-    let mut cmd = Command::new("go");
-    cmd.args(["run", "./cmd/instance-bootstrap"])
-        .current_dir(&boot_dir)
-        .env("ORG_ID", &args.org_id)
+    let mut cmd = Command::new(&bin);
+    cmd.env("ORG_ID", &args.org_id)
         .env("PLUGIN_STATE_DIR", &plugin_state)
         .env("CONTROL_PLANE_URL", &cfg.control_plane_url)
         .env("BOOTSTRAP_TOKEN", &cfg.bootstrap_token)
@@ -325,7 +334,7 @@ fn instance_bootstrap_command(
         .env("PLUGIN_PINS", crate::config::pins_env_value(&cfg.base_dir(), &args.org_id))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd
+    Ok(cmd)
 }
 
 /// drain_stderr reads whatever the child wrote to stderr (best-effort).
@@ -356,13 +365,13 @@ fn reconcile(
     compute_url: &str,
 ) -> Result<(), String> {
     if cfg.bootstrap_token.is_empty() {
-        return Err("bootstrap token not found (set BOOTSTRAP_TOKEN or run `make secrets-sync`)".into());
+        return Err("bootstrap token not set (local data plane provides it automatically; for a remote control plane set BOOTSTRAP_TOKEN)".into());
     }
     let mut child = instance_bootstrap_command(
         cfg, args, provisioning, plugins_dir, cache_dir, instance_token_url, rw_host, rw_port, compute_url,
-    )
+    )?
     .spawn()
-    .map_err(|e| format!("spawn reconciler (is `go` installed?): {e}"))?;
+    .map_err(|e| format!("spawn reconciler: {e}"))?;
 
     if let Some(out) = child.stdout.take() {
         let reader = BufReader::new(out);
@@ -400,9 +409,15 @@ fn provision_library_panels(
     compute_url: &str,
     port: u16,
 ) {
-    let mut cmd = instance_bootstrap_command(
+    let mut cmd = match instance_bootstrap_command(
         cfg, args, provisioning, plugins_dir, cache_dir, instance_token_url, rw_host, rw_port, compute_url,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = app.emit("library-panels-progress", format!("WARN: {e}"));
+            return;
+        }
+    };
     cmd.arg("library-panels")
         .env("GRAFANA_URL", format!("http://127.0.0.1:{}", port))
         .env("GRAFANA_WEBAUTH_USER", &args.webauth_user);
@@ -412,7 +427,7 @@ fn provision_library_panels(
         Err(e) => {
             let _ = app.emit(
                 "library-panels-progress",
-                format!("WARN: failed to spawn library-panels (is `go` installed?): {e}"),
+                format!("WARN: failed to spawn library-panels: {e}"),
             );
             return;
         }
@@ -525,7 +540,6 @@ struct SpawnSpec {
     needs_subcmd: bool,
     homepath: PathBuf,
     config: PathBuf,
-    numbat_modules: PathBuf,
     log_path: PathBuf,
     // App plugins reach RisingWave via pluginclient, which reads the RW host
     // from RISINGWAVE_HOST/PORT env (default "risingwave" — the compose
@@ -544,7 +558,6 @@ fn spawn_grafana(spec: &SpawnSpec) -> Result<Child, String> {
     }
     cmd.arg(format!("--homepath={}", spec.homepath.to_string_lossy()))
         .arg(format!("--config={}", spec.config.to_string_lossy()))
-        .env("NUMBAT_PATH", &spec.numbat_modules)
         // NOTE: only GF_* env survives into plugin subprocesses (Grafana
         // sanitizes the rest), so plugin config like the SQLite root and the RW
         // host travels via jsonData (instance-bootstrap), NOT env. These two are

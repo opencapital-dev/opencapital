@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { css, keyframes } from "@emotion/css";
 import { GrafanaTheme2 } from "@grafana/data";
-import { Alert, Button, Icon, Spinner, Text, useStyles2 } from "@grafana/ui";
+import { Alert, Button, Icon, Text, useStyles2 } from "@grafana/ui";
 import { api, errMsg } from "../api";
 import type { MeOrgs, Org } from "../types";
+import { ProgressButton } from "./ProgressButton";
 
 type Props = {
   me: MeOrgs;
@@ -15,24 +16,22 @@ type Props = {
 };
 
 // Ordered launch stages. The backend emits a `status` matching one of these
-// keys on the `launch-progress` event; we light each row as it arrives.
-const STAGES = [
-  { key: "runtime", label: "Checking runtime" },
-  { key: "provision", label: "Writing provisioning" },
-  { key: "reconcile", label: "Reconciling plugins" },
-  { key: "config", label: "Rendering configuration" },
-  { key: "spawn", label: "Starting Grafana" },
-  { key: "health", label: "Waiting for Grafana" },
-  { key: "ready", label: "Ready" },
+// keys on the `launch-progress` event. We don't surface the stage names — they
+// only drive how far the progress bar has filled.
+const STAGE_KEYS = [
+  "runtime",
+  "provision",
+  "reconcile",
+  "config",
+  "spawn",
+  "health",
+  "ready",
 ] as const;
-
-type StageState = "pending" | "active" | "done";
 
 export function LaunchView({ me, org, userEmail }: Props) {
   const styles = useStyles2(getStyles);
   const [phase, setPhase] = useState<"idle" | "launching" | "live">("idle");
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [detail, setDetail] = useState("");
   const [error, setError] = useState("");
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
@@ -42,19 +41,9 @@ export function LaunchView({ me, org, userEmail }: Props) {
 
     unsubs.push(
       listen<{ status: string; detail: string }>("launch-progress", (e) => {
-        const { status, detail } = e.payload;
+        const { status } = e.payload;
         setActiveKey(status);
-        setDetail(detail || "");
         if (status === "ready") setPhase("live");
-      })
-    );
-
-    unsubs.push(
-      listen<string>("reconcile-progress", (e) => {
-        // Backend sends either a JSON plugin event or a plain status line.
-        // Turn it into one friendly sub-line; never show raw JSON.
-        const friendly = humanizeReconcile(e.payload);
-        if (friendly) setDetail(friendly);
       })
     );
 
@@ -83,14 +72,12 @@ export function LaunchView({ me, org, userEmail }: Props) {
   useEffect(() => {
     setPhase("idle");
     setActiveKey(null);
-    setDetail("");
     setError("");
   }, [org.org_id]);
 
   async function launch() {
     setPhase("launching");
-    setActiveKey(STAGES[0].key);
-    setDetail("");
+    setActiveKey(STAGE_KEYS[0]);
     setError("");
     try {
       await api.launch(org.org_id, userEmail, userEmail || me.user_id);
@@ -100,19 +87,17 @@ export function LaunchView({ me, org, userEmail }: Props) {
     }
   }
 
-  const activeIdx = activeKey ? STAGES.findIndex((s) => s.key === activeKey) : -1;
+  // Map the current stage to a fill percentage. Keep a small floor so the bar
+  // is visibly underway the moment a launch starts.
+  const activeIdx = activeKey ? STAGE_KEYS.indexOf(activeKey as (typeof STAGE_KEYS)[number]) : -1;
+  const pct = Math.max(8, Math.round(((activeIdx + 1) / STAGE_KEYS.length) * 100));
 
   return (
     <div className={styles.wrap}>
       <header className={styles.head}>
-        <div>
-          <Text element="h1" variant="h3">
-            Launch
-          </Text>
-          <Text color="secondary">
-            Boot the Grafana instance for {org.name} in a dedicated window.
-          </Text>
-        </div>
+        <Text element="h1" variant="h3">
+          Launch
+        </Text>
       </header>
 
       <div className={styles.stage}>
@@ -131,47 +116,26 @@ export function LaunchView({ me, org, userEmail }: Props) {
               Relaunch
             </Button>
           </div>
-        ) : phase === "launching" ? (
-          <div className={styles.progressCard}>
-            <ol className={styles.steps}>
-              {STAGES.map((s, i) => {
-                const state: StageState =
-                  i < activeIdx ? "done" : i === activeIdx ? "active" : "pending";
-                return (
-                  <li key={s.key} className={styles.step} data-state={state}>
-                    <span className={styles.dot} data-state={state}>
-                      {state === "done" ? (
-                        <Icon name="check" size="sm" />
-                      ) : state === "active" ? (
-                        <Spinner inline size="sm" />
-                      ) : (
-                        <span className={styles.pendingDot} />
-                      )}
-                    </span>
-                    <span className={styles.stepLabel}>{s.label}</span>
-                  </li>
-                );
-              })}
-            </ol>
-            {detail && (
-              <div className={styles.detail}>
-                <Text variant="bodySmall" color="secondary">
-                  {detail}
-                </Text>
-              </div>
-            )}
-          </div>
         ) : (
           <div className={styles.idleCard}>
             <div className={styles.pulse}>
               <Icon name="rocket" size="xxl" />
             </div>
-            <Text color="secondary">
-              Plugins and provisioning are reconciled automatically on launch.
-            </Text>
-            <Button size="lg" icon="play" onClick={launch} className={styles.launchBtn}>
-              Launch Grafana
-            </Button>
+            {phase === "idle" && (
+              <Text color="secondary">
+                Plugins and provisioning are reconciled automatically on launch.
+              </Text>
+            )}
+            <ProgressButton
+              active={phase === "launching"}
+              value={pct}
+              idleLabel="Launch"
+              activeLabel="Launching…"
+              icon="play"
+              size="lg"
+              onClick={launch}
+              className={styles.launchBtn}
+            />
           </div>
         )}
       </div>
@@ -183,38 +147,6 @@ export function LaunchView({ me, org, userEmail }: Props) {
       )}
     </div>
   );
-}
-
-function humanizeReconcile(raw: string): string {
-  try {
-    const o = JSON.parse(raw);
-    if (o && o.event === "plugin" && o.plugin) {
-      const verb: Record<string, string> = {
-        downloading: "Downloading",
-        verifying: "Verifying",
-        extracting: "Extracting",
-        linking: "Linking",
-        done: "Installed",
-        cached: "Cached",
-      };
-      const v = verb[o.status] || o.status;
-      return `${v} ${prettyPlugin(o.plugin)}`;
-    }
-  } catch {
-    // not JSON — fall through
-  }
-  if (raw.includes("provisioned")) {
-    const m = raw.match(/provisioned (\d+)/);
-    return m ? `Provisioned ${m[1]} plugins` : "";
-  }
-  return "";
-}
-
-function prettyPlugin(id: string): string {
-  return id
-    .replace(/[_-]+/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase())
-    .trim();
 }
 
 const pulse = keyframes({
@@ -247,63 +179,24 @@ const getStyles = (theme: GrafanaTheme2) => ({
     background: theme.colors.background.primary,
     border: `1px solid ${theme.colors.border.weak}`,
     borderRadius: theme.shape.radius.default,
+    boxShadow: theme.shadows.z1,
   }),
   pulse: css({
-    color: theme.colors.primary.text,
-    animation: `${pulse} 3s ease-in-out infinite`,
-  }),
-  launchBtn: css({ marginTop: theme.spacing(1), minWidth: 220, justifyContent: "center" }),
-  progressCard: css({
-    width: "100%",
-    padding: theme.spacing(4),
-    background: theme.colors.background.primary,
-    border: `1px solid ${theme.colors.border.weak}`,
-    borderRadius: theme.shape.radius.default,
-  }),
-  steps: css({
-    listStyle: "none",
-    margin: 0,
-    padding: 0,
-    display: "flex",
-    flexDirection: "column",
-    gap: theme.spacing(1.5),
-  }),
-  step: css({
-    display: "flex",
-    alignItems: "center",
-    gap: theme.spacing(2),
-    transition: "opacity 0.2s ease",
-    '&[data-state="pending"]': { opacity: 0.45 },
-  }),
-  dot: css({
-    width: 22,
-    height: 22,
-    flexShrink: 0,
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
+    width: 88,
+    height: 88,
     borderRadius: theme.shape.radius.circle,
-    color: theme.colors.primary.contrastText,
-    '&[data-state="done"]': { background: theme.colors.success.main },
-    '&[data-state="active"]': { background: theme.colors.primary.main },
-    '&[data-state="pending"]': { background: "transparent" },
+    color: theme.colors.primary.text,
+    background: theme.colors.primary.transparent,
+    boxShadow: `inset 0 0 0 1px ${theme.colors.primary.borderTransparent}`,
+    animation: `${pulse} 3s ease-in-out infinite`,
+    "@media (prefers-reduced-motion: reduce)": {
+      animation: "none",
+    },
   }),
-  pendingDot: css({
-    width: 8,
-    height: 8,
-    borderRadius: theme.shape.radius.circle,
-    border: `2px solid ${theme.colors.border.medium}`,
-  }),
-  stepLabel: css({
-    fontSize: theme.typography.body.fontSize,
-    color: theme.colors.text.primary,
-  }),
-  detail: css({
-    marginTop: theme.spacing(2.5),
-    paddingTop: theme.spacing(2),
-    borderTop: `1px solid ${theme.colors.border.weak}`,
-    minHeight: 20,
-  }),
+  launchBtn: css({ marginTop: theme.spacing(1), minWidth: 220, justifyContent: "center" }),
   liveCard: css({
     width: "100%",
     display: "flex",
@@ -315,6 +208,17 @@ const getStyles = (theme: GrafanaTheme2) => ({
     background: theme.colors.background.primary,
     border: `1px solid ${theme.colors.success.borderTransparent}`,
     borderRadius: theme.shape.radius.default,
+    boxShadow: theme.shadows.z1,
   }),
-  liveIcon: css({ color: theme.colors.success.text }),
+  liveIcon: css({
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: 88,
+    height: 88,
+    borderRadius: theme.shape.radius.circle,
+    color: theme.colors.success.text,
+    background: theme.colors.success.transparent,
+    boxShadow: `inset 0 0 0 1px ${theme.colors.success.borderTransparent}`,
+  }),
 });

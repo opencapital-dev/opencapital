@@ -57,7 +57,8 @@ lib/instance-bootstrap/instance-bootstrap
 .DS_Store
 
 # Claude / skill scratch (local tooling, not repo source).
-.claude/worktrees/
+.claude/
+.github/skills/
 .impeccable/
 
 # Compiled command binaries (built on demand from cmd/*).

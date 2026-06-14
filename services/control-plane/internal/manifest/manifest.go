@@ -1,50 +1,48 @@
-// Package manifest reads the marketplace's plugin/version set from a PUBLIC
-// JSON manifest (plugins.json published to the opencapital repo, read
-// over raw.githubusercontent.com), replacing the per-namespace GitHub Packages
-// REST enumeration the catalog used to do.
-//
-// The manifest is the source of truth for which plugin versions exist. It has
-// two sections:
-//
-//	{
-//	  "plugins": {"core-app":["1.2.0","1.1.0"],"core-datasource":["0.4.1"],"yfinance-app":[]},
-//	  "preview": {"core-app":["0.1.1"],"core-datasource":["0.1.6","0.1.5"],"yfinance-app":["0.1.1"]}
-//	}
-//
-// `plugins` = VALIDATED/productive versions (highest-is-productive; an empty
-// list means no validated version exists yet). `preview` = PREVIEW/staging
-// versions surfaced in the marketplace preview channel. Versions are bare
-// semver, highest-first.
+// Package manifest parses the two federated-catalog file formats:
+//   - PluginClient: fetches + caches a per-plugin self-describing manifest
+//     (registry coords + own version list), one instance per manifest URL.
+//   - ListClient: fetches + caches the curated marketplace list (an array of
+//     per-plugin manifest URLs).
 package manifest
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
+	"net/url"
 	"sync"
 	"time"
-
-	"golang.org/x/mod/semver"
 )
 
 // DefaultTTL is how long a successfully-fetched manifest is served before the
 // next request triggers a refresh.
 const DefaultTTL = 60 * time.Second
 
-type doc struct {
-	Plugins map[string][]string `json:"plugins"`
-	Preview map[string][]string `json:"preview"`
+// PluginManifest is the per-plugin self-describing manifest: registry coords
+// plus the plugin's own validated/preview version lists.
+type PluginManifest struct {
+	SchemaVersion int          `json:"schemaVersion"`
+	PluginID      string       `json:"pluginId"`
+	Publisher     string       `json:"publisher"`
+	Registry      RegistrySpec `json:"registry"`
+	Versions      []string     `json:"versions"`
+	Preview       []string     `json:"preview,omitempty"`
 }
 
-// Client fetches + caches the public plugins manifest. It is concurrency-safe:
-// the marketplace handlers read it from multiple requests at once. On a refresh
-// failure it serves the last good value (logging at Warn); only a COLD miss
-// (never fetched successfully) returns an error.
-type Client struct {
+// RegistrySpec holds the OCI registry coordinates for one plugin.
+type RegistrySpec struct {
+	Host             string `json:"host"`
+	Namespace        string `json:"namespace"`
+	StagingNamespace string `json:"stagingNamespace,omitempty"`
+	PublicURL        string `json:"publicURL,omitempty"`
+}
+
+// PluginClient fetches + caches one per-plugin manifest URL.
+type PluginClient struct {
 	url   string
 	httpc *http.Client
 	ttl   time.Duration
@@ -52,13 +50,14 @@ type Client struct {
 	log   *slog.Logger
 
 	mu        sync.Mutex
-	cached    *doc // nil until the first successful fetch
+	cached    *PluginManifest
 	fetchedAt time.Time
 }
 
-// New builds a Client for the given manifest URL. ttl<=0 selects DefaultTTL.
-// httpc nil selects a client with a sane timeout.
-func New(url string, httpc *http.Client, ttl time.Duration, log *slog.Logger) *Client {
+// NewPluginClient builds a PluginClient for the given manifest URL. ttl<=0
+// selects DefaultTTL. httpc nil selects a client with a sane timeout. log nil
+// selects slog.Default().
+func NewPluginClient(url string, httpc *http.Client, ttl time.Duration, log *slog.Logger) *PluginClient {
 	if httpc == nil {
 		httpc = &http.Client{Timeout: 15 * time.Second}
 	}
@@ -68,140 +67,133 @@ func New(url string, httpc *http.Client, ttl time.Duration, log *slog.Logger) *C
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Client{url: url, httpc: httpc, ttl: ttl, now: time.Now, log: log}
+	return &PluginClient{url: url, httpc: httpc, ttl: ttl, now: time.Now, log: log}
 }
 
-// load returns the cached manifest doc, refreshing it if stale. On a refresh
+// Fetch returns the cached manifest, refreshing it if stale. On a refresh
 // failure with a warm cache it returns the stale value; on a cold miss it
-// returns the error. One fetch serves both the validated (plugins) and preview
-// sections.
-func (c *Client) load(ctx context.Context) (*doc, error) {
+// returns the error.
+func (c *PluginClient) Fetch(ctx context.Context) (*PluginManifest, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	if c.cached != nil && c.now().Sub(c.fetchedAt) < c.ttl {
 		return c.cached, nil
 	}
-
-	fresh, err := c.fetch(ctx)
+	body, err := getJSON(ctx, c.httpc, c.url)
 	if err != nil {
 		if c.cached != nil {
-			c.log.Warn("plugins manifest refresh failed; serving cached value",
-				"err", err, "url", c.url)
+			c.log.Warn("plugin manifest refresh failed; serving cached", "err", err, "url", c.url)
 			return c.cached, nil
 		}
-		return nil, fmt.Errorf("fetch plugins manifest %s: %w", c.url, err)
+		return nil, fmt.Errorf("fetch plugin manifest %s: %w", c.url, err)
 	}
-	c.cached = fresh
-	c.fetchedAt = c.now()
+	var m PluginManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decode plugin manifest %s: %w", c.url, err)
+	}
+	if err := validatePlugin(&m); err != nil {
+		return nil, fmt.Errorf("invalid plugin manifest %s: %w", c.url, err)
+	}
+	c.cached, c.fetchedAt = &m, c.now()
 	return c.cached, nil
 }
 
-func (c *Client) fetch(ctx context.Context) (*doc, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+func validatePlugin(m *PluginManifest) error {
+	if m.PluginID == "" {
+		return errors.New("pluginId required")
+	}
+	if m.Registry.Host == "" {
+		return errors.New("registry.host required")
+	}
+	if m.Registry.Namespace == "" {
+		return errors.New("registry.namespace required")
+	}
+	if len(m.Preview) > 0 && m.Registry.StagingNamespace == "" {
+		return errors.New("preview set but registry.stagingNamespace missing")
+	}
+	return nil
+}
+
+// listDoc is the JSON shape for the curated marketplace list.
+type listDoc struct {
+	SchemaVersion int      `json:"schemaVersion"`
+	Plugins       []string `json:"plugins"`
+}
+
+// ListClient fetches + caches the curated marketplace list (array of per-plugin
+// manifest URLs).
+type ListClient struct {
+	url   string
+	httpc *http.Client
+	ttl   time.Duration
+	now   func() time.Time
+	log   *slog.Logger
+
+	mu        sync.Mutex
+	cached    []string
+	fetchedAt time.Time
+}
+
+// NewListClient builds a ListClient for the given marketplace list URL. ttl<=0
+// selects DefaultTTL. httpc nil selects a client with a sane timeout. log nil
+// selects slog.Default().
+func NewListClient(url string, httpc *http.Client, ttl time.Duration, log *slog.Logger) *ListClient {
+	if httpc == nil {
+		httpc = &http.Client{Timeout: 15 * time.Second}
+	}
+	if ttl <= 0 {
+		ttl = DefaultTTL
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &ListClient{url: url, httpc: httpc, ttl: ttl, now: time.Now, log: log}
+}
+
+// Fetch returns the cached URL list, refreshing it if stale. On a refresh
+// failure with a warm cache it returns the stale value; on a cold miss it
+// returns the error. Each entry is validated to be an http(s) URL.
+func (c *ListClient) Fetch(ctx context.Context) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cached != nil && c.now().Sub(c.fetchedAt) < c.ttl {
+		return c.cached, nil
+	}
+	body, err := getJSON(ctx, c.httpc, c.url)
+	if err != nil {
+		if c.cached != nil {
+			c.log.Warn("marketplace list refresh failed; serving cached", "err", err, "url", c.url)
+			return c.cached, nil
+		}
+		return nil, fmt.Errorf("fetch marketplace list %s: %w", c.url, err)
+	}
+	var d listDoc
+	if err := json.Unmarshal(body, &d); err != nil {
+		return nil, fmt.Errorf("decode marketplace list: %w", err)
+	}
+	for _, u := range d.Plugins {
+		if pu, perr := url.Parse(u); perr != nil || (pu.Scheme != "http" && pu.Scheme != "https") {
+			return nil, fmt.Errorf("marketplace list entry %q is not an http(s) URL", u)
+		}
+	}
+	c.cached, c.fetchedAt = d.Plugins, c.now()
+	return c.cached, nil
+}
+
+// getJSON GETs url and returns the body, erroring on non-200.
+func getJSON(ctx context.Context, httpc *http.Client, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.httpc.Do(req)
+	resp, err := httpc.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		// Drain a small amount so the connection can be reused.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	var d doc
-	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
-	}
-	if d.Plugins == nil {
-		d.Plugins = map[string][]string{}
-	}
-	if d.Preview == nil {
-		d.Preview = map[string][]string{}
-	}
-	return &d, nil
-}
-
-// PluginIDs returns the manifest's validated-section plugin keys, sorted.
-// Includes plugins with an empty validated list — callers that need a validated
-// version filter those out via ValidatedVersions.
-func (c *Client) PluginIDs(ctx context.Context) ([]string, error) {
-	d, err := c.load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return sortedKeys(d.Plugins), nil
-}
-
-// ValidatedVersions returns the validated versions for one plugin, semver-desc
-// (highest first). Unknown id or empty list yields an empty slice.
-func (c *Client) ValidatedVersions(ctx context.Context, id string) ([]string, error) {
-	d, err := c.load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return sortSemverDesc(d.Plugins[id]), nil
-}
-
-// PreviewPluginIDs returns the manifest's preview-section plugin keys, sorted.
-// A missing `preview` section yields an empty slice (not an error).
-func (c *Client) PreviewPluginIDs(ctx context.Context) ([]string, error) {
-	d, err := c.load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return sortedKeys(d.Preview), nil
-}
-
-// PreviewVersions returns the preview versions for one plugin, semver-desc
-// (highest first). Unknown id or empty list yields an empty slice.
-func (c *Client) PreviewVersions(ctx context.Context, id string) ([]string, error) {
-	d, err := c.load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return sortSemverDesc(d.Preview[id]), nil
-}
-
-func sortedKeys(m map[string][]string) []string {
-	out := make([]string, 0, len(m))
-	for id := range m {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// normSemver returns version's v-prefixed canonical form for comparison, or ""
-// if it isn't semver. Tolerates bare versions (the manifest's form) by trying a
-// leading "v".
-func normSemver(v string) string {
-	if semver.IsValid(v) {
-		return v
-	}
-	if p := "v" + v; semver.IsValid(p) {
-		return p
-	}
-	return ""
-}
-
-// sortSemverDesc returns the original version strings, greatest semver first,
-// dropping any that aren't valid semver.
-func sortSemverDesc(versions []string) []string {
-	type tagged struct{ orig, norm string }
-	valid := make([]tagged, 0, len(versions))
-	for _, v := range versions {
-		if n := normSemver(v); n != "" {
-			valid = append(valid, tagged{orig: v, norm: n})
-		}
-	}
-	sort.Slice(valid, func(i, j int) bool { return semver.Compare(valid[i].norm, valid[j].norm) > 0 })
-	out := make([]string, len(valid))
-	for i, v := range valid {
-		out[i] = v.orig
-	}
-	return out
+	return io.ReadAll(resp.Body)
 }

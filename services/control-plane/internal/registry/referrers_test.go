@@ -6,12 +6,12 @@ import (
 )
 
 func TestFindSignatureReferrer_GHCRMislabeledIndex(t *testing.T) {
-	c := newFakeClient(t,
+	s := newFakeStaging(t,
 		map[string][]string{},
 		map[string][]string{"core-datasource": {"v1.0.0"}},
 		map[string]bool{"plugins-staging/core-datasource": true},
 	)
-	repo, err := c.stagingRepo("core-datasource")
+	repo, err := s.repo(s.stagingNamespace, "core-datasource")
 	if err != nil {
 		t.Fatal(err)
 	}

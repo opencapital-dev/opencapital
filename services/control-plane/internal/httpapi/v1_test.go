@@ -22,6 +22,7 @@ func TestMarketplaceEntryTypeRoundTrips(t *testing.T) {
 		},
 		Required: true,
 		Version:  "v1.2.3",
+		Source:   registry.SourceInfo{URL: "u", Publisher: "OpenCapital", Verified: true},
 	}
 
 	// Construct the entry exactly as handleV1MarketplaceCatalog does.
@@ -34,6 +35,7 @@ func TestMarketplaceEntryTypeRoundTrips(t *testing.T) {
 		Required:               rp.Required,
 		LatestValidatedVersion: rp.Version,
 	}
+	entry.Source = rp.Source
 
 	if entry.Type != "datasource" {
 		t.Fatalf("entry.Type = %q, want %q (rp.Type must copy the embedded footprint Type)", entry.Type, "datasource")
@@ -49,6 +51,13 @@ func TestMarketplaceEntryTypeRoundTrips(t *testing.T) {
 	}
 	if got["type"] != "datasource" {
 		t.Fatalf("response JSON `type` = %v, want %q (field must serialize for marketplace catalog)", got["type"], "datasource")
+	}
+	src, ok := got["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("source field missing or wrong type: %v", got["source"])
+	}
+	if src["verified"] != true {
+		t.Fatalf("source.verified = %v, want true", src["verified"])
 	}
 }
 

@@ -1,7 +1,7 @@
 // Grafana runtime: ensure the host binaries the desktop shell drives are
 // present. Under v8 there are no baked plugins and no baked Grafana — the
-// shell downloads vanilla grafana-server + the numbat CLI on first launch
-// (the reconciler installs plugins separately). Everything lives under
+// shell extracts the bundled grafana-server tarball on first launch (the
+// reconciler installs plugins separately). Everything lives under
 // RUNTIME_DIR, content-checked by a marker file so re-launches are instant.
 //
 // Extraction shells out to the system `tar` (macOS/Linux ship it); the v0
@@ -14,9 +14,9 @@ use std::process::Command;
 
 use crate::config::AppConfig;
 
-/// Vanilla grafana version the shell downloads. Stored in the `.ready` marker;
-/// a mismatch forces a re-download (e.g. after bumping this). Keep in sync with
-/// the version in `config::default_grafana_url`.
+/// Vanilla grafana version bundled with the app. Stored in the `.ready` marker;
+/// a mismatch forces a re-extract (e.g. after bumping this). Keep in sync with
+/// the grafana tarball staged by `make app` (Makefile GRAFANA_URL).
 const GRAFANA_VERSION: &str = "13.0.2";
 
 /// Resolved paths to the runtime binaries grafana needs.
@@ -29,27 +29,20 @@ pub struct RuntimePaths {
     /// True when grafana_bin is the unified `grafana` binary needing a
     /// leading `server` subcommand argument.
     pub grafana_needs_server_subcmd: bool,
-    /// numbat CLI the core-datasource datasource shells out to.
-    pub numbat_bin: PathBuf,
-    /// numbat modules dir (NUMBAT_PATH) the CLI loads its stdlib from.
-    pub numbat_modules: PathBuf,
 }
 
-/// ensure downloads + extracts grafana-server and numbat if missing, then
-/// returns the resolved paths. Blocking; call via spawn_blocking.
+/// ensure extracts the bundled grafana-server if missing, then returns the
+/// resolved paths. Blocking; call via spawn_blocking.
 pub fn ensure<F: Fn(&str)>(cfg: &AppConfig, progress: F) -> Result<RuntimePaths, String> {
     fs::create_dir_all(&cfg.runtime_dir).map_err(|e| format!("mkdir runtime dir: {e}"))?;
 
     let grafana_home = ensure_grafana(cfg, &progress)?;
     let (grafana_bin, needs_subcmd) = resolve_grafana_bin(&grafana_home)?;
-    let (numbat_bin, numbat_modules) = ensure_numbat(cfg, &progress)?;
 
     Ok(RuntimePaths {
         grafana_homepath: grafana_home,
         grafana_bin,
         grafana_needs_server_subcmd: needs_subcmd,
-        numbat_bin,
-        numbat_modules,
     })
 }
 
@@ -59,24 +52,12 @@ fn ensure_grafana<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<PathBuf,
     if fs::read_to_string(&marker).ok().as_deref().map(str::trim) == Some(GRAFANA_VERSION) {
         return Ok(dest);
     }
-    let art = resolve_artifact(
-        cfg.artifacts_dir.as_deref(),
-        "grafana.tar.gz",
-        &cfg.grafana_download_url,
-        &cfg.runtime_dir,
-    )?;
-    progress(if art.owned {
-        "Downloading grafana-server (first launch only)…"
-    } else {
-        "Unpacking bundled grafana-server…"
-    });
+    let tarball = resolve_artifact(cfg.artifacts_dir.as_deref(), "grafana.tar.gz")?;
+    progress("Unpacking bundled grafana-server…");
     let staging = cfg.runtime_dir.join(".grafana-staging");
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-    untar(&art.path, &staging)?;
-    if art.owned {
-        let _ = fs::remove_file(&art.path);
-    }
+    untar(&tarball, &staging)?;
 
     // The tarball extracts to a single grafana-<ver> dir; move it to dest.
     let inner = single_subdir(&staging)?;
@@ -144,61 +125,26 @@ fn resolve_grafana_bin(home: &Path) -> Result<(PathBuf, bool), String> {
     Err(format!("no grafana binary under {}/bin", home.display()))
 }
 
-fn ensure_numbat<F: Fn(&str)>(cfg: &AppConfig, progress: &F) -> Result<(PathBuf, PathBuf), String> {
-    let dest = cfg.runtime_dir.join("numbat");
-    let bin = dest.join("numbat");
-    let modules = dest.join("modules");
-    if bin.exists() && modules.exists() {
-        return Ok((bin, modules));
+/// resolve_artifact returns the bundled tarball `<artifacts_dir>/<name>`, staged
+/// into the app by `make app` (see config::resolve_artifacts_dir). The app is
+/// one self-contained bundle: the artifact MUST be present, so a missing dir or
+/// file fails loudly rather than downloading at launch.
+pub(crate) fn resolve_artifact(artifacts_dir: Option<&Path>, name: &str) -> Result<PathBuf, String> {
+    let dir = artifacts_dir
+        .ok_or_else(|| format!("no bundled artifacts dir for {name} (build with `make app`)"))?;
+    let bundled = dir.join(name);
+    if !bundled.exists() {
+        return Err(format!(
+            "bundled artifact {name} missing at {} (run `make app`)",
+            bundled.display()
+        ));
     }
-    progress("Downloading numbat CLI (first launch only)…");
-    let tarball = download(&cfg.numbat_download_url, &cfg.runtime_dir, "numbat.tar.gz")?;
-    progress("Extracting numbat…");
-    let staging = cfg.runtime_dir.join(".numbat-staging");
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-    untar(&tarball, &staging)?;
-    let _ = fs::remove_file(&tarball);
-
-    let inner = single_subdir(&staging)?;
-    let _ = fs::remove_dir_all(&dest);
-    fs::rename(&inner, &dest).map_err(|e| format!("place numbat: {e}"))?;
-    let _ = fs::remove_dir_all(&staging);
-    if !bin.exists() {
-        return Err(format!("numbat binary missing at {}", bin.display()));
-    }
-    Ok((bin, modules))
+    Ok(bundled)
 }
 
-/// An artifact tarball resolved either from the app bundle (offline) or a
-/// download. `owned` is true when we downloaded it into runtime_dir (caller
-/// should delete after extract); false for a read-only bundled resource.
-pub(crate) struct Artifact {
-    pub path: PathBuf,
-    pub owned: bool,
-}
-
-/// resolve_artifact prefers the bundled tarball `<artifacts_dir>/<name>` (staged
-/// into a release build so the app is fully offline) and falls back to
-/// downloading `url` into `runtime_dir`. Same artifact either way — the caller's
-/// extract + version-marker logic is unchanged.
-pub(crate) fn resolve_artifact(
-    artifacts_dir: Option<&Path>,
-    name: &str,
-    url: &str,
-    runtime_dir: &Path,
-) -> Result<Artifact, String> {
-    if let Some(dir) = artifacts_dir {
-        let bundled = dir.join(name);
-        if bundled.exists() {
-            return Ok(Artifact { path: bundled, owned: false });
-        }
-    }
-    let path = download(url, runtime_dir, name)?;
-    Ok(Artifact { path, owned: true })
-}
-
-/// download fetches url to dir/name (blocking) and returns the path.
+/// download fetches url to dir/name (blocking) and returns the path. Only the
+/// Windows WSL-rootfs path downloads at runtime; macOS/Linux bundle everything.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn download(url: &str, dir: &Path, name: &str) -> Result<PathBuf, String> {
     let resp = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(600))

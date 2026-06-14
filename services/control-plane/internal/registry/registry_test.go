@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -221,156 +220,95 @@ func fakeFootprintBlob(id string) []byte {
 	return b
 }
 
-// fakeManifestSource implements ManifestSource from two in-memory
-// plugin->versions maps (bare-semver, any order — the accessors sort
-// semver-desc). plugins = validated section, preview = preview section.
-type fakeManifestSource struct {
-	plugins map[string][]string
-	preview map[string][]string
-}
+// fakeProvider is a static PluginProvider for catalog tests.
+type fakeProvider struct{ refs []*PluginRef }
 
-func fakeSortedKeys(m map[string][]string) []string {
-	out := make([]string, 0, len(m))
-	for id := range m {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
-}
+func (f fakeProvider) Plugins(context.Context) ([]*PluginRef, error) { return f.refs, nil }
 
-func (f fakeManifestSource) PluginIDs(_ context.Context) ([]string, error) {
-	return fakeSortedKeys(f.plugins), nil
-}
-
-func (f fakeManifestSource) ValidatedVersions(_ context.Context, id string) ([]string, error) {
-	return sortSemverDesc(f.plugins[id]), nil
-}
-
-func (f fakeManifestSource) PreviewPluginIDs(_ context.Context) ([]string, error) {
-	return fakeSortedKeys(f.preview), nil
-}
-
-func (f fakeManifestSource) PreviewVersions(_ context.Context, id string) ([]string, error) {
-	return sortSemverDesc(f.preview[id]), nil
-}
-
-// fakeEnum implements RepoEnumerator backed by the same in-memory maps as fakeOCIServer.
-type fakeEnum struct{ trusted, staging map[string][]string }
-
-func (f fakeEnum) ReposWithPrefix(_ context.Context, prefix string) ([]string, error) {
-	m := f.trusted
-	if prefix == "plugins-staging/" {
-		m = f.staging
-	}
-	var out []string
-	for id := range m {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-// newFakeClient builds a *Client pointed at an httptest server serving the given
-// trusted and staging tag maps. sig is keyed by "<ns>/<id>" and marks repos that
-// have a bundle signature referrer (emulating GHCR's mislabeled referrers index).
-// Pass nil for sig when referrer support is not needed.
-func newFakeClient(t *testing.T, trusted, staging map[string][]string, sig map[string]bool) *Client {
+// newFakeCatalog builds a *Client whose single ref points at an httptest OCI
+// server serving the given trusted + staging tag maps under the "plugins" /
+// "plugins-staging" namespaces. validated/preview are the ref's version sets.
+func newFakeCatalog(t *testing.T, trusted, staging map[string][]string, sig map[string]bool, refs []*PluginRef, host string) *Client {
 	t.Helper()
 	f := &fakeOCIServer{trusted: trusted, staging: staging, sig: sig}
 	f.referrerDigest = "sha256:" + sha256Digest(f.referrerManifest())
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
-	// Strip http:// — New parses it back out.
-	c := New(srv.URL, srv.URL, "plugins", "plugins-staging", nil, "", "")
-	return c.WithEnumerator(fakeEnum{trusted, staging})
+	bare := strings.TrimPrefix(srv.URL, "http://")
+	for _, r := range refs {
+		r.Reg.Host = bare
+		r.Reg.PlainHTTP = true
+		r.Reg.Namespace = "plugins"
+		r.Reg.StagingNamespace = "plugins-staging"
+	}
+	_ = host
+	return NewCatalog(fakeProvider{refs: refs}, nil)
 }
 
-func TestVersionsWithStatus_ManifestValidatedAndPreview(t *testing.T) {
-	// Validated set from .plugins, preview set from .preview; no oras read.
-	c := newFakeClient(t,
-		map[string][]string{},
-		map[string][]string{},
-		nil,
-	).WithManifest(fakeManifestSource{
-		plugins: map[string][]string{"yfinance": {"1.0.1", "1.0.2"}},
-		preview: map[string][]string{"yfinance": {"1.0.3"}},
-	})
-	got, err := c.VersionsWithStatus(context.Background(), "yfinance")
+func ref(id string, validated, preview []string) *PluginRef {
+	return &PluginRef{
+		ManifestURL: "https://manifest.test/" + id + ".json",
+		PluginID:    id, Publisher: "OpenCapital", Verified: true,
+		Reg:       &Registry{},
+		Validated: validated, Preview: preview,
+	}
+}
+
+func TestRegistryPublicBase(t *testing.T) {
+	if (&Registry{Host: "ghcr.io"}).publicBase() != "https://ghcr.io" {
+		t.Fatal("default publicBase wrong")
+	}
+	if (&Registry{Host: "ghcr.io", PublicURL: "https://cdn.x"}).publicBase() != "https://cdn.x" {
+		t.Fatal("explicit publicBase wrong")
+	}
+}
+
+func TestSourceInfoFromRef(t *testing.T) {
+	r := &PluginRef{ManifestURL: "u", Publisher: "Acme", Verified: false}
+	if got := r.sourceInfo(); got.URL != "u" || got.Publisher != "Acme" || got.Verified {
+		t.Fatalf("sourceInfo = %+v", got)
+	}
+}
+
+func TestListEmptyWhenRegistryAbsent(t *testing.T) {
+	// The ref names a validated version, but the OCI server has NO repo for it
+	// (404 NameUnknown) → repoAbsent swallows it → the plugin is skipped, the
+	// catalog is empty, and List does not error.
+	refs := []*PluginRef{ref("x", []string{"1.0.0"}, nil)}
+	c := newFakeCatalog(t,
+		map[string][]string{}, // no trusted repos
+		map[string][]string{}, // no staging repos
+		nil, refs, "")
+	got, err := c.List(context.Background())
 	if err != nil {
-		t.Fatalf("VersionsWithStatus: %v", err)
+		t.Fatalf("List: %v", err)
 	}
-	want := []VersionStatus{
-		{Version: "1.0.3", Validated: false},
-		{Version: "1.0.2", Validated: true},
-		{Version: "1.0.1", Validated: true},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v want %+v", got, want)
+	if len(got) != 0 {
+		t.Fatalf("expected empty (registry repo absent → 404), got %d", len(got))
 	}
 }
 
-func TestVersionsWithStatus_ManifestNoPreview(t *testing.T) {
-	c := newFakeClient(t,
-		map[string][]string{},
-		map[string][]string{},
-		nil,
-	).WithManifest(fakeManifestSource{
-		plugins: map[string][]string{"yfinance": {"1.0.1"}},
-		preview: map[string][]string{}, // no preview versions
-	})
-	got, err := c.VersionsWithStatus(context.Background(), "yfinance")
-	if err != nil {
-		t.Fatalf("VersionsWithStatus: %v", err)
+func TestList_LatestValidatedPerPlugin(t *testing.T) {
+	// Trusted tags are v-prefixed (real GHCR); refs hold bare semver.
+	refs := []*PluginRef{
+		ref("core-app", []string{"1.2.0", "1.1.0"}, nil),
+		ref("core-datasource", []string{"0.4.1"}, nil),
+		ref("yfinance-app", nil, nil), // no validated, no preview => skipped
 	}
-	want := []VersionStatus{{Version: "1.0.1", Validated: true}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v want %+v", got, want)
-	}
-}
-
-func TestVersionsWithStatus_NoManifestFallsBackToTrusted(t *testing.T) {
-	// Without a ManifestSource, only the trusted namespace is read (all
-	// Validated); the staging namespace is NOT consulted for the version list.
-	c := newFakeClient(t,
-		map[string][]string{"yfinance": {"v1.0.1", "v1.0.2"}},
-		map[string][]string{"yfinance": {"v1.0.1", "v1.0.2", "v1.0.3"}},
-		nil,
-	)
-	got, err := c.VersionsWithStatus(context.Background(), "yfinance")
-	if err != nil {
-		t.Fatalf("VersionsWithStatus: %v", err)
-	}
-	want := []VersionStatus{
-		{Version: "v1.0.2", Validated: true},
-		{Version: "v1.0.1", Validated: true},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v want %+v", got, want)
-	}
-}
-
-func TestList_FromManifest_LatestValidatedPerPlugin(t *testing.T) {
-	// Trusted tags are v-prefixed (real GHCR); manifest holds bare semver.
-	c := newFakeClient(t,
+	c := newFakeCatalog(t,
 		map[string][]string{
 			"core-app":        {"v1.1.0", "v1.2.0"},
 			"core-datasource": {"v0.4.1"},
-			"yfinance-app":    {"v0.9.0"},
 		},
 		map[string][]string{},
-		nil,
-	).WithManifest(fakeManifestSource{plugins: map[string][]string{
-		"core-app":        {"1.2.0", "1.1.0"},
-		"core-datasource": {"0.4.1"},
-		"yfinance-app":    {}, // validated list empty AND no preview => skipped
-	}})
+		nil, refs, "")
 
 	got, err := c.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("List returned %d plugins, want 2 (yfinance-app has no validated version)", len(got))
+		t.Fatalf("List returned %d plugins, want 2: %+v", len(got), got)
 	}
 	byID := map[string]Plugin{}
 	for _, p := range got {
@@ -378,46 +316,37 @@ func TestList_FromManifest_LatestValidatedPerPlugin(t *testing.T) {
 	}
 	core, ok := byID["core-app"]
 	if !ok {
-		t.Fatalf("core-app missing from catalog: %+v", got)
+		t.Fatalf("core-app missing: %+v", got)
 	}
-	if core.Version != "v1.2.0" {
-		t.Fatalf("core-app version = %q, want v1.2.0 (latest validated, v-prefixed tag)", core.Version)
+	if core.Version != "1.2.0" {
+		t.Fatalf("core-app version = %q, want 1.2.0 (latest validated)", core.Version)
 	}
 	if core.DisplayName != "Display core-app" {
 		t.Fatalf("core-app footprint not read: DisplayName=%q", core.DisplayName)
 	}
+	if core.Source.URL != "https://manifest.test/core-app.json" || !core.Source.Verified {
+		t.Fatalf("core-app source not propagated: %+v", core.Source)
+	}
 	if _, present := byID["yfinance-app"]; present {
-		t.Fatal("yfinance-app (empty validated list) must NOT appear in the catalog")
+		t.Fatal("yfinance-app (no versions) must NOT appear")
 	}
 }
 
-func TestList_FromManifest_IncludesPreviewOnlyPlugins(t *testing.T) {
-	// core-app: validated -> appears with its validated Version.
-	// preview-only: in the manifest's preview section only (no validated
-	//   version) WITH a matching staging build -> appears with empty Version,
-	//   footprint read from staging at the HIGHEST preview version.
-	// missing-build: named in the preview section but its highest preview
-	//   version has NO staging artifact -> omitted (the artifact lookup misses).
-	c := newFakeClient(t,
+func TestList_PreviewOnlyPlugin(t *testing.T) {
+	// preview-only: no validated version, footprint read from staging at the
+	// highest preview version, Version blanked.
+	refs := []*PluginRef{
+		ref("core-app", []string{"1.2.0", "1.1.0"}, nil),
+		ref("preview-only", nil, []string{"0.2.0", "0.1.0"}),
+		ref("missing-build", nil, []string{"9.9.9"}),
+	}
+	c := newFakeCatalog(t,
+		map[string][]string{"core-app": {"v1.1.0", "v1.2.0"}},
 		map[string][]string{
-			"core-app": {"v1.1.0", "v1.2.0"},
-		},
-		map[string][]string{
-			// staging tags are v-prefixed; the manifest names bare semver.
-			"preview-only": {"v0.1.0", "v0.2.0"},
-			// missing-build has a staging repo but NOT the v9.9.9 the manifest names.
+			"preview-only":  {"v0.1.0", "v0.2.0"},
 			"missing-build": {"v0.0.1"},
 		},
-		nil,
-	).WithManifest(fakeManifestSource{
-		plugins: map[string][]string{
-			"core-app": {"1.2.0", "1.1.0"},
-		},
-		preview: map[string][]string{
-			"preview-only":  {"0.2.0", "0.1.0"}, // highest = 0.2.0 -> staging v0.2.0
-			"missing-build": {"9.9.9"},          // no v9.9.9 in staging => omitted
-		},
-	})
+		nil, refs, "")
 
 	got, err := c.List(context.Background())
 	if err != nil {
@@ -427,101 +356,59 @@ func TestList_FromManifest_IncludesPreviewOnlyPlugins(t *testing.T) {
 	for _, p := range got {
 		byID[p.PluginID] = p
 	}
-
-	// Validated plugin: real validated version surfaced.
-	core, ok := byID["core-app"]
-	if !ok {
-		t.Fatalf("core-app missing from catalog: %+v", got)
-	}
-	if core.Version != "v1.2.0" {
-		t.Fatalf("core-app version = %q, want v1.2.0 (latest validated)", core.Version)
-	}
-
-	// Preview-only: appears, Version empty, footprint sourced from the staging
-	// artifact at the highest preview version (v0.2.0, via bare->v fallback).
 	prev, ok := byID["preview-only"]
 	if !ok {
-		t.Fatalf("preview-only must appear (has a staging build at its preview version): %+v", got)
+		t.Fatalf("preview-only must appear: %+v", got)
 	}
 	if prev.Version != "" {
-		t.Fatalf("preview-only Version = %q, want empty (no validated version)", prev.Version)
+		t.Fatalf("preview-only Version = %q, want empty", prev.Version)
 	}
 	if prev.DisplayName != "Display preview-only" {
 		t.Fatalf("preview-only footprint not read from staging: DisplayName=%q", prev.DisplayName)
 	}
-
-	// missing-build: preview version named but no staging artifact => omitted.
 	if _, present := byID["missing-build"]; present {
-		t.Fatal("missing-build (preview version absent from staging) must NOT appear")
+		t.Fatal("missing-build (preview absent from staging) must NOT appear")
 	}
-
 	if len(got) != 2 {
 		t.Fatalf("List returned %d plugins, want 2 (core-app, preview-only): %+v", len(got), got)
 	}
 }
 
-func TestList_FromManifest_ValidatedWinsOverPreview(t *testing.T) {
-	// A plugin present in BOTH the validated and preview sections appears ONCE,
-	// on the validated path (Version set to the validated version).
-	c := newFakeClient(t,
-		map[string][]string{
-			"core-app": {"v1.2.0"},
-		},
-		map[string][]string{
-			"core-app": {"v1.2.0", "v1.3.0"}, // a newer preview build also staged
-		},
-		nil,
-	).WithManifest(fakeManifestSource{
-		plugins: map[string][]string{"core-app": {"1.2.0"}},
-		preview: map[string][]string{"core-app": {"1.3.0", "1.2.0"}},
-	})
-
-	got, err := c.List(context.Background())
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("List returned %d plugins, want 1 (core-app once): %+v", len(got), got)
-	}
-	if got[0].Version != "v1.2.0" {
-		t.Fatalf("core-app version = %q, want v1.2.0 (validated path wins)", got[0].Version)
-	}
-}
-
-func TestVersionsWithStatus_FromManifest(t *testing.T) {
-	// The version LIST is the union of the manifest's validated and preview
-	// sections — NO oras staging-tag listing. preview has 1.2.0 (also validated)
-	// and 1.3.0 (preview-only). validated also has 1.1.0 (preview-pruned), which
-	// must still appear.
-	c := newFakeClient(t,
-		map[string][]string{},
-		map[string][]string{}, // no staging-OCI read at all
-		nil,
-	).WithManifest(fakeManifestSource{
-		plugins: map[string][]string{"core-app": {"1.2.0", "1.1.0"}},
-		preview: map[string][]string{"core-app": {"1.3.0", "1.2.0"}},
-	})
-
+func TestVersionsWithStatus_UnionValidatedAndPreview(t *testing.T) {
+	c := NewCatalog(fakeProvider{refs: []*PluginRef{
+		ref("core-app", []string{"1.2.0", "1.1.0"}, []string{"1.3.0", "1.2.0"}),
+	}}, nil)
 	got, err := c.VersionsWithStatus(context.Background(), "core-app")
 	if err != nil {
 		t.Fatalf("VersionsWithStatus: %v", err)
 	}
 	want := []VersionStatus{
-		{Version: "1.3.0", Validated: false}, // preview-only
-		{Version: "1.2.0", Validated: true},  // preview + validated (validated form reported)
-		{Version: "1.1.0", Validated: true},  // validated-only
+		{Version: "1.3.0", Validated: false},
+		{Version: "1.2.0", Validated: true},
+		{Version: "1.1.0", Validated: true},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v want %+v", got, want)
 	}
 }
 
+func TestVersionsWithStatus_UnknownID(t *testing.T) {
+	c := NewCatalog(fakeProvider{refs: nil}, nil)
+	got, err := c.VersionsWithStatus(context.Background(), "nope")
+	if err != nil {
+		t.Fatalf("VersionsWithStatus: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("unknown id should yield empty, got %+v", got)
+	}
+}
+
 func TestResolveArtifact_TrustedPath(t *testing.T) {
-	c := newFakeClient(t,
+	refs := []*PluginRef{ref("yfinance", []string{"1.0.2"}, []string{"1.0.3"})}
+	c := newFakeCatalog(t,
 		map[string][]string{"yfinance": {"v1.0.2"}},
 		map[string][]string{"yfinance": {"v1.0.2", "v1.0.3"}},
-		nil,
-	)
+		nil, refs, "")
 	art, ok, err := c.ResolveArtifact(context.Background(), "yfinance", "v1.0.2", "darwin-arm64")
 	if err != nil || !ok {
 		t.Fatalf("ResolveArtifact trusted: ok=%v err=%v", ok, err)
@@ -531,13 +418,69 @@ func TestResolveArtifact_TrustedPath(t *testing.T) {
 	}
 }
 
+func TestResolveArtifact_FallsBackToStagingForPreview(t *testing.T) {
+	refs := []*PluginRef{ref("yfinance", []string{"1.0.2"}, []string{"1.0.3"})}
+	c := newFakeCatalog(t,
+		map[string][]string{"yfinance": {"v1.0.2"}},
+		map[string][]string{"yfinance": {"v1.0.2", "v1.0.3"}},
+		nil, refs, "")
+	art, ok, err := c.ResolveArtifact(context.Background(), "yfinance", "v1.0.3", "darwin-arm64")
+	if err != nil || !ok {
+		t.Fatalf("ResolveArtifact preview: ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(art.DownloadURL, "/plugins-staging/") {
+		t.Fatalf("expected staging namespace in URL, got %q", art.DownloadURL)
+	}
+}
+
+func TestGetVersion_TrustedThenStaging(t *testing.T) {
+	refs := []*PluginRef{ref("yfinance", []string{"1.0.2"}, []string{"1.0.3"})}
+	c := newFakeCatalog(t,
+		map[string][]string{"yfinance": {"v1.0.2"}},
+		map[string][]string{"yfinance": {"v1.0.2", "v1.0.3"}},
+		nil, refs, "")
+	// trusted tag
+	p, found, err := c.GetVersion(context.Background(), "yfinance", "v1.0.2")
+	if err != nil || !found {
+		t.Fatalf("GetVersion trusted: found=%v err=%v", found, err)
+	}
+	if p.Version != "v1.0.2" {
+		t.Fatalf("version = %q want v1.0.2", p.Version)
+	}
+	// staging-only tag falls back
+	p, found, err = c.GetVersion(context.Background(), "yfinance", "v1.0.3")
+	if err != nil || !found {
+		t.Fatalf("GetVersion staging fallback: found=%v err=%v", found, err)
+	}
+	if p.Source.URL == "" {
+		t.Fatalf("GetVersion must propagate source")
+	}
+}
+
+func TestGet_LatestValidated(t *testing.T) {
+	refs := []*PluginRef{ref("core-app", []string{"1.2.0", "1.1.0"}, nil)}
+	c := newFakeCatalog(t,
+		map[string][]string{"core-app": {"v1.1.0", "v1.2.0"}},
+		map[string][]string{},
+		nil, refs, "")
+	p, found, err := c.Get(context.Background(), "core-app")
+	if err != nil || !found {
+		t.Fatalf("Get: found=%v err=%v", found, err)
+	}
+	if p.Version != "1.2.0" {
+		t.Fatalf("version = %q want 1.2.0", p.Version)
+	}
+	if !p.Source.Verified {
+		t.Fatalf("Get must propagate source: %+v", p.Source)
+	}
+}
+
 func TestStagingTagSigned_GHCRMislabeledIndex(t *testing.T) {
-	c := newFakeClient(t,
+	s := newFakeStaging(t,
 		map[string][]string{},
 		map[string][]string{"core-datasource": {"v1.0.0"}},
-		map[string]bool{"plugins-staging/core-datasource": true},
-	)
-	signed, err := c.StagingTagSigned(context.Background(), "core-datasource", "v1.0.0")
+		map[string]bool{"plugins-staging/core-datasource": true})
+	signed, err := s.StagingTagSigned(context.Background(), "core-datasource", "v1.0.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,12 +490,11 @@ func TestStagingTagSigned_GHCRMislabeledIndex(t *testing.T) {
 }
 
 func TestStagingTagSigned_Unsigned(t *testing.T) {
-	c := newFakeClient(t,
+	s := newFakeStaging(t,
 		map[string][]string{},
 		map[string][]string{"core-datasource": {"v1.0.0"}},
-		nil, // no signature referrer
-	)
-	signed, err := c.StagingTagSigned(context.Background(), "core-datasource", "v1.0.0")
+		nil)
+	signed, err := s.StagingTagSigned(context.Background(), "core-datasource", "v1.0.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,20 +503,43 @@ func TestStagingTagSigned_Unsigned(t *testing.T) {
 	}
 }
 
-func TestResolveArtifact_FallsBackToStagingForPreview(t *testing.T) {
-	c := newFakeClient(t,
-		map[string][]string{"yfinance": {"v1.0.2"}},
-		map[string][]string{"yfinance": {"v1.0.2", "v1.0.3"}},
-		nil,
-	)
-	art, ok, err := c.ResolveArtifact(context.Background(), "yfinance", "v1.0.3", "darwin-arm64")
-	if err != nil || !ok {
-		t.Fatalf("ResolveArtifact preview: ok=%v err=%v", ok, err)
+func TestStagingListVersions(t *testing.T) {
+	s := newFakeStaging(t,
+		map[string][]string{"yfinance": {"v1.0.1", "v1.0.2"}},
+		map[string][]string{"yfinance": {"v1.0.1", "v1.0.2", "v1.0.3"}},
+		nil)
+	trusted, err := s.ListVersions(context.Background(), "yfinance")
+	if err != nil {
+		t.Fatalf("ListVersions: %v", err)
 	}
-	if art.DownloadURL == "" {
-		t.Fatalf("expected a staging download URL")
+	if !reflect.DeepEqual(trusted, []string{"v1.0.2", "v1.0.1"}) {
+		t.Fatalf("trusted = %v", trusted)
 	}
-	if !strings.Contains(art.DownloadURL, "/plugins-staging/") {
-		t.Fatalf("expected staging namespace in URL, got %q", art.DownloadURL)
+	staged, err := s.ListStagingVersions(context.Background(), "yfinance")
+	if err != nil {
+		t.Fatalf("ListStagingVersions: %v", err)
 	}
+	if !reflect.DeepEqual(staged, []string{"v1.0.3", "v1.0.2", "v1.0.1"}) {
+		t.Fatalf("staged = %v", staged)
+	}
+}
+
+func TestNewStagingCanPrune(t *testing.T) {
+	if NewStaging("https://ghcr.io", "p", "p-staging", "", "").CanPruneStaging() {
+		t.Fatal("no creds, no deleter → cannot prune")
+	}
+	if !NewStaging("https://ghcr.io", "p", "p-staging", "user", "pat").CanPruneStaging() {
+		t.Fatal("basic auth → can prune")
+	}
+}
+
+// newFakeStaging builds a *StagingClient pointed at an httptest OCI server with
+// the given trusted + staging tag maps.
+func newFakeStaging(t *testing.T, trusted, staging map[string][]string, sig map[string]bool) *StagingClient {
+	t.Helper()
+	f := &fakeOCIServer{trusted: trusted, staging: staging, sig: sig}
+	f.referrerDigest = "sha256:" + sha256Digest(f.referrerManifest())
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	return NewStaging(srv.URL, "plugins", "plugins-staging", "", "")
 }

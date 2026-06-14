@@ -32,9 +32,10 @@ type catalogEntry struct {
 	// UninstallState surfaces an in-flight uninstall so the UI can
 	// disable controls until the worker finishes. Empty when the
 	// plugin isn't being uninstalled.
-	UninstallState     string `json:"uninstall_state,omitempty"`
-	UninstallKeysDone  int    `json:"uninstall_keys_done,omitempty"`
-	UninstallKeysTotal int    `json:"uninstall_keys_total,omitempty"`
+	UninstallState     string              `json:"uninstall_state,omitempty"`
+	UninstallKeysDone  int                 `json:"uninstall_keys_done,omitempty"`
+	UninstallKeysTotal int                 `json:"uninstall_keys_total,omitempty"`
+	Source             registry.SourceInfo `json:"source"`
 }
 
 type pluginInstallResponse struct {
@@ -118,6 +119,7 @@ func (s *Server) handleListPlugins(w http.ResponseWriter, r *http.Request, orgID
 			Description: rp.Description,
 			Required:    rp.Required,
 		}
+		entry.Source = rp.Source
 		if p, ok := idx[rp.PluginID]; ok {
 			entry.Installed = true
 			entry.InstalledAt = p.GrantedAt.Format(time.RFC3339)

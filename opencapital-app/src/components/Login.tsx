@@ -1,6 +1,6 @@
 import { css, keyframes } from "@emotion/css";
 import { GrafanaTheme2 } from "@grafana/data";
-import { Alert, Button, Spinner, Text, useStyles2 } from "@grafana/ui";
+import { Alert, Button, Icon, Spinner, Text, useStyles2 } from "@grafana/ui";
 import { Brand } from "./Brand";
 
 type Props = {
@@ -54,9 +54,12 @@ export function Login({ busy, error, onLogin, onDismissError }: Props) {
           </Alert>
         )}
       </div>
-      <Text variant="bodySmall" color="disabled">
-        Secured by single sign-on
-      </Text>
+      <div className={styles.footer}>
+        <Icon name="lock" size="sm" />
+        <Text variant="bodySmall" color="secondary">
+          Secured by single sign-on
+        </Text>
+      </div>
     </div>
   );
 }
@@ -82,13 +85,16 @@ const getStyles = (theme: GrafanaTheme2) => ({
     position: "absolute",
     top: "42%",
     left: "50%",
-    width: 720,
-    height: 720,
+    width: 760,
+    height: 760,
     transform: "translate(-50%, -50%)",
-    background: `radial-gradient(circle, ${theme.colors.primary.main}22 0%, transparent 60%)`,
-    filter: "blur(20px)",
+    background: `radial-gradient(circle, ${theme.colors.primary.main}38 0%, ${theme.colors.primary.main}12 34%, transparent 66%)`,
+    filter: "blur(24px)",
     pointerEvents: "none",
-    animation: `${float} 6s ease-in-out infinite alternate`,
+    animation: `${float} 7s ease-in-out infinite alternate`,
+    "@media (prefers-reduced-motion: reduce)": {
+      animation: "none",
+    },
   }),
   card: css({
     position: "relative",
@@ -101,7 +107,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
     maxWidth: 460,
     textAlign: "center",
     background: theme.colors.background.primary,
-    border: `1px solid ${theme.colors.border.weak}`,
+    border: `1px solid ${theme.colors.border.medium}`,
     borderRadius: theme.shape.radius.default,
     boxShadow: theme.shadows.z3,
   }),
@@ -109,6 +115,8 @@ const getStyles = (theme: GrafanaTheme2) => ({
     display: "flex",
     flexDirection: "column",
     gap: theme.spacing(1),
+    // text-wrap is inherited — balances both the h1 and the lede below it.
+    textWrap: "balance",
   }),
   cta: css({
     marginTop: theme.spacing(1),
@@ -121,4 +129,12 @@ const getStyles = (theme: GrafanaTheme2) => ({
     gap: theme.spacing(1),
   }),
   alert: css({ marginTop: theme.spacing(1), textAlign: "left" }),
+  footer: css({
+    position: "relative",
+    zIndex: 1,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: theme.spacing(0.75),
+    color: theme.colors.text.secondary,
+  }),
 });

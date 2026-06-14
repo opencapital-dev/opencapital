@@ -1,12 +1,12 @@
 {
   "plugins": {
+    "core-app": ["v0.1.2"],
+    "core-datasource": ["v0.1.7"],
+    "yfinance-app": ["v0.1.2"]
+  },
+  "preview": {
     "core-app": [],
     "core-datasource": [],
     "yfinance-app": []
-  },
-  "preview": {
-    "core-app": ["0.1.2"],
-    "core-datasource": ["0.1.7"],
-    "yfinance-app": ["0.1.2"]
   }
 }

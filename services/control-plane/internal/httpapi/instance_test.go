@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,13 @@ import (
 	"github.com/portfolio-management/control-plane/internal/registry"
 )
 
+// stubProvider is a registry.PluginProvider that yields no plugins, so the
+// catalog Client resolves every id to not-found. Auth-guard tests use it to get
+// a non-401 (503/404) once the guard passes without reaching a real registry.
+type stubProvider struct{}
+
+func (stubProvider) Plugins(context.Context) ([]*registry.PluginRef, error) { return nil, nil }
+
 // TestInstanceListVersions_AuthGuard calls handleInstanceListVersions directly
 // (no HTTP server needed). It verifies:
 //  - no bearer → 401
@@ -20,11 +28,11 @@ import (
 func TestInstanceListVersions_AuthGuard(t *testing.T) {
 	const token = "test-bootstrap-token"
 
-	// registry.New with an unreachable host returns a non-nil *Client that
-	// errors on actual calls (no panic). The handler reaches the registry only
-	// after the auth guard passes, so 401-path tests don't need it at all;
-	// the "correct bearer" sub-test gets a 503 from the failed OCI call.
-	reg := registry.New("http://127.0.0.1:0", "", "plugins", "plugins-staging", nil, "", "")
+	// NewCatalog over a no-op provider returns a non-nil *Client. The handler
+	// reaches the registry only after the auth guard passes, so 401-path tests
+	// don't need it at all; the "correct bearer" sub-test gets a 503 because the
+	// provider yields no plugins (the id resolves to not-found / unreachable).
+	reg := registry.NewCatalog(stubProvider{}, nil)
 
 	s := &Server{
 		cfg:    config.Config{AdminBootstrapToken: token},
@@ -107,7 +115,7 @@ func TestInstanceListVersions_ResponseShape(t *testing.T) {
 //   - correct bearer + ?platform=darwin-arm64 → neither 401 nor 400 (503 from stub)
 func TestInstanceArtifact_AuthGuard(t *testing.T) {
 	const token = "test-bootstrap-token"
-	reg := registry.New("http://127.0.0.1:0", "", "plugins", "plugins-staging", nil, "", "")
+	reg := registry.NewCatalog(stubProvider{}, nil)
 	s := &Server{
 		cfg:      config.Config{AdminBootstrapToken: token},
 		logger:   slog.Default(),

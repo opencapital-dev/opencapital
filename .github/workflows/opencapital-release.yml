@@ -12,7 +12,7 @@ on:
     tags: ["opencapital-v*"]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -188,8 +188,8 @@ jobs:
 
       - name: Build latest.json and publish to opencapital
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
-          RELEASES_REPO: opencapital-dev/opencapital
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES_REPO: ${{ github.repository }}
           REF_NAME: ${{ github.ref_name }}
         shell: bash
         run: |

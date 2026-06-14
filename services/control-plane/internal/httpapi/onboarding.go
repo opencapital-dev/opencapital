@@ -192,23 +192,31 @@ func (s *Server) handleCreateOrg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plugins, err := s.registry.List(ctx)
-	if err != nil {
-		s.logger.Error("onboarding: registry list", "err", err)
-		http.Error(w, "registry unavailable", http.StatusServiceUnavailable)
-		return
-	}
+	// Install only the required plugins, resolving each directly (latest
+	// trusted version, else the staging fallback). We deliberately do NOT build
+	// the full marketplace catalog here: that would fetch every plugin in the
+	// manifest — including non-required ones — and a single unreachable plugin
+	// would abort onboarding. A required plugin that is unavailable in BOTH
+	// namespaces is logged and skipped rather than failing org creation; only a
+	// genuine registry/transport error (not a missing repo) is fatal.
 	var installed []string
-	for _, rp := range plugins {
-		if !rp.Required {
+	for _, id := range s.registry.RequiredIDs() {
+		rp, found, err := s.registry.Get(ctx, id)
+		if err != nil {
+			s.logger.Error("onboarding: resolve required plugin", "err", err, "plugin", id)
+			http.Error(w, "registry unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !found {
+			s.logger.Warn("onboarding: required plugin unavailable, skipping", "plugin", id)
 			continue
 		}
 		if _, err := s.installer.Install(ctx, orgID, shortID, rp.Footprint); err != nil {
-			s.logger.Error("onboarding: plugin install", "err", err, "plugin", rp.PluginID, "org_id", orgID)
+			s.logger.Error("onboarding: plugin install", "err", err, "plugin", id, "org_id", orgID)
 			http.Error(w, "plugin install failed", http.StatusInternalServerError)
 			return
 		}
-		installed = append(installed, rp.PluginID)
+		installed = append(installed, id)
 	}
 
 	s.audit(ctx, store.AuditEntry{

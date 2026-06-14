@@ -1,5 +1,6 @@
-import { Button, Modal, Spinner, Text } from "@grafana/ui";
+import { Button, Modal, Text } from "@grafana/ui";
 import type { UpdaterState } from "../updater-core";
+import { ProgressButton } from "./ProgressButton";
 
 type Props = {
   state: UpdaterState;
@@ -16,33 +17,29 @@ export function UpdatePrompt({ state, onInstall, onDismiss }: Props) {
     return null;
   }
 
+  const downloading = state.status === "downloading";
+  const restarting = state.status === "readyToRestart";
+  const installActive = downloading || restarting;
+
   return (
     <Modal title={`Update available — ${state.version}`} isOpen onDismiss={onDismiss}>
-      {state.status === "available" && (
-        <>
-          <Text element="p">
-            {state.notes || "A new version is ready to install."}
-          </Text>
-          <Modal.ButtonRow>
-            <Button variant="secondary" onClick={onDismiss}>
-              Later
-            </Button>
-            <Button variant="primary" onClick={onInstall}>
-              Install &amp; restart
-            </Button>
-          </Modal.ButtonRow>
-        </>
-      )}
-      {state.status === "downloading" && (
-        <Text element="p">
-          <Spinner inline /> Downloading… {state.pct}%
-        </Text>
-      )}
-      {state.status === "readyToRestart" && (
-        <Text element="p">
-          <Spinner inline /> Restarting…
-        </Text>
-      )}
+      <Text element="p">
+        {state.status === "available"
+          ? state.notes || "A new version is ready to install."
+          : "Hang tight — the update is installing and the app will restart."}
+      </Text>
+      <Modal.ButtonRow>
+        <Button variant="secondary" onClick={onDismiss} disabled={installActive}>
+          Later
+        </Button>
+        <ProgressButton
+          active={installActive}
+          value={state.status === "downloading" ? state.pct : undefined}
+          idleLabel="Install & restart"
+          activeLabel={restarting ? "Restarting…" : "Downloading…"}
+          onClick={onInstall}
+        />
+      </Modal.ButtonRow>
     </Modal>
   );
 }

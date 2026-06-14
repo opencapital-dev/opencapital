@@ -199,3 +199,53 @@ func TestPluginJSONRoundTrip(t *testing.T) {
 		t.Errorf("artifact round-trip lost data: %+v", out.Artifact)
 	}
 }
+
+// TestEnsureBackendExecutable verifies the backend binary gets its exec bit set
+// (OCI artifacts pack it 0644), the platform-suffixed name is matched via the
+// plugin.json executable prefix, and frontend-only / missing-manifest dirs are
+// no-ops rather than errors.
+func TestEnsureBackendExecutable(t *testing.T) {
+	t.Run("backend binary chmod +x", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "plugin.json"), `{"backend":true,"executable":"gpx_demo"}`, 0o644)
+		bin := filepath.Join(dir, "gpx_demo_darwin_arm64")
+		writeFile(t, bin, "#!/bin/sh\n", 0o644)
+		if err := ensureBackendExecutable(dir); err != nil {
+			t.Fatalf("ensureBackendExecutable: %v", err)
+		}
+		fi, err := os.Stat(bin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm()&0o111 == 0 {
+			t.Fatalf("backend binary not executable: mode=%v", fi.Mode().Perm())
+		}
+	})
+
+	t.Run("frontend-only is a no-op", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "plugin.json"), `{"backend":false}`, 0o644)
+		f := filepath.Join(dir, "module.js")
+		writeFile(t, f, "x", 0o644)
+		if err := ensureBackendExecutable(dir); err != nil {
+			t.Fatalf("ensureBackendExecutable: %v", err)
+		}
+		fi, _ := os.Stat(f)
+		if fi.Mode().Perm()&0o111 != 0 {
+			t.Fatalf("frontend file should not be executable: mode=%v", fi.Mode().Perm())
+		}
+	})
+
+	t.Run("missing plugin.json is tolerated", func(t *testing.T) {
+		if err := ensureBackendExecutable(t.TempDir()); err != nil {
+			t.Fatalf("expected nil for missing plugin.json, got %v", err)
+		}
+	})
+}
+
+func writeFile(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+}

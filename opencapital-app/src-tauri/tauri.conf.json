@@ -28,7 +28,8 @@
     "createUpdaterArtifacts": true,
     "targets": "all",
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
     },
     "externalBin": [
       "binaries/compute"

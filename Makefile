@@ -13,22 +13,22 @@ GO_SVCS := control-plane gateway read-gateway
         compute-venv compute-freeze compute-smoke compute-sidecar-stage \
         grafana-ui grafana-ui-build grafana-ui-dev grafana-overlay-pull \
         go-sidecars dataplane-resource dataplane-stage artifacts-stage \
-        app dev app-stage app-deps \
+        app app-stage app-deps signing-key \
         rw-apply rw-parity schemas install-local
 
 help:
-	@echo "Build the desktop app (same steps CI runs — one command):"
-	@echo "  app                       - build the bundle (.app + .dmg) like CI"
-	@echo "  dev                       - run the app in dev mode (same staged prereqs)"
-	@echo "  app-stage                 - stage build prereqs only (sidecar + overlay + npm deps)"
+	@echo "Build the desktop app (the ONE path — same steps CI runs; build it, run from the build):"
+	@echo "  app                       - build the self-contained bundle (.app + .dmg) like CI"
+	@echo "  app-stage                 - stage all bundled prereqs only (no build)"
 	@echo ""
 	@echo "Individual build prereqs (invoked by app-stage; CI calls the same targets):"
 	@echo "  compute-venv              - create .venv + install the compute freeze deps"
 	@echo "  compute-sidecar-stage     - freeze compute + stage it as the Tauri externalBin sidecar"
 	@echo "  dataplane-stage           - build the 3 Go service sidecars + stage the dataplane/ tree"
-	@echo "  artifacts-stage           - download Postgres/RisingWave/Grafana tarballs into the bundle (release only)"
+	@echo "  artifacts-stage           - download Postgres/RisingWave/Grafana tarballs into the bundle"
 	@echo "  grafana-overlay-pull      - pull the pinned Grafana overlay (grafana-overlay.pin) into the bundle"
 	@echo "  app-deps                  - npm ci for the shell frontend"
+	@echo "  signing-key               - ensure an updater signing key (CI secret, else local throwaway)"
 	@echo ""
 	@echo "Other:"
 	@echo "  test / test-unit          - python unit tests (compute; no data plane required)"
@@ -138,13 +138,16 @@ compute-sidecar-stage: $(COMPUTE_SIDECAR) ## Freeze + stage the compute binary a
 # macOS/Linux only — Windows runs the plane via the bundled WSL distro.
 DATAPLANE_RESOURCE_DST := ./$(APP_DIR)/src-tauri/resources/dataplane
 
-go-sidecars: ## Build the 3 Go data-plane services as Tauri externalBin sidecars
+go-sidecars: ## Build the Go data-plane services + the grafana reconciler as Tauri externalBin sidecars
 	@mkdir -p $(COMPUTE_SIDECAR_DIR)
 	@for s in $(GO_SVCS); do \
 	  echo ">>> building $$s sidecar"; \
 	  (cd services/$$s && go build -o $(CURDIR)/$(COMPUTE_SIDECAR_DIR)/$$s-$(HOST_TRIPLE) ./cmd/$$s) || exit 1; \
 	  chmod +x $(COMPUTE_SIDECAR_DIR)/$$s-$(HOST_TRIPLE); \
 	done
+	@echo ">>> building instance-bootstrap sidecar (grafana reconciler)"
+	@(cd lib/instance-bootstrap && go build -o $(CURDIR)/$(COMPUTE_SIDECAR_DIR)/instance-bootstrap-$(HOST_TRIPLE) ./cmd/instance-bootstrap) || exit 1
+	@chmod +x $(COMPUTE_SIDECAR_DIR)/instance-bootstrap-$(HOST_TRIPLE)
 	@echo ">>> Go sidecars staged in $(COMPUTE_SIDECAR_DIR)"
 
 dataplane-resource: ## Stage dataplane/ (postgres init SQL + risingwave DDL/apply.sh) as a Tauri resource
@@ -157,11 +160,11 @@ dataplane-resource: ## Stage dataplane/ (postgres init SQL + risingwave DDL/appl
 dataplane-stage: go-sidecars dataplane-resource ## Build Go sidecars + stage the dataplane tree for the bundle
 
 # ── Bundled data-plane artifacts (Postgres / RisingWave / Grafana) ─────
-# Downloaded into the bundle resources so a release .app is fully offline (the
-# app extracts these instead of downloading on first launch — see
-# runtime::resolve_artifact). Staged only for `make app`/CI release builds, NOT
-# `make dev` (dev keeps the lighter download-to-~/.opencapital path). macOS arm64
-# URLs — keep in sync with config.rs default_{postgres,risingwave,grafana}_url.
+# Downloaded into the bundle resources so the .app is fully self-contained: the
+# app extracts these at first launch instead of ever downloading (see
+# runtime::resolve_artifact, which fails loudly if they are absent). Cached by
+# the staged file's presence. macOS arm64 URLs — postgres/risingwave URLs match
+# config.rs default_{postgres,risingwave}_url; grafana matches GRAFANA_VERSION.
 ARTIFACTS_DST  := ./$(APP_DIR)/src-tauri/resources/artifacts
 POSTGRES_URL   := https://github.com/theseus-rs/postgresql-binaries/releases/download/17.10.0/postgresql-17.10.0-aarch64-apple-darwin.tar.gz
 RISINGWAVE_URL := https://github.com/opencapital-dev/opencapital/releases/download/risingwave-2.8.0-macos-arm64/risingwave-2.8.0-macos-arm64.tar.gz
@@ -177,27 +180,45 @@ artifacts-stage: ## Download Postgres/RisingWave/Grafana tarballs into the bundl
 	done
 	@echo ">>> artifacts staged in $(ARTIFACTS_DST)"
 
-# ── Desktop app (build / run) ──────────────────────────────────────────
-# `app` and `dev` are the two entry points. Both stage the exact prereqs CI
-# stages (compute sidecar, pinned overlay, npm deps) then build/run. The
-# prereqs are idempotent, so repeat `make dev` runs are fast.
+# ── Desktop app (build) ────────────────────────────────────────────────
+# `make app` is the ONE build path — the same steps CI runs. There is no dev
+# mode: to test, build the bundle and run it from the build. app-stage stages
+# every bundled prereq (compute + Go service sidecars, dataplane tree, pinned
+# Grafana overlay, npm deps, and the PG/RW/Grafana artifact tarballs); the
+# macOS bundle config (tauri.macos.conf.json) is auto-merged by tauri, so the
+# build is a plain `tauri build` with no extra flags.
 $(APP_DIR)/node_modules: $(APP_DIR)/package-lock.json
 	cd $(APP_DIR) && npm ci
 
 app-deps: $(APP_DIR)/node_modules ## npm ci for the shell frontend
 
-app-stage: $(COMPUTE_SIDECAR) dataplane-stage grafana-overlay-pull app-deps ## Stage all build prereqs (sidecars + dataplane + overlay + deps)
-	@echo ">>> app staged (sidecars + dataplane + overlay + deps) — ready to build/run"
+app-stage: $(COMPUTE_SIDECAR) dataplane-stage artifacts-stage grafana-overlay-pull app-deps ## Stage all bundled prereqs
+	@echo ">>> app staged (sidecars + dataplane + artifacts + overlay + deps) — ready to build"
 
-app: app-stage artifacts-stage ## Build the offline desktop bundle (.app + .dmg, bundles PG/RW/Grafana), mirroring CI
-	@cd $(APP_DIR) && n=0; until npx tauri build --config $(CURDIR)/$(APP_DIR)/src-tauri/tauri.bundle.conf.json --bundles app,dmg; do \
-	  n=$$((n+1)); \
-	  [ $$n -ge 3 ] && { echo "tauri build failed after $$n attempts"; exit 1; }; \
-	  echo "build attempt $$n failed (likely flaky bundle_dmg.sh) — retrying"; sleep 5; \
-	done
+# tauri.conf.json has createUpdaterArtifacts=true + an updater pubkey, so the
+# build signs the updater artifact and needs a private key. CI injects the prod
+# key via the TAURI_SIGNING_PRIVATE_KEY secret; locally we generate a throwaway
+# key (gitignored) so `make app` is the same command and completes the same way.
+# The locally-signed updater artifact is never consumed (you run the .dmg).
+TAURI_SIGNING_KEY := $(APP_DIR)/.tauri-signing.key
 
-dev: app-stage ## Run the app in dev mode (same staged prereqs as the bundle)
-	cd $(APP_DIR) && npm run tauri dev
+signing-key: ## Ensure an updater signing key exists (env secret in CI, throwaway file locally)
+	@if [ -n "$$TAURI_SIGNING_PRIVATE_KEY" ]; then \
+	  echo ">>> using TAURI_SIGNING_PRIVATE_KEY from the environment"; \
+	elif [ ! -f $(TAURI_SIGNING_KEY) ]; then \
+	  echo ">>> generating local throwaway updater signing key"; \
+	  (cd $(APP_DIR) && npx tauri signer generate --ci -p "" -w $(CURDIR)/$(TAURI_SIGNING_KEY)); \
+	fi
+
+app: app-stage signing-key ## Build the self-contained desktop bundle (.app + .dmg), mirroring CI
+	@cd $(APP_DIR) && \
+	  export TAURI_SIGNING_PRIVATE_KEY="$${TAURI_SIGNING_PRIVATE_KEY:-$$(cat $(CURDIR)/$(TAURI_SIGNING_KEY))}" && \
+	  export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$${TAURI_SIGNING_PRIVATE_KEY_PASSWORD-}" && \
+	  n=0; until npx tauri build --bundles app,dmg; do \
+	    n=$$((n+1)); \
+	    [ $$n -ge 3 ] && { echo "tauri build failed after $$n attempts"; exit 1; }; \
+	    echo "build attempt $$n failed (likely flaky bundle_dmg.sh) — retrying"; sleep 5; \
+	  done
 
 # ── RisingWave (local data plane) ──────────────────────────────────────
 rw-apply:

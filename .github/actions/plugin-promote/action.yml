@@ -45,9 +45,21 @@ runs:
   using: composite
   steps:
     # gh, jq and yq are preinstalled on GitHub-hosted runners; cosign and oras
-    # are not, so set them up here. SHA-pinned: this path runs `cosign verify`,
-    # so a retagged installer could ship a tampered binary.
-    - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+    # are not, so set them up here.
+    #
+    # cosign is installed DIRECTLY at v3.0.6 (not via sigstore/cosign-installer,
+    # which defaults to v2.6.1). The plugins are signed with cosign v3.x
+    # --new-bundle-format; cosign v2 cannot verify that bundle format ("signature
+    # did not verify under any signer"). v3.x ships no detached .sig, so the
+    # installer action can't self-verify it anyway — mirror the publish action
+    # and curl the pinned v3.0.6 binary over HTTPS.
+    - name: install cosign v3.0.6
+      shell: bash
+      run: |
+        curl -fsSL -o "${{ runner.temp }}/cosign" \
+          https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64
+        chmod +x "${{ runner.temp }}/cosign"
+        echo "${{ runner.temp }}" >> "$GITHUB_PATH"
     - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
 
     - name: Reconcile trusted namespace

@@ -35,6 +35,14 @@ fn kill_stray_compute() {
 /// kill_stray_dataplane best-effort terminates a postgres/risingwave left over
 /// from a prior run (a `tauri dev` rebuild SIGKILLs the app but orphans its
 /// data-plane children, which then hold the fixed ports 5432/4566).
+///
+/// Go service sidecars (control-plane, gateway, read-gateway) live next to the
+/// app exe, so their path differs between a local dev build, a downloaded .app,
+/// and any previous release. Path-based pkill only kills processes from the
+/// SAME exe directory. We complement it with port-based kills so that a stale
+/// sidecar from ANY prior app version is cleared before we try to bind the same
+/// fixed ports — avoiding the scenario where the old control-plane (on port
+/// 18080) has a dead postgres and serves 500s to the new session.
 fn kill_stray_dataplane() {
     #[cfg(not(windows))]
     {
@@ -45,9 +53,23 @@ fn kill_stray_dataplane() {
         ] {
             let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
         }
-        // Go service sidecars run next to the app exe (externalBin), named
-        // `<name>` in a bundle or `<name>-<triple>` in dev. Scope the match to
-        // this exe's dir so we only kill our own orphans, matching both layouts.
+        // Go service sidecars: kill by fixed port so we catch orphans from any
+        // app instance (local dev, downloaded release, previous version).
+        for port in [
+            dataplane::CP_PORT,
+            dataplane::GW_PORT,
+            dataplane::RG_PORT,
+        ] {
+            let _ = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("lsof -ti tcp:{port} 2>/dev/null | xargs kill 2>/dev/null"),
+                ])
+                .status();
+        }
+        // Also kill from this exe's dir to catch the triple-suffixed dev layout
+        // (`control-plane-aarch64-apple-darwin`) that lsof might miss if the
+        // process hasn't bound its port yet.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 for name in ["control-plane", "gateway", "read-gateway"] {

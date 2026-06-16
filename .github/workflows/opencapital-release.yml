@@ -142,24 +142,37 @@ jobs:
           cp services/compute/dist/compute.exe opencapital-app/src-tauri/binaries/compute-x86_64-pc-windows-msvc.exe
 
       # --- pinned Grafana overlay (built in the fork; pulled here) ---
-      # Cache the overlay tarball keyed on the pin — re-download only when the
-      # pin changes.
-      - name: Cache pinned overlay
+      # macOS uses the SAME `make grafana-overlay-pull` target as a local build,
+      # so the overlay staging (extract + the `.overlay-version` marker the
+      # runtime hard-reads) can never drift from `make app`. The marker omission
+      # that previously broke launch came from an inline hand-copy of this
+      # target; calling the target directly removes that drift surface entirely.
+      - name: Pull pinned Grafana overlay (macOS)
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: make grafana-overlay-pull
+
+      # Windows can't reuse the make path: GNU tar on Windows treats an absolute
+      # dst like "D:\..." as a remote host ("Cannot connect to D"), so the
+      # extract must use a relative dir. Kept inline + cached for that reason.
+      # MUST mirror `make grafana-overlay-pull`, INCLUDING the `.overlay-version`
+      # marker write — without it the launched app fails with
+      # "read overlay version: No such file or directory".
+      - name: Cache pinned overlay (Windows)
+        if: runner.os == 'Windows'
         uses: actions/cache@v4
         with:
           path: _overlay
           key: overlay-${{ hashFiles('opencapital-app/grafana-overlay.pin') }}
 
-      # Behaviorally identical to `make grafana-overlay-pull` (the local build
-      # path); kept inline here for the actions/cache hit above and the
-      # Windows-tar workaround below.
-      - name: Pull pinned Grafana overlay
+      - name: Pull pinned Grafana overlay (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use a RELATIVE dir (no drive letter) — GNU tar on Windows treats a
-          # path like "D:\..." as a remote host ("Cannot connect to D").
+          # Relative dir (no drive letter) — see note above.
           pin=$(tr -d '[:space:]' < opencapital-app/grafana-overlay.pin)
           echo "overlay pin: $pin"
           mkdir -p _overlay
@@ -169,9 +182,10 @@ jobs:
             echo "overlay cache hit"
           fi
           dst=opencapital-app/src-tauri/resources/grafana-public
-          mkdir -p "$dst"
+          rm -rf "$dst"; mkdir -p "$dst"
           tar xzf _overlay/grafana-overlay.tar.gz -C "$dst"
-          ls "$dst"
+          echo "$pin" > "$dst/.overlay-version"
+          ls -a "$dst"
 
       # Build + minisign-sign directly via the tauri CLI. `npx tauri` bypasses the
       # `tauri` npm script (which carries a bash-only localhost env prefix for dev

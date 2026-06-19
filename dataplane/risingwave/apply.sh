@@ -124,7 +124,12 @@ run_sql() {
 # rw-apply` work standalone after `make secrets-sync`.
 : "${SECRETS_DIR:=$HERE/../secrets}"
 
-declare -A SQL_SUBSTITUTIONS=()
+# macOS /bin/bash is 3.2 (no associative arrays). The downloaded .app launches
+# from Finder with a minimal PATH, so this script runs under /bin/bash 3.2 — it
+# must avoid bash 4+ features (assoc arrays, mapfile). Parallel indexed arrays
+# keyed by position stand in for the placeholder->value map.
+SQL_SUB_KEYS=()
+SQL_SUB_VALS=()
 load_substitution() {
     local placeholder="$1" file_or_env="$2"
     local value=""
@@ -134,7 +139,8 @@ load_substitution() {
         value="$(cat "${SECRETS_DIR}/${file_or_env}")"
     fi
     if [[ -n "${value}" ]]; then
-        SQL_SUBSTITUTIONS["${placeholder}"]="${value}"
+        SQL_SUB_KEYS+=("${placeholder}")
+        SQL_SUB_VALS+=("${value}")
     fi
 }
 load_substitution "@@SR_RW_PASSWORD@@" sr_rw_password
@@ -142,19 +148,22 @@ load_substitution "@@RW_KAFKA_SASL_PASSWORD@@" rw_kafka_sasl_password
 # CDC source postgres host: compose/nomad DNS 'postgres' by default; the local
 # desktop packaging overrides via CDC_PG_HOST=127.0.0.1. Always substituted so
 # the @@CDC_PG_HOST@@ placeholder never reaches RW literally.
-SQL_SUBSTITUTIONS["@@CDC_PG_HOST@@"]="${CDC_PG_HOST:-postgres}"
+SQL_SUB_KEYS+=("@@CDC_PG_HOST@@")
+SQL_SUB_VALS+=("${CDC_PG_HOST:-postgres}")
 
 run_file() {
     local file="$1"
     echo "==> applying $file"
-    if [[ ${#SQL_SUBSTITUTIONS[@]} -gt 0 ]]; then
+    if [[ ${#SQL_SUB_KEYS[@]} -gt 0 ]]; then
         # Stream the file through sed substitutions before piping to
         # psql. Substitutions only apply to files that contain a
         # placeholder; the rest stream through unchanged.
         local sed_args=()
-        for k in "${!SQL_SUBSTITUTIONS[@]}"; do
+        local i k v
+        for i in "${!SQL_SUB_KEYS[@]}"; do
+            k="${SQL_SUB_KEYS[$i]}"
             # Escape characters that have meaning in sed's s///
-            local v="${SQL_SUBSTITUTIONS[$k]}"
+            v="${SQL_SUB_VALS[$i]}"
             v="${v//\\/\\\\}"
             v="${v//&/\\&}"
             v="${v//\//\\/}"
@@ -220,7 +229,8 @@ else
     # Walk every numbered subdirectory in path-sort order. Files in
     # */functions/ trigger wait_for_udf before the apply; otherwise just
     # apply.
-    mapfile -t v2_files < <(find "$V2_SCHEMA_DIR" -name '*.sql' -type f | LC_ALL=C sort)
+    v2_files=()
+    while IFS= read -r line; do v2_files+=("$line"); done < <(find "$V2_SCHEMA_DIR" -name '*.sql' -type f | LC_ALL=C sort)
     # Keep only the source flavour this packaging selected; drop the other.
     # The trailing slash makes '/01-sources/' match cloud files without also
     # matching '/01-sources-local/'.
@@ -244,7 +254,8 @@ fi
 
 # ---- Phase B: core versioned migrations -----------------------------------
 mkdir -p "$MIGRATIONS_DIR"
-mapfile -t migrations < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name 'V*.sql' -type f | LC_ALL=C sort)
+migrations=()
+while IFS= read -r line; do migrations+=("$line"); done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name 'V*.sql' -type f | LC_ALL=C sort)
 
 if [[ ${#migrations[@]} -eq 0 ]]; then
     echo "==> no core migrations under $MIGRATIONS_DIR"
@@ -268,7 +279,8 @@ if [[ -d "$PLUGINS_DIR" ]]; then
     # Sort by (plugin name, version) — `find` then sort already gives this
     # because path-sort puts plugin dirs alphabetically and V### sorts
     # within each.
-    mapfile -t plugin_files < <(find "$PLUGINS_DIR" -maxdepth 3 -path "*/migrations/V*.sql" -type f | LC_ALL=C sort)
+    plugin_files=()
+    while IFS= read -r line; do plugin_files+=("$line"); done < <(find "$PLUGINS_DIR" -maxdepth 3 -path "*/migrations/V*.sql" -type f | LC_ALL=C sort)
     if [[ ${#plugin_files[@]} -eq 0 ]]; then
         echo "==> no plugin migrations under $PLUGINS_DIR"
     else

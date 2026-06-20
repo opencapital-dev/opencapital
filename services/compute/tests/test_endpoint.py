@@ -344,6 +344,75 @@ def test_server_e2e_via_monkeypatched_rwclient(monkeypatch):
     assert body["columns"] == ["ts", "nav"]
 
 
+def test_server_e2e_json_type_fidelity(monkeypatch):
+    """Deserialized JSON rows must contain native int/float, not strings."""
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+    monkeypatch.setattr(
+        rwclient, "query",
+        lambda conn, q, p: pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.5]}),
+    )
+    srv, base = _serve_compute()
+    source = (
+        "@metric(output='series')\n"
+        "def m():\n"
+        "    df = sql('SELECT ts, nav FROM nav')\n"
+        "    return df\n"
+    )
+    try:
+        status, body = _post_compute(
+            base, {"source": source, "window": {"from": 0, "to": 9}}
+        )
+    finally:
+        srv.shutdown()
+    assert status == 200
+    rows = body["rows"]
+    # ts column must be int, nav column must be float — no accidental stringification
+    assert isinstance(rows[0][0], int), f"expected int for ts, got {type(rows[0][0])}"
+    assert isinstance(rows[0][1], float), f"expected float for nav, got {type(rows[0][1])}"
+
+
+def test_per_request_isolation(monkeypatch):
+    """Two sequential /compute requests must not share contract registry state."""
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+
+    call_count = [0]
+
+    def _query(conn, q, p):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return pl.DataFrame({"ts": [1], "val": [100.0]})
+        return pl.DataFrame({"ts": [2], "val": [200.0]})
+
+    monkeypatch.setattr(rwclient, "query", _query)
+    srv, base = _serve_compute()
+
+    source_a = (
+        "@metric(output='series')\n"
+        "def m():\n"
+        "    return sql('SELECT ts, val FROM a')\n"
+    )
+    source_b = (
+        "@metric(output='series')\n"
+        "def m():\n"
+        "    return sql('SELECT ts, val FROM b')\n"
+    )
+    try:
+        status_a, body_a = _post_compute(
+            base, {"source": source_a, "window": {"from": 0, "to": 9}}
+        )
+        status_b, body_b = _post_compute(
+            base, {"source": source_b, "window": {"from": 0, "to": 9}}
+        )
+    finally:
+        srv.shutdown()
+
+    assert status_a == 200
+    assert status_b == 200
+    # Each request must return its own correct result — no registry leakage
+    assert body_a["rows"] == [[1, 100.0]], f"request A got wrong rows: {body_a['rows']}"
+    assert body_b["rows"] == [[2, 200.0]], f"request B got wrong rows: {body_b['rows']}"
+
+
 def test_server_malformed_json_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
     monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())

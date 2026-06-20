@@ -30,7 +30,7 @@ struct SpawnSpec {
     bin: PathBuf,
     host: String,
     port: u16,
-    read_gateway_url: String,
+    risingwave_dsn: String,
     log_path: PathBuf,
 }
 
@@ -49,7 +49,7 @@ pub fn start(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<u
         bin,
         host: "127.0.0.1".into(),
         port,
-        read_gateway_url: cfg.read_gateway_url.clone(),
+        risingwave_dsn: cfg.risingwave_dsn.clone(),
         log_path,
     };
 
@@ -105,7 +105,7 @@ fn spawn_compute(spec: &SpawnSpec) -> Result<Child, String> {
     let mut cmd = Command::new(&spec.bin);
     cmd.env("COMPUTE_HOST", &spec.host)
         .env("COMPUTE_PORT", spec.port.to_string())
-        .env("READ_GATEWAY_URL", &spec.read_gateway_url)
+        .env("RISINGWAVE_DSN", &spec.risingwave_dsn)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     cmd.spawn().map_err(|e| format!("spawn compute sidecar: {e}"))

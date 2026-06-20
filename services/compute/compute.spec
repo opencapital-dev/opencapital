@@ -43,6 +43,7 @@ a = Analysis(
             '_polars_runtime_32.build_feature_flags',
             'polars._plr',
             'polars._cpu_check',
+            'pg8000',
         ]
     ),
     hookspath=[],

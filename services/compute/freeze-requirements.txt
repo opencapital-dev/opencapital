@@ -1,5 +1,4 @@
 # Deps to freeze the compute sidecar into a one-file binary (Tauri externalBin).
-# Compute's only third-party import is polars; pyinstaller performs the freeze.
-# Used by the opencapital-release CI; keep in sync with pyproject (polars, pyinstaller).
 polars>=1,<2
+pg8000>=1.30,<2
 pyinstaller>=6,<7

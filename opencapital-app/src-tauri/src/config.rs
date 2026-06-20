@@ -20,6 +20,12 @@ pub struct AppConfig {
     /// id_token with the user's email; audience governs API authorization.
     pub kinde_scope: String,
 
+    // --- Plugin catalog (in-process) ------------------------------------
+    /// Curated marketplace list URL — the official array of per-plugin manifest
+    /// URLs the catalog seeds the official set from. Mirrors the control-plane's
+    /// PLUGINS_MANIFEST_URL env var. Default: the GitHub-hosted release file.
+    pub plugin_list_url: String,
+
     // --- Grafana runtime (the "launch Grafana" half) -------------------
     /// Gateway base plugins POST data to (host-reachable), e.g. http://localhost:8090.
     pub gateway_url: String,
@@ -90,6 +96,11 @@ impl AppConfig {
             // access token's API authorization.
             kinde_scope: pick("KINDE_SCOPE", file.get("kinde_scope"), "openid email"),
 
+            plugin_list_url: pick(
+                "PLUGINS_MANIFEST_URL",
+                file.get("plugin_list_url"),
+                "https://raw.githubusercontent.com/opencapital-dev/opencapital-releases/main/plugins.json",
+            ),
             gateway_url: pick("PLUGIN_GATEWAY_URL", file.get("gateway_url"), "http://localhost:8090"),
             read_gateway_url: pick("PLUGIN_READ_GATEWAY_URL", file.get("read_gateway_url"), "http://localhost:8095"),
             otlp_endpoint: pick("PLUGIN_OTLP_ENDPOINT", file.get("otlp_endpoint"), "http://localhost:4317"),

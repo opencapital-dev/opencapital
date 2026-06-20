@@ -1,3 +1,4 @@
+mod catalog;
 mod compute;
 mod config;
 mod dataplane;

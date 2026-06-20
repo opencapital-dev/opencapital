@@ -288,96 +288,132 @@ pub async fn create_org(
 }
 
 /// marketplace_catalog lists the plugins available to an org with their
-/// installed state (Kinde-authed).
+/// installed state. Now served in-process from the federated plugin catalog
+/// (no control-plane HTTP roundtrip). `installed` is approximated from the
+/// local selection file: a plugin is considered installed if it is required
+/// or present in the org's local selection.
 #[tauri::command]
 pub async fn marketplace_catalog(
     org_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    catalog_req(cfg.inner(), session.inner(), &org_id).await
+    let _ = session; // auth check dropped for in-process call; org is local-only
+    catalog_req(cfg.inner(), &org_id).await
 }
 
-/// catalog_req fetches the marketplace catalog for an org (each entry carries
-/// plugin_id, required, installed). Reusable by the marketplace_catalog command
-/// and the launch-time selection reconcile.
+/// catalog_req builds the marketplace catalog for an org from the in-process
+/// federated plugin catalog. `installed` is approximated from the local
+/// selection file (required ∪ selection). Reusable by the marketplace_catalog
+/// command and the launch-time selection reconcile.
 pub async fn catalog_req(
     cfg: &AppConfig,
-    session: &Session,
     org_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = reqwest::Client::new()
-        .get(format!("{}/v1/marketplace/catalog", cfg.control_plane_url))
-        .query(&[("org_id", &org_id)])
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/marketplace/catalog: {e}"))?;
-    read_json(resp, "/v1/marketplace/catalog").await
+    let http_client = reqwest::Client::new();
+    let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let refs = crate::catalog::sources::build_plugin_refs(
+        &http_client,
+        &cfg.plugin_list_url,
+        &user_sources,
+    )
+    .await;
+
+    let plugins = crate::catalog::list(&refs);
+
+    // Determine installed state: required ∪ local selection.
+    let selection: std::collections::HashSet<String> =
+        crate::config::read_selection_in(&cfg.base_dir(), org_id)?
+            .into_iter()
+            .collect();
+
+    let entries: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|p| {
+            let installed = p.required || selection.contains(&p.footprint.plugin_id);
+            serde_json::json!({
+                "plugin_id": p.footprint.plugin_id,
+                "grafana_slug": p.footprint.grafana_slug,
+                "display_name": p.footprint.display_name,
+                "description": p.footprint.description,
+                "type": p.footprint.plugin_type,
+                "required": p.required,
+                "installed": installed,
+                "latest_validated_version": p.version,
+                "source": {
+                    "url": p.source.url,
+                    "publisher": p.source.publisher,
+                    "verified": p.source.verified,
+                }
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "org_id": org_id,
+        "plugins": entries,
+    }))
 }
 
-/// list_sources returns the user-added plugin manifest URLs (GET /v1/sources).
+/// list_sources returns the user-added plugin manifest URLs from the local
+/// JSON store (in-process, no control-plane HTTP roundtrip).
 /// Global (not org-scoped); the official set is implicit in the catalog.
 #[tauri::command]
 pub async fn list_sources(
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .get(format!("{}/v1/sources", cfg.control_plane_url))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call GET /v1/sources: {e}"))?;
-    read_json(resp, "GET /v1/sources").await
+    let _ = session; // auth check dropped for in-process call
+    let records = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let entries: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "manifest_url": r.manifest_url,
+                "publisher": r.publisher,
+                "enabled": r.enabled,
+            })
+        })
+        .collect();
+    Ok(serde_json::Value::Array(entries))
 }
 
-#[derive(serde::Serialize)]
-struct AddSourceRequest<'a> {
-    manifest_url: &'a str,
-}
-
-/// add_source validates + persists a user-added per-plugin manifest URL
-/// (POST /v1/sources). Surfaces the control-plane validation error (422) verbatim
-/// so the UI can show "manifest unreachable or invalid: …".
+/// add_source validates + persists a user-added per-plugin manifest URL to the
+/// local JSON store (in-process). Surfaces validation errors verbatim so the UI
+/// can show "manifest unreachable or invalid: …".
 #[tauri::command]
 pub async fn add_source(
     manifest_url: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/sources", cfg.control_plane_url))
-        .bearer_auth(token)
-        .json(&AddSourceRequest { manifest_url: &manifest_url })
-        .send()
-        .await
-        .map_err(|e| format!("call POST /v1/sources: {e}"))?;
-    read_json(resp, "POST /v1/sources").await
+    let _ = session; // auth check dropped for in-process call
+    let http_client = reqwest::Client::new();
+    let record = crate::catalog::sources::add_source_in(
+        &cfg.base_dir(),
+        &http_client,
+        &manifest_url,
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "manifest_url": record.manifest_url,
+        "publisher": record.publisher,
+        "enabled": record.enabled,
+    }))
 }
 
-/// remove_source deletes a user-added source (DELETE /v1/sources?manifest_url=…).
+/// remove_source deletes a user-added source from the local JSON store
+/// (in-process, no control-plane HTTP roundtrip).
 #[tauri::command]
 pub async fn remove_source(
     manifest_url: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<(), String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .delete(format!("{}/v1/sources", cfg.control_plane_url))
-        .query(&[("manifest_url", &manifest_url)])
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call DELETE /v1/sources: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("DELETE /v1/sources {status}: {body}"));
+    let _ = session; // auth check dropped for in-process call
+    let deleted = crate::catalog::sources::remove_source_in(&cfg.base_dir(), &manifest_url)?;
+    if !deleted {
+        return Err(format!("source not found: {manifest_url}"));
     }
     Ok(())
 }
@@ -440,7 +476,8 @@ pub async fn reconcile_plugin_selection(
 ) -> Result<(), String> {
     use std::collections::BTreeSet;
     // marketplace_catalog returns { org_id, plugins: [...] }.
-    let catalog = catalog_req(cfg, session, org_id).await?;
+    // catalog_req now resolves the catalog in-process (no control-plane roundtrip).
+    let catalog = catalog_req(cfg, org_id).await?;
     let entries = catalog
         .get("plugins")
         .and_then(|v| v.as_array())
@@ -505,43 +542,42 @@ pub struct VersionStatus {
 }
 
 /// plugin_versions lists the published versions of a plugin with their
-/// validation status, newest first.
+/// validation status, newest first. Now served in-process from the federated
+/// plugin catalog (no control-plane HTTP roundtrip).
 #[tauri::command]
 pub async fn plugin_versions(
     plugin_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<Vec<VersionStatus>, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/marketplace/plugins/{}/versions",
-            cfg.control_plane_url, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("list versions {plugin_id}: {e}"))?;
-    let body = read_json(resp, "plugin versions").await?;
-    let arr = body
-        .get("versions")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "plugin versions: missing versions array".to_string())?;
-    arr.iter()
-        .map(|v| {
-            Ok(VersionStatus {
-                version: v
-                    .get("version")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                validated: v
-                    .get("validated")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false),
-            })
-        })
-        .collect()
+    let _ = session; // auth check dropped for in-process call
+    let http_client = reqwest::Client::new();
+    let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let refs = crate::catalog::sources::build_plugin_refs(
+        &http_client,
+        &cfg.plugin_list_url,
+        &user_sources,
+    )
+    .await;
+
+    // Find the ref for this plugin_id.
+    let plugin_ref = refs
+        .iter()
+        .find(|r| r.plugin_id == plugin_id);
+
+    match plugin_ref {
+        None => Ok(vec![]), // unknown id → empty list
+        Some(r) => {
+            let vs = crate::catalog::versions_with_status(r);
+            Ok(vs
+                .into_iter()
+                .map(|v| VersionStatus {
+                    version: v.version,
+                    validated: v.validated,
+                })
+                .collect())
+        }
+    }
 }
 
 /// get_plugin_selection returns the org's desired OPTIONAL plugins (the local

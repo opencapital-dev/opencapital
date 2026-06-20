@@ -567,57 +567,61 @@ git commit -m "feat(tauri): port plugin catalog/federation/artifact resolution t
 
 ---
 
-# Plan A6 — Delete control-plane + auth/identity; finish provisioning handoff
+# Plan A6 — Delete control-plane + auth/identity; fold instance-bootstrap into Tauri
 
-**Goal:** Remove `services/control-plane` and all auth/identity; have Tauri write the resolved install set to a local file that instance-bootstrap consumes (no roundtrip).
+**Goal:** Remove `services/control-plane` and all auth/identity, and **fold the
+`instance-bootstrap` reconciler into the Tauri Rust shell** — deleting the last Go
+sidecar. Tauri resolves the install set (A5 catalog), then downloads → verifies →
+extracts → renders Grafana provisioning in-process, no handoff file.
 
 `[LOCKSTEP]` Only after A5 (catalog in Tauri) **and** the companion core plugin writes portfolios to Postgres directly (control-plane's portfolio handlers can then go). Pair with A3.
 
 **Files:**
-- Delete: `services/control-plane/` (whole tree), `lib/jwks/` (only control-plane consumed it after A4)
+- Delete: `services/control-plane/` (whole tree), `lib/jwks/`, **`lib/instance-bootstrap/` (whole tree — folded into Tauri)**
+- Create: `opencapital-app/src-tauri/src/reconcile/mod.rs` (+ `download.rs`, `provision.rs`, `dashboards.rs`) — the Rust reconciler
 - Modify: `opencapital-app/src-tauri/src/dataplane.rs` (remove `CP_PORT` 42, step 3 control-plane spawn 105-115, `spawn_control_plane`, `CONTROL_PLANE_URL` 51, `LOCAL_TOKEN` 56)
-- Modify: `opencapital-app/src-tauri/src/lib.rs` (remove `CP_PORT` kill + `"control-plane"` path kill)
+- Modify: `opencapital-app/src-tauri/src/lib.rs` (remove `CP_PORT` kill + `"control-plane"` path kill; `mod reconcile;`)
 - Modify: `opencapital-app/src-tauri/src/proxy.rs` (`cp_child`)
-- Modify: `opencapital-app/src-tauri/src/kinde.rs` (`instance_token`/mint → removed or local no-op; reconcile writes a local file)
-- Modify: `opencapital-app/src-tauri/src/grafana.rs` (instance-bootstrap input = local file path, not control-plane URL + bootstrap token)
-- Modify: `lib/instance-bootstrap/bootstrap.go` (replace the `/v1/internal/...` roundtrip 234-312 with a local-file read)
-- Modify: `Makefile:10` (`GO_SVCS :=` empty → drop the Go-sidecar build entirely or keep only instance-bootstrap)
+- Modify: `opencapital-app/src-tauri/src/kinde.rs` (`instance_token`/mint → removed; reconcile calls the in-process reconciler, no local file)
+- Modify: `opencapital-app/src-tauri/src/grafana.rs` (call the in-process reconciler before spawning `grafana-server`, not the sidecar command)
+- Modify: `opencapital-app/src-tauri/Cargo.toml` (add `sha2`, `tar`, `flate2`, `serde_yaml` if absent)
+- Modify: `Makefile` (`GO_SVCS :=` empty; delete the `go-sidecars` target entirely — no Go sidecars remain)
 
 **Interfaces:**
-- Consumes: A5 `catalog::resolve_artifact`.
-- Produces: a local provisioning file (e.g. `base_dir/provisioning/plugins.json`) — `[{plugin_id, grafana_slug, version, artifact:{download_url,sha256,size_bytes}, jsonData fields}]`. **[contract]** instance-bootstrap reads this.
+- Consumes: A5 `catalog::resolve_artifact` + `catalog::list`.
+- Produces: `reconcile::run(cfg, install_set) -> Result<(), String>` — downloads + verifies (sha256) + extracts each artifact (idempotent via `.artifact-sha256`), symlinks into the plugins dir, renders Grafana provisioning YAML (datasource + app jsonData with `risingwaveHost`/`risingwavePort` + Postgres coords, no gateway URLs). **[contract]** replaces the entire `lib/instance-bootstrap` binary.
 
-- [ ] **Step 1: Define the local provisioning file written by Tauri**
+- [ ] **Step 1: Audit `lib/instance-bootstrap` — port vs delete**
 
-In `kinde.rs`/`grafana.rs`, `reconcile_plugin_selection` resolves the install set via `catalog::*` and writes `base_dir/provisioning/plugins.json` (the same shape control-plane's `/v1/internal/orgs/{org}/plugins` returned, minus tokens). No instance token is minted (auth dropped).
+Read `bootstrap.go`, `reconcile.go`, `provision_dashboards.go`, `library_panels.go`, `metric_deps.go` (~4k LOC). Classify each unit: **port** (download/verify/extract/symlink, datasource+app provisioning YAML, dashboard provider YAML, library-panel install) vs **delete** (`metric_deps.go` — it resolves the old read-gateway/DSL `query_entities` surface, which the `sql()` model removes; confirm nothing downstream needs it, then drop). Write the port/delete decision per file into the report before coding.
 
-- [ ] **Step 2: Make instance-bootstrap read the local file**
+- [ ] **Step 2: Implement the Rust reconciler (TDD the pure parts)**
 
-In `lib/instance-bootstrap/bootstrap.go`: replace the control-plane HTTP calls (`/v1/internal/orgs/{org}/plugins`, versions, artifact — lines 234-312) with reading + unmarshalling the local `plugins.json`. Remove the bootstrap-token + `PluginControlPlaneURL` plumbing. Keep the download→verify-sha256→extract→render-Grafana-YAML pipeline.
+Create `src-tauri/src/reconcile/`. Port the classified-port units: `download.rs` (reqwest GET → `sha2` verify against the artifact sha256 → `tar`/`flate2` extract → symlink, idempotent via the `.artifact-sha256` marker), `provision.rs` (render datasource + app provisioning YAML via `serde_yaml`, jsonData = `risingwaveHost`/`risingwavePort` + `postgresHost`/`postgresPort`/`controlDb`, NO `gatewayUrl`/`readGatewayUrl`), `dashboards.rs` (dashboard provider YAML + library-panel install). Unit-test the pure logic (sha256 verify pass/fail, idempotency marker skip, rendered-YAML shape) offline; gate any network-touching test `#[ignore]`. `grafana.rs` calls `reconcile::run(...)` in-process before spawning `grafana-server`, replacing `instance_bootstrap_command` + the sidecar child.
 
 - [ ] **Step 3: Remove control-plane from the boot sequence**
 
 In `dataplane.rs`: delete step 3 (control-plane spawn, lines 105-115), `spawn_control_plane`, the `CP_PORT` constant (42), `CONTROL_PLANE_URL` (51), `LOCAL_TOKEN` (56). In `proxy.rs`: delete `cp_child`. In `lib.rs`: remove `CP_PORT` from the kill loop and `"control-plane"` from the path-kill list.
 
-- [ ] **Step 4: Delete the service tree + jwks lib + empty the Go-sidecar build**
+- [ ] **Step 4: Delete the service tree + jwks lib + instance-bootstrap; drop the Go-sidecar build**
 
 ```bash
-git rm -r services/control-plane lib/jwks
+git rm -r services/control-plane lib/jwks lib/instance-bootstrap
 ```
-In `Makefile`: with `GO_SVCS` empty, trim `go-build`/`go-test`/`go-sidecars` to build only `lib/instance-bootstrap`. Remove `CONTROL_DB_DSN` usage if control-plane was its only reader (the host reconciler uses `psql`, not the DSN constant).
+In `Makefile`: `GO_SVCS` is empty and no Go sidecars remain — delete the `go-sidecars` target and its references in `dataplane-stage`/`app-stage`; trim `go-build`/`go-test` to no-ops or remove. Remove `CONTROL_DB_DSN` usage if control-plane was its only reader (the host reconciler uses `psql`, not the DSN constant). Remove the `config.rs` `lib/instance-bootstrap/go.mod` repo-root marker lookup.
 
 - [ ] **Step 5: Verify no dangling references + clean build**
 
-Run: `grep -rn "control-plane\|control_plane\|CONTROL_PLANE_URL\|cp_child\|CP_PORT\|lib/jwks\|instance_token\|/jwt/mint\|bootstrap_token" opencapital-app Makefile lib 2>/dev/null`
+Run: `grep -rn "control-plane\|CONTROL_PLANE_URL\|cp_child\|CP_PORT\|lib/jwks\|lib/instance-bootstrap\|instance_token\|/jwt/mint\|bootstrap_token\|instance_bootstrap_command" opencapital-app Makefile lib 2>/dev/null`
 Expected: no matches (besides the postgres role name `control_plane` in init SQL, which stays).
 
-Run: `cd opencapital-app/src-tauri && cargo build 2>&1 | tail -5 && (cd ../../lib/instance-bootstrap && go build ./...)`
-Expected: both compile clean.
+Run: `cd opencapital-app/src-tauri && cargo build 2>&1 | tail -5`
+Expected: compiles clean. No Go build remains for the shell side.
 
-- [ ] **Step 6: End-to-end smoke — three services gone, app works**
+- [ ] **Step 6: End-to-end smoke — all services + the last Go sidecar gone, app works**
 
-Run the app (`make app` or the dev launch). Verify: Postgres + RisingWave + compute spawn; no gateway/read-gateway/control-plane processes; marketplace lists plugins (Tauri catalog); a portfolio created in the UI appears in `control_db.portfolios` and flows to RW; a panel renders a metric (compute → RW pgwire).
-Expected: NAV/metrics render; `ps aux | grep -E "gateway|control-plane"` shows nothing.
+Run the app (`make app` or the dev launch). Verify: Postgres + RisingWave + compute spawn; no gateway/read-gateway/control-plane/instance-bootstrap processes; marketplace lists plugins (Tauri catalog); plugins install + provision via the in-process reconciler; a portfolio created in the UI appears in `control_db.portfolios` and flows to RW; a panel renders a metric (compute → RW pgwire).
+Expected: NAV/metrics render; `ps aux | grep -E "gateway|control-plane|instance-bootstrap"` shows nothing.
 
 - [ ] **Step 7: Commit**
 
@@ -637,7 +641,7 @@ git commit -m "refactor: delete control-plane + auth/identity; Tauri owns catalo
 - Direct pgwire read/write → A1 (compute), A4 ([contract] plugins). ✓
 - Two-store + CDC → A3 (portfolios + publication, host reconciler). ✓
 - Catalog → Tauri → A5. ✓
-- instance-bootstrap thin renderer → A6 Step 2. ✓
+- instance-bootstrap folded into Tauri (last Go sidecar deleted) → A6 Steps 1-2,4. ✓
 - Delete plugin_installs + identity tables → A3 Step 5 / A6. ✓
 
 **Placeholder scan:** No "TBD"/"handle errors"/"similar to". Mechanical edits cite verbatim current code + line numbers from grounding; the one absent test harness (RW golden) is built in A2 Step 1.

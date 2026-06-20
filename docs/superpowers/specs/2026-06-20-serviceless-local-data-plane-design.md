@@ -135,16 +135,31 @@ plugin must target, it is called out as **[contract]**.
 - Drop `READ_GATEWAY_URL`; add `RISINGWAVE_DSN` (host passes loopback DSN, as it
   already does for the gateways).
 
-### 4. instance-bootstrap (`lib/instance-bootstrap`)
+### 4. instance-bootstrap → folded into Tauri (delete the Go sidecar)
 
-- Drop the control-plane roundtrip (`/v1/internal/orgs/{org}/plugins`, versions,
-  artifact). Its provisioning input now comes from a **local file Tauri writes**
-  (resolved install set + artifact paths) — instance-bootstrap becomes a pure,
-  network-free Grafana-provisioning renderer: a thin local-file consumer, not
-  absorbed into Tauri.
+**Amendment (2026-06-20):** `lib/instance-bootstrap` is **folded into the Tauri
+Rust shell**, not kept as a thin Go renderer. After A5 Tauri already owns catalog
++ artifact resolution; the reconciler's remaining work (download → verify sha256 →
+extract → symlink → render Grafana provisioning YAML) becomes a Rust module in
+`src-tauri`. This deletes the **last Go sidecar** — no `instance-bootstrap` binary,
+no `go-sidecars` build, no Rust-resolves-then-Go-renders handoff file. Justified:
+nothing but `grafana.rs` invokes it (no compose/CI/cloud consumer), and it already
+runs as a native process (same context as Tauri — no new WSL boundary).
+
+- Port `reconcile.go` (download/verify/extract/symlink, idempotent via
+  `.artifact-sha256`), `provision_dashboards.go`, `library_panels.go`, and
+  `metric_deps.go` into a `src-tauri` reconciler module (`reqwest` for download,
+  `sha2` for verify, `tar`/`flate2` for extract, `serde_yaml` for provisioning).
+  **Audit port-vs-delete first:** `metric_deps.go` analyzes the old
+  read-gateway/DSL surface; in the `sql()` world it likely shrinks or is deleted
+  rather than ported (~4k LOC total, less after the audit).
+- `grafana.rs` calls the in-process reconciler before spawning `grafana-server`
+  (it already orchestrates Grafana startup), instead of shelling out to the
+  sidecar.
 - Drop `gatewayUrl` / `readGatewayUrl` from rendered plugin jsonData. Keep
   `risingwaveHost` / `risingwavePort`. Add Postgres coordinates (`postgresHost` /
   `postgresPort` / `controlDb`) so the core plugin reaches OLTP. **[contract]**
+- Delete `lib/instance-bootstrap` and its Makefile sidecar target entirely.
   these jsonData keys are the plugin's DB coordinates.
 
 ### 5. Tauri shell (`opencapital-app/src-tauri`) + Makefile
@@ -176,12 +191,14 @@ Port control-plane's platform brain into the shell:
 - **Install/uninstall + state**: Tauri persists the org's (now the single user's)
   install set locally — a small SQLite or JSON store under `base_dir`. Generates
   any per-plugin token the plugin still needs (likely none, post-auth-removal).
-- **Provisioning handoff**: Tauri writes the resolved install set + artifact paths
-  to the local file instance-bootstrap consumes (§4).
+- **Provisioning (folded in, §4)**: the reconciler — download → verify → extract →
+  symlink → render Grafana provisioning YAML — is ported from `lib/instance-bootstrap`
+  into a Tauri Rust module and called in-process by `grafana.rs`. No handoff file,
+  no Go sidecar.
 
 This is the largest single block and is internally phaseable in the implementation
-plan (manifest/version logic first behind a feature flag, then artifact resolution,
-then cut over instance-bootstrap's input source).
+plan (manifest/version logic first, then artifact resolution, then the reconciler
+fold).
 
 ## Data flow after Spec A
 
@@ -201,8 +218,8 @@ read-your-writes. CDC streams the change into RW's `portfolios` table; the
 fold/metrics pipeline joins `base_currency` as before.
 
 **Plugin install:** Tauri resolves the catalog, downloads + verifies the artifact,
-records install state locally, and writes the provisioning file; instance-bootstrap
-renders Grafana provisioning from it. No control-plane.
+records install state locally, extracts it, and renders the Grafana provisioning
+YAML — all in-process (the folded-in reconciler). No control-plane, no Go sidecar.
 
 ## Risks & verification
 

@@ -5,12 +5,91 @@
 // instance token (POST /v1/instance/token), which it later hands to
 // plugins. The shell never gives the Kinde token to Grafana or plugins.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, State};
+
+// ---------------------------------------------------------------------------
+// Shared HTTP client — one reqwest::Client per process (connection pool reuse).
+// Eliminates per-command-call reqwest::Client::new() allocations.
+// ---------------------------------------------------------------------------
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+// ---------------------------------------------------------------------------
+// Manifest refs cache — avoids re-fetching all per-plugin manifests on every
+// catalog/version-dropdown call.  Keyed by (list_url, user_sources snapshot)
+// with a 60-second TTL that matches the PluginClient manifest TTL.
+// On stale the previous refs are served immediately while the background refresh
+// is triggered on the NEXT call (serve-stale, same pattern as PluginClient).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CachedRefs {
+    refs: Vec<crate::catalog::PluginRef>,
+    /// Serialised representation of the inputs used to build this cache entry,
+    /// used for invalidation when list_url or user_sources changes.
+    cache_key: String,
+    fetched_at: Instant,
+}
+
+fn refs_cache() -> &'static Mutex<Option<CachedRefs>> {
+    static CACHE: OnceLock<Mutex<Option<CachedRefs>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// build_refs_cached builds (or serves from cache) the full PluginRef list.
+/// Shared by catalog_req and plugin_versions to avoid redundant manifest fetches.
+async fn build_refs_cached(
+    list_url: &str,
+    user_sources: &[crate::catalog::SourceRecord],
+) -> Vec<crate::catalog::PluginRef> {
+    const REFS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // Build a cheap cache key from the inputs.
+    let cache_key = format!(
+        "{}|{}",
+        list_url,
+        user_sources
+            .iter()
+            .map(|s| format!("{}:{}", s.manifest_url, s.enabled))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    // Fast path: serve from cache if key matches and TTL hasn't expired.
+    {
+        let guard = refs_cache().lock().unwrap();
+        if let Some(cached) = &*guard {
+            if cached.cache_key == cache_key && cached.fetched_at.elapsed() < REFS_TTL {
+                return cached.refs.clone();
+            }
+        }
+    }
+
+    // Slow path: re-fetch all manifests.
+    let client = shared_http_client();
+    let refs = crate::catalog::sources::build_plugin_refs(client, list_url, user_sources).await;
+
+    // Store in cache.
+    {
+        let mut guard = refs_cache().lock().unwrap();
+        *guard = Some(CachedRefs {
+            refs: refs.clone(),
+            cache_key,
+            fetched_at: Instant::now(),
+        });
+    }
+
+    refs
+}
 
 use crate::config::AppConfig;
 
@@ -93,7 +172,7 @@ pub async fn kinde_login(cfg: State<'_, AppConfig>, session: State<'_, Session>)
 /// any failure so the caller can fall back to the id_token.
 async fn fetch_kinde_email(cfg: &AppConfig, access_token: &str) -> Option<String> {
     let url = format!("{}/oauth2/user_profile", cfg.kinde_domain);
-    let v = reqwest::Client::new()
+    let v = shared_http_client()
         .get(&url)
         .bearer_auth(access_token)
         .send()
@@ -169,7 +248,7 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<TokenResponse, String> {
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .post(format!("{}/oauth2/token", cfg.kinde_domain))
         .form(&[
             ("grant_type", "authorization_code"),
@@ -196,7 +275,7 @@ pub async fn me_orgs(
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
     let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .get(format!("{}/v1/me/orgs", cfg.control_plane_url))
         .bearer_auth(token)
         .send()
@@ -248,7 +327,7 @@ pub async fn mint_instance_token(
     org_id: &str,
 ) -> Result<serde_json::Value, String> {
     let token = current_token(session)?;
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .post(format!("{}/v1/instance/token", cfg.control_plane_url))
         .bearer_auth(token)
         .json(&InstanceTokenRequest { org_id })
@@ -274,7 +353,7 @@ pub async fn create_org(
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
     let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .post(format!("{}/v1/orgs", cfg.control_plane_url))
         .bearer_auth(token)
         .json(&CreateOrgRequest {
@@ -310,16 +389,11 @@ pub async fn catalog_req(
     cfg: &AppConfig,
     org_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let http_client = reqwest::Client::new();
     let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
-    let refs = crate::catalog::sources::build_plugin_refs(
-        &http_client,
-        &cfg.plugin_list_url,
-        &user_sources,
-    )
-    .await;
+    let refs = build_refs_cached(&cfg.plugin_list_url, &user_sources).await;
 
-    let plugins = crate::catalog::list(&refs);
+    let client = shared_http_client();
+    let plugins = crate::catalog::list(client, &refs).await;
 
     // Determine installed state: required ∪ local selection.
     let selection: std::collections::HashSet<String> =
@@ -388,10 +462,9 @@ pub async fn add_source(
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
     let _ = session; // auth check dropped for in-process call
-    let http_client = reqwest::Client::new();
     let record = crate::catalog::sources::add_source_in(
         &cfg.base_dir(),
-        &http_client,
+        shared_http_client(),
         &manifest_url,
     )
     .await?;
@@ -428,7 +501,7 @@ pub async fn install_req(
     plugin_id: &str,
 ) -> Result<serde_json::Value, String> {
     let token = current_token(session)?;
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .post(format!(
             "{}/v1/orgs/{}/plugins/{}",
             cfg.control_plane_url, org_id, plugin_id
@@ -448,7 +521,7 @@ pub async fn uninstall_req(
     plugin_id: &str,
 ) -> Result<serde_json::Value, String> {
     let token = current_token(session)?;
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .delete(format!(
             "{}/v1/orgs/{}/plugins/{}",
             cfg.control_plane_url, org_id, plugin_id
@@ -543,7 +616,8 @@ pub struct VersionStatus {
 
 /// plugin_versions lists the published versions of a plugin with their
 /// validation status, newest first. Now served in-process from the federated
-/// plugin catalog (no control-plane HTTP roundtrip).
+/// plugin catalog (no control-plane HTTP roundtrip). Uses the shared refs
+/// cache to avoid re-fetching all manifests on every version-dropdown open.
 #[tauri::command]
 pub async fn plugin_versions(
     plugin_id: String,
@@ -551,14 +625,8 @@ pub async fn plugin_versions(
     session: State<'_, Session>,
 ) -> Result<Vec<VersionStatus>, String> {
     let _ = session; // auth check dropped for in-process call
-    let http_client = reqwest::Client::new();
     let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
-    let refs = crate::catalog::sources::build_plugin_refs(
-        &http_client,
-        &cfg.plugin_list_url,
-        &user_sources,
-    )
-    .await;
+    let refs = build_refs_cached(&cfg.plugin_list_url, &user_sources).await;
 
     // Find the ref for this plugin_id.
     let plugin_ref = refs

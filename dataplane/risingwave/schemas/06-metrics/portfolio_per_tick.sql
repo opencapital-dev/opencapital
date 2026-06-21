@@ -17,26 +17,23 @@
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS portfolio_per_tick AS
 WITH fold_per_ts AS (
-    -- One row per (org_id, portfolio_id, business_ts): the fold_per_event
+    -- One row per (portfolio_id, business_ts): the fold_per_event
     -- row with the largest source_id at that business_ts. The OverWindow
     -- operator orders within a business_ts by source_id, so the
     -- max-source_id row carries the latest cumulative state. Pre-filtering
     -- here prevents double-counting when multiple events share a
-    -- business_ts. v6 keys the collapse on org_id too so colliding
-    -- portfolio_ids across orgs do not race.
-    SELECT fpe.org_id, fpe.portfolio_id, fpe.business_ts, fpe.source_id, fpe.fold_result
+    -- business_ts.
+    SELECT fpe.portfolio_id, fpe.business_ts, fpe.source_id, fpe.fold_result
     FROM fold_per_event fpe
     JOIN (
-        SELECT org_id, portfolio_id, business_ts, MAX(source_id) AS source_id
+        SELECT portfolio_id, business_ts, MAX(source_id) AS source_id
         FROM fold_per_event
-        GROUP BY org_id, portfolio_id, business_ts
-    ) m USING (org_id, portfolio_id, business_ts, source_id)
+        GROUP BY portfolio_id, business_ts
+    ) m USING (portfolio_id, business_ts, source_id)
 ),
 portfolio_instruments AS (
-    -- All (org, portfolio, instrument) triples the fold has ever seen
-    -- with qty>0.
+    -- All (portfolio, instrument) pairs the fold has ever seen with qty>0.
     SELECT DISTINCT
-        fpe.org_id,
         fpe.portfolio_id,
         (ep ->> 'instrument_id') AS instrument_id
     FROM fold_per_ts fpe,
@@ -45,34 +42,29 @@ portfolio_instruments AS (
 portfolio_tick_grid AS (
     -- Per-portfolio ticks: union of price ticks for the portfolio's
     -- ever-held instruments + every fold event business_ts (for cash-only
-    -- events). DISTINCT keeps the cardinality bounded. org_id rides
-    -- along so the downstream ASOF joins to fold_per_ts / fx_rates /
-    -- prices stay org-scoped.
-    SELECT DISTINCT pi.org_id, pi.portfolio_id AS scope_id, px.price_ts AS tick_ts
+    -- events). DISTINCT keeps the cardinality bounded.
+    SELECT DISTINCT pi.portfolio_id AS scope_id, px.price_ts AS tick_ts
       FROM portfolio_instruments pi
       JOIN prices px
-        ON  px.org_id        = pi.org_id
-        AND px.portfolio_id  = pi.portfolio_id
+        ON  px.portfolio_id  = pi.portfolio_id
         AND px.instrument_id = pi.instrument_id
     UNION
-    SELECT DISTINCT pi.org_id, pi.portfolio_id AS scope_id, om.price_ts AS tick_ts
+    SELECT DISTINCT pi.portfolio_id AS scope_id, om.price_ts AS tick_ts
       FROM portfolio_instruments pi
       JOIN option_marks om
-        ON  om.org_id        = pi.org_id
-        AND om.instrument_id = pi.instrument_id
+        ON  om.instrument_id = pi.instrument_id
     UNION
-    SELECT DISTINCT org_id, portfolio_id AS scope_id, business_ts AS tick_ts
+    SELECT DISTINCT portfolio_id AS scope_id, business_ts AS tick_ts
       FROM fold_per_ts
 ),
 held_at_tick AS (
     -- ASOF the latest snapshot at-or-before tick_ts.
     SELECT
-        t.org_id, t.scope_id, t.tick_ts,
+        t.scope_id, t.tick_ts,
         (fpe.fold_result).snapshot AS snap
     FROM portfolio_tick_grid t
     ASOF LEFT JOIN fold_per_ts fpe
-        ON  fpe.org_id       = t.org_id
-        AND fpe.portfolio_id = t.scope_id
+        ON  fpe.portfolio_id = t.scope_id
         AND t.tick_ts >= fpe.business_ts
 ),
 positions_at_tick AS (
@@ -80,7 +72,7 @@ positions_at_tick AS (
     -- already absent from the array under v5 fold semantics — this is
     -- belt-and-suspenders).
     SELECT
-        h.org_id, h.scope_id, h.tick_ts,
+        h.scope_id, h.tick_ts,
         (ep ->> 'instrument_id')                                  AS instrument_id,
         (ep ->> 'quantity')::DOUBLE PRECISION                     AS quantity,
         (ep ->> 'currency')                                       AS currency,
@@ -107,22 +99,18 @@ positions_priced AS (
         fx.rate                                                   AS fx_rate
     FROM positions_at_tick p
     LEFT JOIN instruments i
-        ON  i.org_id        = p.org_id
-        AND i.portfolio_id  = p.scope_id
+        ON  i.portfolio_id  = p.scope_id
         AND i.instrument_id = p.instrument_id
     ASOF LEFT JOIN prices px
-        ON  px.org_id        = p.org_id
-        AND px.portfolio_id  = p.scope_id
+        ON  px.portfolio_id  = p.scope_id
         AND px.instrument_id = p.instrument_id
         AND p.tick_ts >= px.price_ts
     ASOF LEFT JOIN option_marks om
-        ON  om.org_id        = p.org_id
-        AND om.portfolio_id  = p.scope_id
+        ON  om.portfolio_id  = p.scope_id
         AND om.instrument_id = p.instrument_id
         AND p.tick_ts >= om.price_ts
     ASOF LEFT JOIN fx_rates fx
-        ON  fx.org_id   = p.org_id
-        AND fx.from_ccy = p.currency
+        ON  fx.from_ccy = p.currency
         AND fx.to_ccy   = p.base_currency
         AND p.tick_ts >= fx.ts
 ),
@@ -133,7 +121,7 @@ equity_agg AS (
     -- portfolio_core (which includes contributions from closed
     -- positions too) and are sourced via the core_at_tick CTE below.
     SELECT
-        org_id, scope_id, tick_ts,
+        scope_id, tick_ts,
         SUM(quantity
             * COALESCE(last_price, avg_cost_avg_native)
             * contract_multiplier
@@ -158,7 +146,7 @@ equity_agg AS (
         MAX(base_currency)               AS base_currency,
         COUNT(*)                         AS instrument_count
     FROM positions_priced
-    GROUP BY org_id, scope_id, tick_ts
+    GROUP BY scope_id, tick_ts
 ),
 core_at_tick AS (
     -- ASOF latest portfolio_core at-or-before each tick. portfolio_core
@@ -167,17 +155,15 @@ core_at_tick AS (
     -- aggregation in equity_agg cannot reproduce these because closed
     -- positions are absent from equity_positions.
     SELECT
-        t.org_id, t.scope_id, t.tick_ts,
+        t.scope_id, t.tick_ts,
         ((fpe.fold_result).snapshot -> 'portfolio_core') AS core
     FROM portfolio_tick_grid t
     ASOF LEFT JOIN fold_per_ts fpe
-        ON  fpe.org_id       = t.org_id
-        AND fpe.portfolio_id = t.scope_id
+        ON  fpe.portfolio_id = t.scope_id
         AND t.tick_ts >= fpe.business_ts
 ),
 cash_per_event AS (
     SELECT
-        u.org_id                                      AS org_id,
         u.portfolio_id                                AS scope_id,
         u.business_ts                                 AS event_ts,
         MAX(u.portfolio_core ->> 'base_currency')     AS base_currency,
@@ -196,7 +182,6 @@ cash_per_event AS (
         COUNT(*)                                                      AS cash_position_count
     FROM (
         SELECT
-            fpe.org_id,
             fpe.portfolio_id,
             fpe.business_ts,
             (fpe.fold_result).snapshot -> 'portfolio_core' AS portfolio_core,
@@ -205,14 +190,12 @@ cash_per_event AS (
              jsonb_array_elements((fpe.fold_result).snapshot -> 'cash_positions') AS cp
     ) u
     ASOF LEFT JOIN fx_rates fx
-        ON  fx.org_id   = u.org_id
-        AND fx.from_ccy = (u.cp ->> 'currency')
+        ON  fx.from_ccy = (u.cp ->> 'currency')
         AND fx.to_ccy   = (u.portfolio_core ->> 'base_currency')
         AND u.business_ts >= fx.ts
-    GROUP BY u.org_id, u.portfolio_id, u.business_ts
+    GROUP BY u.portfolio_id, u.business_ts
 )
 SELECT
-    eq.org_id                                         AS org_id,
     'portfolio'                                       AS scope_type,
     eq.scope_id                                       AS scope_id,
     eq.tick_ts                                        AS event_ts,
@@ -279,10 +262,8 @@ SELECT
     COALESCE(cash.cash_position_count, 0)             AS cash_position_count
 FROM equity_agg eq
 LEFT JOIN core_at_tick core
-    ON  core.org_id   = eq.org_id
-    AND core.scope_id = eq.scope_id
+    ON  core.scope_id = eq.scope_id
     AND core.tick_ts  = eq.tick_ts
 ASOF LEFT JOIN cash_per_event cash
-    ON  cash.org_id   = eq.org_id
-    AND cash.scope_id = eq.scope_id
+    ON  cash.scope_id = eq.scope_id
     AND eq.tick_ts >= cash.event_ts;

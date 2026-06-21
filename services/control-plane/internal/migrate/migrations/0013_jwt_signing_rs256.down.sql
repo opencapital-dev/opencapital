@@ -1,2 +1,0 @@
--- No-op: ES256 keys are deleted forward-only. Bootstrap regenerates a
--- key on next boot if the table is empty.

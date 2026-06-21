@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Apply the RisingWave schema.
 #
-# Phase A — v2 bootstrap (one-shot). Applies the v2 schemas in dependency
-# order under infra/risingwave/schemas/ and records the marker
-# `V001__v2_baseline` in `_schema_migrations` with plugin_id='core'.
+# Squashed baseline (one-shot). Applies the complete, org_id-free schema in
+# dependency order under dataplane/risingwave/schemas/ and records the marker
+# `V001__v2_baseline` in `_schema_migrations` with plugin_id='core'. This is
+# the single source of truth. Historical core migrations (V002-V007) and the
+# centralized plugin-migration mechanism have been retired. Plugins now ship
+# their own RW migrations via the SDK rwmigrate framework.
 #
 #   00-bootstrap.sql      → _schema_migrations tracker (with plugin_id)
 #   01-sources/           → portfolio_events.v2, data.v2 Kafka tables
@@ -13,32 +16,20 @@
 #                             `checkpoints` table.
 #                            (yfinance state is in-memory; see
 #                            services/ingestor-yfinance/backfill_queue.py)
-#   03-functions/         → CREATE FUNCTION replay_portfolio, xirr
-#                            (waits for udf-server first)
-#   03-unifying-views/    → events VIEW, prices VIEW
-#   04-fx/                → fx_rates MV (broker branches only)
-#   05-fold/              → enriched_events, latest_valid_checkpoint,
-#                            portfolio_state, portfolio_state_series
-#   06-metrics/           → metrics_equity_position, _cash_position,
-#                            _portfolio (dense; read state_series directly)
-#   07-snapshots/         → latest_portfolio_state
-#   08-ingestor-discovery/→ instruments_used, fx_pairs_used
-#
-# Phase B — core versioned migrations under infra/risingwave/migrations/V*.sql.
-# Tracked with plugin_id='core'. Idempotent re-apply (same V### + plugin_id
-# → no-op).
-#
-# Phase C — plugin discovery (ADR-0015). For each
-# infra/risingwave/plugins/<name>/migrations/V*.sql, apply if not already
-# recorded under plugin_id=<name>. Plugins are applied in (plugin name,
-# version) sort order; each plugin's migrations are independent of others.
-#
-# For MV body changes, use the SWAP pattern inside a migration:
-#
-#   CREATE MATERIALIZED VIEW some_mv_new AS <new SELECT>;
-#   -- wait for backfill via rw_catalog.rw_ddl_progress
-#   ALTER MATERIALIZED VIEW some_mv SWAP WITH some_mv_new;
-#   DROP MATERIALIZED VIEW some_mv_new;
+#   03-functions/         → fold_kernel UDAF (waits for udf-server first)
+#   03-unifying-views/    → option_marks MV, prices MV
+#   03b-instruments/      → instruments MV
+#   04-fx/                → fx_rates MV
+#   04b-events/           → events MV
+#   05-fold/              → fold_per_event MV
+#   06-metrics/           → per-tick/per-event metric MVs
+#   07-snapshots/         → latest_portfolio_state VIEW
+#   08-ingestor-discovery/→ instruments_used MV, fx_pairs_used MV,
+#                            ohlcv_coverage VIEW, data_coverage VIEW,
+#                            instruments_catalog VIEW
+#   10-entities/          → e_portfolio, e_nav, e_instrument, e_cash,
+#                            e_price, e_events, e_flows, e_closures,
+#                            e_cycles VIEWs
 #
 # Usage:
 #   ./apply.sh                       # connect to localhost:4566 from host
@@ -51,22 +42,8 @@ RW_PORT="${RW_PORT:-4566}"
 RW_USER="${RW_USER:-root}"
 RW_DB="${RW_DB:-dev}"
 
-# PACKAGING selects the ingestion flavour for the source tables:
-#   cloud (default) → schemas/01-sources/        (Kafka FORMAT UPSERT ENCODE AVRO)
-#   local           → schemas/01-sources-local/  (connector-less; gateway writes
-#                     pgwire DML — the fully-local desktop data plane has no
-#                     Redpanda). Everything from 02-* onward is shared.
-PACKAGING="${PACKAGING:-cloud}"
-case "$PACKAGING" in
-    cloud) SOURCES_EXCLUDE='/01-sources-local/' ;;
-    local) SOURCES_EXCLUDE='/01-sources/' ;;
-    *) echo "unknown PACKAGING='$PACKAGING' (want: cloud|local)" >&2; exit 1 ;;
-esac
-
 HERE="$(cd "$(dirname "$0")" && pwd)"
 V2_SCHEMA_DIR="$HERE/schemas"
-MIGRATIONS_DIR="$HERE/migrations"
-PLUGINS_DIR="$HERE/plugins"
 
 # psql client selection — host psql first, fall back to a one-shot
 # postgres:17 client container on the compose network (Postgres image's
@@ -92,23 +69,6 @@ for i in $(seq 1 240); do
     fi
     sleep 0.5
 done
-
-# Wait for topics-seed container to have completed. RisingWave Kafka sources
-# created against an empty topic park at start_offset=-1 (issue #18299); the
-# topics-seed container publishes one real Avro record per partition before
-# we create the data/portfolio_events sources to avoid that race. Local
-# packaging has no Kafka/Redpanda/topics-seed, so skip the wait entirely.
-if [[ "$PACKAGING" == "cloud" ]]; then
-    echo "==> waiting for topics-seed to complete (Kafka seed for RW issue #18299) ..."
-    for i in $(seq 1 120); do
-        status="$(docker inspect topics-seed --format='{{.State.Status}}' 2>/dev/null || true)"
-        if [[ "$status" == "exited" ]]; then
-            echo "  topics-seed done"
-            break
-        fi
-        sleep 1
-    done
-fi
 
 run_sql() {
     "${PSQL[@]}" -c "$1"
@@ -143,8 +103,6 @@ load_substitution() {
         SQL_SUB_VALS+=("${value}")
     fi
 }
-load_substitution "@@SR_RW_PASSWORD@@" sr_rw_password
-load_substitution "@@RW_KAFKA_SASL_PASSWORD@@" rw_kafka_sasl_password
 # CDC source postgres host: compose/nomad DNS 'postgres' by default; the local
 # desktop packaging overrides via CDC_PG_HOST=127.0.0.1. Always substituted so
 # the @@CDC_PG_HOST@@ placeholder never reaches RW literally.
@@ -231,15 +189,6 @@ else
     # apply.
     v2_files=()
     while IFS= read -r line; do v2_files+=("$line"); done < <(find "$V2_SCHEMA_DIR" -name '*.sql' -type f | LC_ALL=C sort)
-    # Keep only the source flavour this packaging selected; drop the other.
-    # The trailing slash makes '/01-sources/' match cloud files without also
-    # matching '/01-sources-local/'.
-    filtered=()
-    for path in "${v2_files[@]}"; do
-        [[ "$path" == *"$SOURCES_EXCLUDE"* ]] && continue
-        filtered+=("$path")
-    done
-    v2_files=("${filtered[@]}")
     udf_ready=0
     for path in "${v2_files[@]}"; do
         rel="${path#"$V2_SCHEMA_DIR/"}"
@@ -250,56 +199,6 @@ else
         run_file "$path"
     done
     record "core" "V001__v2_baseline" "v2_baseline"
-fi
-
-# ---- Phase B: core versioned migrations -----------------------------------
-mkdir -p "$MIGRATIONS_DIR"
-migrations=()
-while IFS= read -r line; do migrations+=("$line"); done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name 'V*.sql' -type f | LC_ALL=C sort)
-
-if [[ ${#migrations[@]} -eq 0 ]]; then
-    echo "==> no core migrations under $MIGRATIONS_DIR"
-else
-    for path in "${migrations[@]}"; do
-        file="$(basename "$path")"
-        version="${file%.sql}"
-        short="${version#V*__}"
-        if is_applied "core" "$version"; then
-            echo "==> already applied: core/$version"
-            continue
-        fi
-        run_file "$path"
-        record "core" "$version" "$short"
-        echo "==> recorded core/$version"
-    done
-fi
-
-# ---- Phase C: plugin migrations (ADR-0015) --------------------------------
-if [[ -d "$PLUGINS_DIR" ]]; then
-    # Sort by (plugin name, version) — `find` then sort already gives this
-    # because path-sort puts plugin dirs alphabetically and V### sorts
-    # within each.
-    plugin_files=()
-    while IFS= read -r line; do plugin_files+=("$line"); done < <(find "$PLUGINS_DIR" -maxdepth 3 -path "*/migrations/V*.sql" -type f | LC_ALL=C sort)
-    if [[ ${#plugin_files[@]} -eq 0 ]]; then
-        echo "==> no plugin migrations under $PLUGINS_DIR"
-    else
-        for path in "${plugin_files[@]}"; do
-            # Path shape: $PLUGINS_DIR/<plugin>/migrations/V###__short.sql
-            rel="${path#"$PLUGINS_DIR/"}"
-            plugin="${rel%%/*}"
-            file="$(basename "$path")"
-            version="${file%.sql}"
-            short="${version#V*__}"
-            if is_applied "$plugin" "$version"; then
-                echo "==> already applied: $plugin/$version"
-                continue
-            fi
-            run_file "$path"
-            record "$plugin" "$version" "$short"
-            echo "==> recorded $plugin/$version"
-        done
-    fi
 fi
 
 echo "==> DDL progress (any rows = MV still backfilling)"

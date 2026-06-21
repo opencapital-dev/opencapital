@@ -26,18 +26,11 @@
 -- ADR-0005 seam intact: reads only `portfolio_events_log` + control-plane
 -- CDC tables + `fx_rates` (which itself reads `portfolio_events_log`). No
 -- path to `data_log`.
---
--- v6 (ADR-0037): the envelope drops `correction_of` — every correction is
--- a re-publish under the same source_id via the UPSERT key (ADR-0006), so
--- the v5 anti-join that filtered legacy correction_of-pointing rows is
--- dead and has been removed. org_id propagates through every row so
--- downstream per-tenant logical views can `WHERE org_id = '<uuid>'`.
 -- ============================================================================
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS events AS
 WITH typed AS (
     SELECT
-        org_id,
         source_id,
         portfolio_id,
         instrument_id,
@@ -48,7 +41,6 @@ WITH typed AS (
     FROM portfolio_events_log
 )
 SELECT
-    t.org_id,
     t.source_id,
     t.portfolio_id,
     t.instrument_id,
@@ -59,7 +51,6 @@ SELECT
     p.base_currency,
     t.payload
         || jsonb_build_object(
-            'org_id',              t.org_id,
             'event_type',          t.event_type,
             'source_id',           t.source_id,
             'portfolio_id',        t.portfolio_id,
@@ -74,17 +65,11 @@ SELECT
             'contract_multiplier', i.contract_multiplier
         ) AS enriched
 FROM typed t
--- v6 (Phase 7, ADR-0036): every JOIN constrains org_id so cross-tenant
--- enrichment is structurally impossible even if a portfolio_id collides
--- across orgs. portfolios + instruments PKs already lead with org_id;
--- fx_rates carries org_id explicitly per fx_rates.sql.
-JOIN portfolios p USING (org_id, portfolio_id)
+JOIN portfolios p USING (portfolio_id)
 LEFT JOIN instruments i
-    ON  i.org_id        = t.org_id
-    AND i.portfolio_id  = t.portfolio_id
+    ON  i.portfolio_id  = t.portfolio_id
     AND i.instrument_id = t.instrument_id
 ASOF LEFT JOIN fx_rates fx
-    ON  fx.org_id   = t.org_id
-    AND fx.from_ccy = t.payload ->> 'currency'
+    ON  fx.from_ccy = t.payload ->> 'currency'
     AND fx.to_ccy   = p.base_currency
     AND t.business_ts >= fx.ts;

@@ -98,3 +98,51 @@ def test_frozen_binary_health_and_polars_compute() -> None:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+_PLAN_SOURCE = """\
+@metric(output="table")
+def sqlglot_smoke():
+    return pl.DataFrame({"ts": [1], "value": [1.0]})
+"""
+
+
+@pytest.mark.freeze
+@pytest.mark.timeout(90)
+def test_frozen_binary_plan_exercises_sqlglot() -> None:
+    """POST /plan must succeed — run_plan exec's the source which imports compute.router
+    (sqlglot) transitively; if sqlglot is missing from the freeze this 500s or crashes."""
+    binary = os.path.abspath(_BINARY)
+    assert os.path.isfile(binary), f"frozen binary not found: {binary!r} — run make compute-freeze first"
+
+    port = _free_port()
+    env = {**os.environ, "COMPUTE_PORT": str(port), "COMPUTE_HOST": "127.0.0.1"}
+
+    proc = subprocess.Popen(
+        [binary],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        health_url = f"http://127.0.0.1:{port}/health"
+        _wait_ready(health_url, timeout=30.0)
+
+        # /plan — triggers exec of source inside the frozen binary; compute.router
+        # is imported transitively which in turn imports sqlglot.
+        payload = json.dumps({"source": _PLAN_SOURCE}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/plan",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            result = json.loads(resp.read())
+
+        assert "bindings" in result, f"unexpected /plan response: {result}"
+
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)

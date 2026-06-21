@@ -19,7 +19,7 @@ import {
   useStyles2,
 } from "@grafana/ui";
 import { api, errMsg } from "../api";
-import type { CatalogEntry, Org, VersionStatus } from "../types";
+import type { CatalogEntry, VersionStatus } from "../types";
 
 // Versions in the registry are mixed: legacy bare ("0.1.0") and new
 // v-prefixed ("v1.0.4"). Display them uniformly as "vX.Y.Z" without
@@ -29,9 +29,7 @@ const fmtVersion = (v?: string | null) => (v ? `v${v.replace(/^v/, "")}` : v);
 // Sentinel for the "follow latest validated" option (a null pin).
 const LATEST = "__latest__";
 
-type Props = { org: Org };
-
-export function PluginsView({ org }: Props) {
+export function PluginsView() {
   const styles = useStyles2(getStyles);
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -54,21 +52,21 @@ export function PluginsView({ org }: Props) {
     setLoading(true);
     setError("");
     try {
-      const c = await api.catalog(org.org_id);
+      const c = await api.catalog();
       setCatalog(c.plugins);
-      // Seed (first view only) from installed optionals so a pre-selection org
-      // doesn't show its installed plugins as pending-uninstall.
+      // Seed (first view only) from installed optionals so a pre-selection
+      // instance doesn't show its installed plugins as pending-uninstall.
       const installedOptional = c.plugins
         .filter((p) => p.installed && !p.required)
         .map((p) => p.plugin_id);
-      await api.seedPluginSelection(org.org_id, installedOptional);
-      const sel = await api.getPluginSelection(org.org_id);
+      await api.seedPluginSelection(installedOptional);
+      const sel = await api.getPluginSelection();
       setSelection(new Set(sel));
       const pinEntries = await Promise.all(
         c.plugins
           .filter((p) => p.installed)
           .map(async (p) => {
-            const pin = await api.getPluginPin(org.org_id, p.plugin_id);
+            const pin = await api.getPluginPin(p.plugin_id);
             return [p.plugin_id, pin] as [string, string | null];
           })
       );
@@ -85,7 +83,7 @@ export function PluginsView({ org }: Props) {
     api.getShowPreview().then(setShowPreview).catch(() => {});
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [org.org_id]);
+  }, []);
 
   // Toggling only records intent (local selection); launch installs/uninstalls.
   // Required plugins are locked on and cannot be deselected.
@@ -103,7 +101,7 @@ export function PluginsView({ org }: Props) {
     const next = !selection.has(p.plugin_id);
     setError("");
     try {
-      await api.setPluginSelection(org.org_id, p.plugin_id, next);
+      await api.setPluginSelection(p.plugin_id, next);
       setSelection((prev) => {
         const s = new Set(prev);
         if (next) s.add(p.plugin_id);
@@ -118,7 +116,7 @@ export function PluginsView({ org }: Props) {
 
   async function onSelect(p: CatalogEntry, version: string | null) {
     try {
-      await api.setPluginPin(org.org_id, p.plugin_id, version);
+      await api.setPluginPin(p.plugin_id, version);
       setDirty(true);
       setPins((prev) => ({ ...prev, [p.plugin_id]: version }));
     } catch (e) {
@@ -162,7 +160,7 @@ export function PluginsView({ org }: Props) {
             Plugins
           </Text>
           <Text color="secondary">
-            {selectedCount} selected in {org.name}. Selection applies on next launch.
+            {selectedCount} selected. Selection applies on next launch.
           </Text>
         </div>
         <Stack alignItems="center" gap={2}>

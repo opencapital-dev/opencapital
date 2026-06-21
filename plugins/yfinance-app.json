@@ -8,6 +8,6 @@
     "stagingNamespace": "opencapital-dev/plugins-staging",
     "publicURL": "https://ghcr.io"
   },
-  "versions": ["0.1.3", "0.1.2"],
+  "versions": ["0.1.4", "0.1.3", "0.1.2"],
   "preview": []
 }

@@ -59,6 +59,7 @@ Params shown in order; `pid="$portfolio_id"`, `iid="${instrument_id}"`,
 | `events{portfolio} @window` | rw | `("SELECT * FROM e_events WHERE portfolio=$1 AND ts BETWEEN $2 AND $3 ORDER BY ts ASC", pid, w0, w1)` |
 | `instrument{portfolio} @asof` | rw | `("SELECT * FROM e_instrument WHERE portfolio=$1 ORDER BY ts ASC", pid)` |
 | `instrument{portfolio,instrument} @asof` | rw | `("SELECT * FROM e_instrument WHERE portfolio=$1 AND instrument=$2 ORDER BY ts ASC", pid, iid)` |
+| `price{portfolio,instrument} @asof` | rw | `("SELECT * FROM e_price WHERE portfolio=$1 AND instrument=$2 ORDER BY ts ASC", pid, "$benchmark_ids")` |
 | `instrument{portfolio} @latest` | rw | `("SELECT DISTINCT ON (portfolio, instrument) * FROM e_instrument WHERE portfolio=$1 ORDER BY portfolio, instrument, ts DESC", pid)` |
 | `classification{portfolio} @latest` | pg | `pg("SELECT DISTINCT ON (portfolio, instrument_id) * FROM yfinance.gw_classification WHERE portfolio=$1 ORDER BY portfolio, instrument_id, ts DESC", pid)` |
 

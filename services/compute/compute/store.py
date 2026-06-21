@@ -1,0 +1,59 @@
+"""Dual-store query layer: one pg8000 connection to RisingWave, one to
+Postgres control_db. Both speak pgwire, so rwclient's query/_frame_from serve
+both. A QuerySpec carries store="auto"|"rw"|"pg"; auto is resolved by router.
+"""
+from __future__ import annotations
+import polars as pl
+from compute import rwclient
+from compute.contract import QuerySpec
+from compute.router import tables_in, decide_store
+
+def rw(sql: str, *params) -> QuerySpec:
+    return QuerySpec("rw", sql, tuple(params))
+
+def pg(sql: str, *params) -> QuerySpec:
+    return QuerySpec("pg", sql, tuple(params))
+
+_RW_CATALOG_SQL = (
+    "SELECT name FROM rw_catalog.rw_tables "
+    "UNION ALL SELECT name FROM rw_catalog.rw_materialized_views "
+    "UNION ALL SELECT name FROM rw_catalog.rw_views"
+)
+_PG_CATALOG_SQL = (
+    "SELECT table_name AS name FROM information_schema.tables "
+    "WHERE table_schema NOT IN ('pg_catalog','information_schema')"
+)
+
+class Store:
+    def __init__(self, rw_dsn: str, pg_dsn: str | None):
+        self._rw = rwclient.connect(rw_dsn)
+        self._pg = rwclient.connect(pg_dsn) if pg_dsn else None
+        self._catalog: dict[str, str] | None = None
+
+    def catalog(self) -> dict[str, str]:
+        if self._catalog is None:
+            cat: dict[str, str] = {}
+            for name in rwclient.query(self._rw, _RW_CATALOG_SQL)["name"].to_list():
+                cat[name] = "rw"
+            if self._pg is not None:
+                for name in rwclient.query(self._pg, _PG_CATALOG_SQL)["name"].to_list():
+                    cat[name] = "both" if cat.get(name) == "rw" else "pg"
+            self._catalog = cat
+        return self._catalog
+
+    def run(self, spec: QuerySpec) -> pl.DataFrame:
+        store = spec.store
+        if store == "auto":
+            store = decide_store(tables_in(spec.sql), self.catalog())
+        conn = self._rw if store == "rw" else self._pg
+        if conn is None:
+            raise RuntimeError(f"no connection for store {store!r} (postgres DSN unset?)")
+        return rwclient.query(conn, spec.sql, spec.params)
+
+    def close(self) -> None:
+        for c in (self._rw, self._pg):
+            try:
+                if c is not None:
+                    c.close()
+            except Exception:
+                pass

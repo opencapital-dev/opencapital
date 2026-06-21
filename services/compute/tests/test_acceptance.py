@@ -87,8 +87,16 @@ def _make_query_stub(table_data: dict[str, dict]):
 
     The stub inspects the SQL query for known table names (nav, flows, etc.)
     and returns the matching canned frame.  Params are ignored.
+    Catalog introspection queries (rw_catalog / information_schema) return all
+    known table names as "rw" so Store.catalog() + auto-routing succeed.
     """
-    def _query(conn, sql: str, params: tuple) -> pl.DataFrame:
+    known_tables = list(table_data.keys())
+
+    def _query(conn, sql: str, params: tuple = ()) -> pl.DataFrame:
+        if "rw_catalog" in sql:
+            return pl.DataFrame({"name": known_tables})
+        if "information_schema" in sql:
+            return pl.DataFrame({"name": []})
         for name, doc in table_data.items():
             if name in sql:
                 return _frame_from(doc["columns"], doc["rows"])
@@ -339,7 +347,11 @@ def _expected_beta_series() -> list[tuple[int, float | None]]:
 
 
 def _make_beta_query_stub():
-    def _query(conn, sql: str, params: tuple) -> pl.DataFrame:
+    def _query(conn, sql: str, params: tuple = ()) -> pl.DataFrame:
+        if "rw_catalog" in sql:
+            return pl.DataFrame({"name": ["portfolio_cum", "benchmark_cum"]})
+        if "information_schema" in sql:
+            return pl.DataFrame({"name": []})
         if "portfolio_cum" in sql:
             return _frame_from(_PORTFOLIO_CUM_ROWS["columns"], _PORTFOLIO_CUM_ROWS["rows"])
         if "benchmark_cum" in sql:

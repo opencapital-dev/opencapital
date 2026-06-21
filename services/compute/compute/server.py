@@ -4,6 +4,7 @@ Bind address and port are read from environment variables:
   COMPUTE_HOST       — defaults to 127.0.0.1 (loopback only)
   COMPUTE_PORT       — defaults to 8790
   RISINGWAVE_DSN     — RisingWave pgwire DSN the /compute endpoint connects to
+  POSTGRES_DSN       — Postgres control-db DSN (optional; enables pg store)
 
 Routes:
   GET  /health   →  200 "ok"
@@ -25,6 +26,7 @@ log = logging.getLogger("compute.server")
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8790
 _DEFAULT_DSN = "postgres://root@127.0.0.1:4566/dev?sslmode=disable"
+_DEFAULT_PG_DSN = "postgres://postgres@127.0.0.1:5432/control_db?sslmode=disable"
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -54,7 +56,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
         try:
-            result = run_compute(body, self.server.dsn)
+            result = run_compute(body, self.server.dsn, self.server.pg_dsn)
         except ComputeError as exc:
             log.warning("compute: %s", exc.message)
             self._send_json(exc.status, {"error": exc.message})
@@ -92,12 +94,14 @@ class ComputeServer(ThreadingHTTPServer):
         host: str = _DEFAULT_HOST,
         port: int = _DEFAULT_PORT,
         dsn: str = _DEFAULT_DSN,
+        pg_dsn: str | None = _DEFAULT_PG_DSN,
     ) -> None:
         super().__init__((host, port), _Handler)
         self.dsn = dsn
+        self.pg_dsn = pg_dsn
         log.info(
-            "compute server listening host=%s port=%d dsn=%s",
-            host, port, dsn,
+            "compute server listening host=%s port=%d dsn=%s pg_dsn=%s",
+            host, port, dsn, pg_dsn,
         )
 
     @classmethod
@@ -105,7 +109,8 @@ class ComputeServer(ThreadingHTTPServer):
         host = os.environ.get("COMPUTE_HOST", _DEFAULT_HOST)
         port = int(os.environ.get("COMPUTE_PORT", _DEFAULT_PORT))
         dsn = os.environ.get("RISINGWAVE_DSN", _DEFAULT_DSN)
-        return cls(host=host, port=port, dsn=dsn)
+        pg_dsn = os.environ.get("POSTGRES_DSN", _DEFAULT_PG_DSN)
+        return cls(host=host, port=port, dsn=dsn, pg_dsn=pg_dsn)
 
 
 def main() -> None:

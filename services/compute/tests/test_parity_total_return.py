@@ -103,7 +103,11 @@ class _FakeConn:
 
 
 def _make_query_stub():
-    def _query(conn, sql: str, params: tuple) -> pl.DataFrame:
+    def _query(conn, sql: str, params: tuple = ()) -> pl.DataFrame:
+        if "rw_catalog" in sql:
+            return pl.DataFrame({"name": ["nav", "flows"]})
+        if "information_schema" in sql:
+            return pl.DataFrame({"name": []})
         if "nav" in sql:
             return _frame_from(_NAV_ROWS["columns"], _NAV_ROWS["rows"])
         if "flows" in sql:

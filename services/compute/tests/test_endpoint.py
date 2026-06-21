@@ -19,9 +19,12 @@ import polars as pl
 import pytest
 
 from compute.contract import Window, make_contract
-from compute.endpoint import _to_frame, build_namespace
-from compute import endpoint, rwclient
+from compute.endpoint import _to_frame, build_namespace, run_compute
+from compute import endpoint as ep, rwclient
 from compute.server import ComputeServer
+
+# keep short alias for existing tests that reference `endpoint.*`
+endpoint = ep
 
 
 # ---------------------------------------------------------------------------
@@ -77,19 +80,33 @@ class _FakeConn:
         pass
 
 
+class _FakeStore:
+    """Stub Store for endpoint tests — returns a fixed DataFrame from run()."""
+    def __init__(self, *a, **k):
+        pass
+
+    def run(self, spec):
+        return pl.DataFrame({"ts": [1, 2], "nav": [100.0, 110.0]})
+
+    def close(self):
+        pass
+
+
 def test_run_compute_calls_sql_and_frames_result(monkeypatch):
-    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(
-        rwclient, "query",
-        lambda conn, q, p: pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.0]}),
-    )
+    """Verify the sql() convenience in the exec namespace calls through the store."""
+    class _SqlStore:
+        def __init__(self, *a, **k): pass
+        def run(self, spec): return pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.0]})
+        def close(self): pass
+
+    monkeypatch.setattr(ep, "Store", _SqlStore)
     source = (
         "@metric(output='series')\n"
         "def m():\n"
         "    df = sql('SELECT ts, nav FROM nav WHERE portfolio = $1', 'p1')\n"
         "    return df\n"
     )
-    out = endpoint.run_compute({"source": source, "window": {"from": 0, "to": 9}}, "dsn")
+    out = endpoint.run_compute({"source": source, "window": {"from": 0, "to": 9}}, "dsn", None)
     assert out["columns"] == ["ts", "nav"]
     assert out["rows"] == [[1, 10.0], [2, 11.0]]
 
@@ -102,25 +119,25 @@ def test_run_compute_scalar(monkeypatch):
         "def m():\n"
         "    return 3.14\n"
     )
-    out = endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn")
+    out = endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn", None)
     assert out["output"] == "scalar"
     assert out["rows"] == [[3.14]]
 
 
 def test_run_compute_source_error_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     source = "raise ValueError('bad source')"
     from compute.endpoint import ComputeError
     with pytest.raises(ComputeError) as exc_info:
-        endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn")
+        endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn", None)
     assert exc_info.value.status == 400
     assert "bad source" in exc_info.value.message
 
 
 def test_run_compute_entrypoint_error_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     source = (
         "@metric(output='scalar')\n"
         "def m():\n"
@@ -128,20 +145,33 @@ def test_run_compute_entrypoint_error_is_400(monkeypatch):
     )
     from compute.endpoint import ComputeError
     with pytest.raises(ComputeError) as exc_info:
-        endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn")
+        endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn", None)
     assert exc_info.value.status == 400
     assert "boom" in exc_info.value.message
 
 
 def test_run_compute_no_metric_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     source = "x = 1  # no @metric anywhere"
     from compute.endpoint import ComputeError
     with pytest.raises(ComputeError) as exc_info:
-        endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn")
+        endpoint.run_compute({"source": source, "window": {"from": 0, "to": 1}}, "dsn", None)
     assert exc_info.value.status == 400
     assert "@metric" in exc_info.value.message
+
+
+def test_run_compute_binds_frames_to_entrypoint(monkeypatch):
+    monkeypatch.setattr(ep, "Store", _FakeStore)
+    src = (
+        "@bind(nav=rw('SELECT ts, nav FROM portfolio_per_tick WHERE portfolio_id=$1', 'p1'))\n"
+        "@metric(output='scalar')\n"
+        "def m(nav):\n"
+        "    return float(nav['nav'][-1])\n"
+    )
+    out = run_compute({"source": src, "window": {"from": 0, "to": 100}}, "rwdsn", "pgdsn")
+    assert out["output"] == "scalar"
+    assert out["rows"] == [[110.0]]
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +183,13 @@ def test_namespace_surface_is_exactly_the_curated_set() -> None:
     from itertools import pairwise
 
     from compute import metrics
+    from compute.store import rw as _rw, pg as _pg
+    from compute.endpoint import _NoopStore
 
-    def dummy_sql(q, *p):
-        return pl.DataFrame()
-
-    ns = build_namespace(make_contract(), Window(0, 1), dummy_sql)
+    ns = build_namespace(make_contract(), Window(0, 1), _NoopStore())
     expected = (
         set(metrics.__all__)
-        | {"metric", "window", "pl", "sql"}
+        | {"metric", "bind", "window", "pl", "sql", "rw", "pg"}
         | {"prod", "pairwise", "sorted", "math"}
     )
     assert set(ns) == expected
@@ -171,12 +200,17 @@ def test_namespace_surface_is_exactly_the_curated_set() -> None:
     assert ns["math"] is math
     assert ns["pl"] is pl
     assert ns["window"] == Window(0, 1)
-    assert ns["sql"] is dummy_sql
+    assert ns["rw"] is _rw
+    assert ns["pg"] is _pg
+    # sql is a lambda wrapping the store — just verify it's callable
+    assert callable(ns["sql"])
     for name in metrics.__all__:
         assert ns[name] is getattr(metrics, name)
 
 
 def test_source_can_call_injected_curated_names() -> None:
+    from compute.endpoint import _NoopStore
+
     src = """
 @metric(output="scalar")
 def m():
@@ -185,11 +219,7 @@ def m():
     return prod(factors) + math.floor(1.9) + len(xs)
 """
     contract = make_contract()
-
-    def dummy_sql(q, *p):
-        return pl.DataFrame()
-
-    ns = build_namespace(contract, Window(0, 1), dummy_sql)
+    ns = build_namespace(contract, Window(0, 1), _NoopStore())
     exec(src, ns)
     # prod([2, 2]) = 4 ; floor(1.9) = 1 ; len = 3 -> 8
     assert contract.registry.entrypoint() == 8
@@ -201,20 +231,20 @@ def m():
 
 def test_parse_body_missing_source_raises(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     from compute.endpoint import ComputeError
     with pytest.raises(ComputeError) as exc_info:
-        endpoint.run_compute({"window": {"from": 0, "to": 1}}, "dsn")
+        endpoint.run_compute({"window": {"from": 0, "to": 1}}, "dsn", None)
     assert exc_info.value.status == 400
     assert "source" in exc_info.value.message
 
 
 def test_parse_body_missing_window_raises(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     from compute.endpoint import ComputeError
     with pytest.raises(ComputeError) as exc_info:
-        endpoint.run_compute({"source": "@metric(output='scalar')\ndef m(): return 1"}, "dsn")
+        endpoint.run_compute({"source": "@metric(output='scalar')\ndef m(): return 1"}, "dsn", None)
     assert exc_info.value.status == 400
     assert "window" in exc_info.value.message
 
@@ -310,7 +340,7 @@ def test_nan_inf_sanitized_in_list_tuple():
 
 def test_health_still_works(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     try:
         with urllib.request.urlopen(base + "/health") as resp:
@@ -320,13 +350,23 @@ def test_health_still_works(monkeypatch):
         srv.shutdown()
 
 
+class _E2EStore:
+    """Fake Store for server e2e tests — bypasses rwclient entirely."""
+
+    def __init__(self, frame: pl.DataFrame):
+        self._frame = frame
+
+    def run(self, spec):
+        return self._frame
+
+    def close(self):
+        pass
+
+
 def test_server_e2e_via_monkeypatched_rwclient(monkeypatch):
-    """Full HTTP e2e: server -> run_compute -> monkeypatched rwclient."""
-    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(
-        rwclient, "query",
-        lambda conn, q, p: pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.0]}),
-    )
+    """Full HTTP e2e: server -> run_compute -> fake Store."""
+    _frame = pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.0]})
+    monkeypatch.setattr(ep, "Store", lambda rw_dsn, pg_dsn: _E2EStore(_frame))
     srv, base = _serve_compute()
     source = (
         "@metric(output='series')\n"
@@ -346,11 +386,8 @@ def test_server_e2e_via_monkeypatched_rwclient(monkeypatch):
 
 def test_server_e2e_json_type_fidelity(monkeypatch):
     """Deserialized JSON rows must contain native int/float, not strings."""
-    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(
-        rwclient, "query",
-        lambda conn, q, p: pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.5]}),
-    )
+    _frame = pl.DataFrame({"ts": [1, 2], "nav": [10.0, 11.5]})
+    monkeypatch.setattr(ep, "Store", lambda rw_dsn, pg_dsn: _E2EStore(_frame))
     srv, base = _serve_compute()
     source = (
         "@metric(output='series')\n"
@@ -373,17 +410,24 @@ def test_server_e2e_json_type_fidelity(monkeypatch):
 
 def test_per_request_isolation(monkeypatch):
     """Two sequential /compute requests must not share contract registry state."""
-    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-
     call_count = [0]
+    frames = [
+        pl.DataFrame({"ts": [1], "val": [100.0]}),
+        pl.DataFrame({"ts": [2], "val": [200.0]}),
+    ]
 
-    def _query(conn, q, p):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return pl.DataFrame({"ts": [1], "val": [100.0]})
-        return pl.DataFrame({"ts": [2], "val": [200.0]})
+    class _CountingStore:
+        def __init__(self, *a, **k):
+            self._idx = call_count[0]
+            call_count[0] += 1
 
-    monkeypatch.setattr(rwclient, "query", _query)
+        def run(self, spec):
+            return frames[self._idx]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ep, "Store", _CountingStore)
     srv, base = _serve_compute()
 
     source_a = (
@@ -415,7 +459,7 @@ def test_per_request_isolation(monkeypatch):
 
 def test_server_malformed_json_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     try:
         req = urllib.request.Request(
@@ -435,7 +479,7 @@ def test_server_malformed_json_is_400(monkeypatch):
 
 def test_server_zero_metric_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     src = "x = 1  # no @metric anywhere"
     try:
@@ -450,7 +494,7 @@ def test_server_zero_metric_is_400(monkeypatch):
 
 def test_server_many_metric_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     src = """
 @metric(output="scalar")
@@ -490,7 +534,7 @@ def _post_plan(base: str, body: dict) -> tuple[int, dict]:
 
 def test_plan_returns_empty_bindings(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     src = """
 @metric(output="scalar")
@@ -507,7 +551,7 @@ def m():
 
 def test_plan_malformed_source_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     try:
         status, body = _post_plan(base, {"source": "raise ValueError('bad source')"})
@@ -519,7 +563,7 @@ def test_plan_malformed_source_is_400(monkeypatch):
 
 def test_plan_missing_source_is_400(monkeypatch):
     monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
-    monkeypatch.setattr(rwclient, "query", lambda conn, q, p: pl.DataFrame())
+    monkeypatch.setattr(rwclient, "query", lambda conn, q, p=(): pl.DataFrame())
     srv, base = _serve_compute()
     try:
         status, body = _post_plan(base, {"not_source": "x"})

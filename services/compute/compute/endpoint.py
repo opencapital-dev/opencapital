@@ -5,12 +5,15 @@ The HTTP layer (``compute.server``) delegates here.  Given a request body
 
   1. builds a fresh, isolated ``Contract`` (no cross-request leakage) and the
      exec namespace — the metric module's panel-facing names, ``metric`` /
-     ``window`` / ``pl`` / ``sql``, plus a curated set of stdlib names the
-     formulas use;
-  2. ``exec``s the source so the decorator registers the entrypoint and the
-     output mode, then asserts the contract is complete;
-  3. calls the entrypoint with no arguments; the entrypoint calls ``sql()``
-     — injected into the namespace — to pull its own data from RisingWave;
+     ``bind`` / ``rw`` / ``pg`` / ``window`` / ``pl`` / ``sql``, plus a
+     curated set of stdlib names the formulas use;
+  2. ``exec``s the source so the decorator registers the entrypoint, the
+     output mode, and any ``@bind`` QuerySpecs, then asserts the contract is
+     complete;
+  3. runs each registered ``@bind`` QuerySpec through the dual-store ``Store``
+     and calls the ``@metric`` entrypoint with the resulting Polars frames as
+     kwargs; or, for sources without ``@bind``, calls the entrypoint with no
+     arguments (legacy path, entrypoint pulls data via ``sql()``);
   4. maps the return to the NEUTRAL FRAME the P2 plugin consumes:
      ``{"output", "columns", "rows"}``.
 
@@ -27,8 +30,9 @@ from itertools import pairwise
 
 import polars as pl
 
-from compute import metrics, rwclient
-from compute.contract import ContractError, Window, make_contract
+from compute import metrics
+from compute.contract import ContractError, QuerySpec, Window, make_contract
+from compute.store import Store, pg, rw
 
 log = logging.getLogger("compute.endpoint")
 
@@ -56,39 +60,57 @@ class ComputeError(Exception):
         self.message = message
 
 
-def build_namespace(contract, window: Window, sql_fn) -> dict:
+class _NoopStore:
+    """Stub store for /plan — never fetches data, run() returns empty frame."""
+
+    def run(self, spec: QuerySpec) -> pl.DataFrame:  # noqa: ARG002
+        return pl.DataFrame()
+
+    def close(self) -> None:
+        pass
+
+
+def _auto_spec(q: str, p: tuple) -> QuerySpec:
+    """Build an auto-routed QuerySpec for the ``sql()`` convenience function."""
+    return QuerySpec("auto", q, p)
+
+
+def build_namespace(contract, window: Window, store) -> dict:
     """Assemble the exec namespace injected into a panel source.
 
     The metric module's panel-facing names (``metrics.__all__``), ``metric``
-    from *contract*, the injected ``window``, ``pl`` (polars), ``sql``
-    (the pgwire query function), and the curated stdlib names.  Returned as a
-    plain dict; Python supplies ``__builtins__`` itself when this is used as
-    ``exec`` globals.
+    and ``bind`` from *contract*, the injected ``window``, ``pl`` (polars),
+    ``rw`` / ``pg`` (store-pinned QuerySpec constructors), ``sql`` (auto-routed
+    convenience that runs immediately via *store*), and the curated stdlib
+    names.  Returned as a plain dict; Python supplies ``__builtins__`` itself
+    when this is used as ``exec`` globals.
     """
     ns: dict = {name: getattr(metrics, name) for name in metrics.__all__}
     ns.update(_CURATED_STDLIB)
     ns["metric"] = contract.metric
+    ns["bind"] = contract.bind
     ns["window"] = window
     ns["pl"] = pl
-    ns["sql"] = sql_fn
+    ns["rw"] = rw
+    ns["pg"] = pg
+    ns["sql"] = lambda q, *p: store.run(_auto_spec(q, tuple(p)))
     return ns
 
 
-def run_compute(body: dict, dsn: str) -> dict:
+def run_compute(body: dict, rw_dsn: str, pg_dsn: str | None = None) -> dict:
     """Run one panel source end to end and return the neutral frame.
 
-    *body* is the parsed request (``source`` / ``window``); *dsn* is the
-    RisingWave postgres:// DSN.  Raises ``ComputeError`` for any client-visible
-    failure (malformed request, contract error, author exception) so the HTTP
-    layer can render a clean ``{"error": ...}`` body.
+    *body* is the parsed request (``source`` / ``window``); *rw_dsn* is the
+    RisingWave postgres:// DSN; *pg_dsn* is the optional Postgres control-db
+    DSN.  Raises ``ComputeError`` for any client-visible failure (malformed
+    request, contract error, author exception) so the HTTP layer can render a
+    clean ``{"error": ...}`` body.
     """
-    source, window = _parse_body(body)          # jwt + prefetched no longer read
-    conn = rwclient.connect(dsn)
+    source, window = _parse_body(body)
+    store = Store(rw_dsn, pg_dsn)
     try:
-        def sql_fn(query: str, *params):
-            return rwclient.query(conn, query, tuple(params))
         contract = make_contract()
-        ns = build_namespace(contract, window, sql_fn)
+        ns = build_namespace(contract, window, store)
         try:
             exec(source, ns)  # noqa: S102 — unrestricted by design (single-tenant)
         except ContractError as exc:
@@ -102,15 +124,23 @@ def run_compute(body: dict, dsn: str) -> dict:
         except ContractError as exc:
             raise ComputeError(400, str(exc)) from exc
 
-        log.debug("compute: output=%s", reg.output)
+        log.debug("compute: output=%s bindings=%s", reg.output, list(reg.bindings))
+
+        frames = {}
+        for name, spec in reg.bindings.items():
+            try:
+                frames[name] = store.run(spec)
+            except Exception as exc:
+                raise ComputeError(400, f"binding {name!r}: {exc}") from exc
+
         try:
-            result = reg.entrypoint()   # entrypoint calls sql() itself
+            result = reg.entrypoint(**frames)
         except Exception as exc:
             raise ComputeError(400, f"entrypoint error: {exc}") from exc
 
         return _to_frame(reg.output, result)
     finally:
-        conn.close()
+        store.close()
 
 
 def run_plan(body: dict) -> dict:
@@ -129,8 +159,8 @@ def run_plan(body: dict) -> dict:
         raise ComputeError(400, "missing or invalid 'source'")
 
     contract = make_contract()
-    # sql_fn is a no-op for /plan (never calls the entrypoint or fetches data).
-    ns = build_namespace(contract, Window(0, 0), lambda q, *p: pl.DataFrame())
+    # Use a no-op store for /plan (never calls the entrypoint or fetches data).
+    ns = build_namespace(contract, Window(0, 0), _NoopStore())
     try:
         exec(source, ns)  # noqa: S102 — unrestricted by design (single-tenant)
     except ContractError as exc:

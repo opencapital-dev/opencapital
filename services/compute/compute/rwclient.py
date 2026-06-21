@@ -7,12 +7,17 @@ read-gateway HTTP hop (compute/gateway.py).
 from __future__ import annotations
 
 import logging
+import re
 from urllib.parse import urlparse
 
 import pg8000.native
 import polars as pl
 
 log = logging.getLogger("compute.rwclient")
+
+# Matches positional placeholders $1, $2, … but NOT the `::` cast operator
+# (the negative lookbehind avoids turning `col::text` into `col:p:text`).
+_PLACEHOLDER = re.compile(r"(?<!:)\$(\d+)")
 
 
 def connect(dsn: str) -> pg8000.native.Connection:
@@ -28,8 +33,19 @@ def connect(dsn: str) -> pg8000.native.Connection:
 
 
 def query(conn: pg8000.native.Connection, sql: str, params: tuple = ()) -> pl.DataFrame:
-    """Run *sql* with positional *params* ($1,$2,…) and return a polars frame."""
-    rows = conn.run(sql, *params)
+    """Run *sql* with positional *params* ($1,$2,…) and return a polars frame.
+
+    pg8000.native binds NAMED placeholders (``:name``) passed as keyword args,
+    not positional ``$N``. Translate ``$N`` → ``:pN`` and hand the params as
+    ``pN=`` kwargs so multi-param queries (and non-string params like ints)
+    bind correctly.
+    """
+    if params:
+        translated = _PLACEHOLDER.sub(lambda m: f":p{m.group(1)}", sql)
+        kwargs = {f"p{i + 1}": p for i, p in enumerate(params)}
+        rows = conn.run(translated, **kwargs)
+    else:
+        rows = conn.run(sql)
     columns = [c["name"] for c in conn.columns]
     return _frame_from(columns, rows)
 

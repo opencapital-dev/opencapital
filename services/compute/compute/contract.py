@@ -33,7 +33,7 @@ concurrent execs cannot bleed into one another.  The endpoint wires it as::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Literal, NamedTuple
+from typing import Callable, Literal, NamedTuple
 
 OutputMode = Literal["scalar", "series", "table"]
 

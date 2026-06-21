@@ -22,3 +22,8 @@ def test_decide_store_cross_store_errors():
     cat = {"a": "rw", "b": "pg"}
     with pytest.raises(ValueError, match="across"):
         decide_store({"a", "b"}, cat)
+
+def test_tables_in_excludes_cte_aliases():
+    # The CTE alias "c" must not appear in the result — only the underlying
+    # table "e_nav" referenced inside the CTE body should be returned.
+    assert tables_in("WITH c AS (SELECT * FROM e_nav) SELECT * FROM c") == {"e_nav"}

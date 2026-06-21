@@ -4,12 +4,17 @@ import sqlglot
 from sqlglot import exp
 
 def tables_in(sql: str) -> set[str]:
-    """Bare table names referenced by *sql* (schema/db qualifiers stripped, lowercased)."""
+    """Bare table names referenced by *sql* (schema/db qualifiers stripped, lowercased).
+
+    CTE aliases are excluded: ``WITH cte AS (...) SELECT * FROM cte`` returns
+    only the tables referenced inside the CTE body, not ``cte`` itself.
+    """
     try:
         tree = sqlglot.parse_one(sql, read="postgres")
     except Exception as exc:
         raise ValueError(f"unparseable SQL: {exc}") from exc
-    return {t.name.lower() for t in tree.find_all(exp.Table) if t.name}
+    ctes = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
+    return {t.name.lower() for t in tree.find_all(exp.Table) if t.name and t.name.lower() not in ctes}
 
 # The lone CDC-mirrored table; on auto it resolves to the RW analytics mirror.
 _OVERLAP_DEFAULT = {"portfolios": "rw"}

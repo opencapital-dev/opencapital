@@ -8,12 +8,19 @@ if the DSN is unreachable.  This matters for auto-routed bindings: the
 ``tables_in(spec.sql)`` parse (sqlglot) is evaluated BEFORE ``self.catalog()``
 opens the connection, so the freeze smoke test can prove the postgres dialect
 loads in the frozen binary even when no database is available.
+
+If Postgres is configured but unreachable, ``catalog()`` logs a warning and
+returns an RW-only catalog so that auto-routed RW panels keep working.
+Explicit ``pg()`` bindings will then fail at ``run()`` (no pg conn available).
 """
 from __future__ import annotations
+import logging
 import polars as pl
 from compute import rwclient
 from compute.contract import QuerySpec
 from compute.router import tables_in, decide_store
+
+_log = logging.getLogger(__name__)
 
 def rw(sql: str, *params) -> QuerySpec:
     return QuerySpec("rw", sql, tuple(params))
@@ -53,13 +60,22 @@ class Store:
 
     def catalog(self) -> dict[str, str]:
         if self._catalog is None:
+            # Build RW catalog first — this must succeed for any query routing.
             cat: dict[str, str] = {}
             for name in rwclient.query(self._conn_rw(), _RW_CATALOG_SQL)["name"].to_list():
                 cat[name] = "rw"
-            pg_conn = self._conn_pg()
-            if pg_conn is not None:
-                for name in rwclient.query(pg_conn, _PG_CATALOG_SQL)["name"].to_list():
-                    cat[name] = "both" if cat.get(name) == "rw" else "pg"
+            # PG catalog is best-effort: a down/unreachable Postgres must not
+            # break RW-only queries.  Explicit pg() bindings will fail later at
+            # run() when _conn_pg() returns None.
+            try:
+                pg_conn = self._conn_pg()
+                if pg_conn is not None:
+                    for name in rwclient.query(pg_conn, _PG_CATALOG_SQL)["name"].to_list():
+                        cat[name] = "both" if cat.get(name) == "rw" else "pg"
+            except Exception as exc:
+                _log.warning(
+                    "postgres catalog unavailable — RW-only routing active: %s", exc
+                )
             self._catalog = cat
         return self._catalog
 

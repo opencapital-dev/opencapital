@@ -33,15 +33,55 @@ concurrent execs cannot bleed into one another.  The endpoint wires it as::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal, NamedTuple
+from typing import Callable, Iterable, Literal, NamedTuple
 
 OutputMode = Literal["scalar", "series", "table"]
 
 _OUTPUTS: frozenset[str] = frozenset({"scalar", "series", "table"})
+_STORES: frozenset[str] = frozenset({"auto", "rw", "pg"})
 
 
 class ContractError(Exception):
     """A malformed panel-source contract (bad decorators)."""
+
+
+class QuerySpec(NamedTuple):
+    """A normalised binding of a SQL query to a named parameter slot.
+
+    store: "auto" | "rw" | "pg"
+    sql:   non-empty SQL string
+    params: positional parameters passed to the query
+    """
+
+    store: str
+    sql: str
+    params: tuple
+
+
+def to_spec(value) -> "QuerySpec":
+    """Normalize a binding value into a QuerySpec.
+
+    str         -> auto-routed, no params
+    (sql, *p)   -> auto-routed, positional params
+    QuerySpec   -> validated as-is (from rw()/pg())
+    """
+    if isinstance(value, QuerySpec):
+        spec = value
+    elif isinstance(value, str):
+        spec = QuerySpec("auto", value, ())
+    elif isinstance(value, tuple) and value and isinstance(value[0], str):
+        spec = QuerySpec("auto", value[0], tuple(value[1:]))
+    else:
+        raise ContractError(
+            f"invalid @bind value {value!r}; want str, (sql, *params), or rw()/pg()"
+        )
+    if spec.store not in _STORES:
+        raise ContractError(
+            f"invalid store {spec.store!r}; expected one of {sorted(_STORES)}"
+        )
+    if not isinstance(spec.sql, str) or not spec.sql.strip():
+        raise ContractError("@bind sql must be a non-empty string")
+    return spec
 
 
 class Window(NamedTuple):
@@ -65,6 +105,7 @@ class Registry:
 
     entrypoint: Callable | None = None
     output: OutputMode | None = None
+    bindings: dict = field(default_factory=dict)  # name -> QuerySpec
 
     def require_complete(self) -> None:
         """Assert the registry holds a usable contract; raise ``ContractError`` otherwise.
@@ -104,6 +145,21 @@ class Contract:
         def decorate(fn: Callable) -> Callable:
             reg.entrypoint = fn
             reg.output = output  # type: ignore[assignment]
+            return fn
+
+        return decorate
+
+    def bind(self, **specs) -> Callable[[Callable], Callable]:
+        """Record one QuerySpec per binding name; returns the fn unchanged.
+
+        Pure registration — no SQL runs here. The endpoint executes the specs
+        after exec and passes the resulting frames to the entrypoint as kwargs.
+        """
+        reg = self.registry
+        normalized = {name: to_spec(val) for name, val in specs.items()}
+        reg.bindings.update(normalized)
+
+        def decorate(fn: Callable) -> Callable:
             return fn
 
         return decorate

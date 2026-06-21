@@ -119,3 +119,45 @@ def test_window_unpacks_to_pair() -> None:
     assert (t0, t1) == (1_000, 2_000)
     assert w.t0 == 1_000
     assert w.t1 == 2_000
+
+
+# ---------------------------------------------------------------------------
+# Task 1: QuerySpec + @bind registration
+# ---------------------------------------------------------------------------
+from compute.contract import QuerySpec, to_spec  # noqa: E402
+
+
+def test_bind_records_specs_normalizing_value_forms():
+    c = make_contract()
+
+    @c.bind(a="SELECT 1", b=("SELECT $1", 7), c=QuerySpec("pg", "SELECT 2", ()))
+    @c.metric(output="table")
+    def f(a, b, c):
+        return a
+
+    binds = c.registry.bindings
+    assert binds["a"] == QuerySpec("auto", "SELECT 1", ())
+    assert binds["b"] == QuerySpec("auto", "SELECT $1", (7,))
+    assert binds["c"] == QuerySpec("pg", "SELECT 2", ())
+
+
+def test_bind_alone_without_metric_is_incomplete():
+    c = make_contract()
+
+    @c.bind(a="SELECT 1")
+    def f(a):
+        return a
+
+    try:
+        c.registry.require_complete()
+        assert False, "expected ContractError"
+    except ContractError:
+        pass
+
+
+def test_to_spec_rejects_unknown_store():
+    try:
+        to_spec(QuerySpec("mysql", "SELECT 1", ()))
+        assert False
+    except ContractError:
+        pass

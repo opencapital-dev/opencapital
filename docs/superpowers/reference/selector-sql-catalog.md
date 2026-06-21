@@ -28,9 +28,17 @@ unchanged panel bodies expect.
 - **Scope:** always `WHERE portfolio = $1`, param = `"$portfolio_id"` (a quoted
   Python literal so `core-datasource`'s `substituteVars` turns it into a bound
   SQL string param — NEVER splice the value raw into SQL).
-- **Matchers:** a selector with an `instrument` matcher (`instrument="${instrument_id}"`)
-  adds `AND instrument = $2`, param = `"${instrument_id}"`. (Other label matchers
-  map the same way to their column.)
+- **Matchers:** every label/comparison inside the selector braces (other than
+  `portfolio`, which is the scope) becomes an extra `AND` clause, with its value
+  as the next positional param ($2, $3, …). Three forms occur in the panels:
+  - **string equality** `event_type="TRADE"` → `AND event_type = $N`, param the
+    literal `"TRADE"` (a quoted Python str).
+  - **variable equality** `instrument="${instrument_id}"` → `AND instrument = $N`,
+    param `"${instrument_id}"` (quoted literal → substituted to a bound param).
+  - **numeric comparison** `quantity != 0` → `AND quantity != $N`, param `0`
+    (a bare Python int, NOT quoted). Operators seen: `=`, `!=`, `<`, `>`, `<=`, `>=`.
+  Param ORDER in the binding tuple: `"$portfolio_id"` first, then each matcher's
+  value left-to-right, then (for `@window`) `window.t0, window.t1`.
 - **`@asof`** → `SELECT * FROM <view> WHERE <scope+matchers> ORDER BY ts ASC`
   (full ordered series; the old compiler did NOT bound `@asof` by the window —
   panels window in-code via the injected `window`).

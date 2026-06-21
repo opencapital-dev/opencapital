@@ -51,14 +51,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Go builds the 3 data-plane service sidecars (control-plane, gateway,
-      # read-gateway) on macOS — see `make dataplane-stage`. Windows runs the
-      # plane via the bundled WSL distro, so it needs no native Go build.
-      - uses: actions/setup-go@v5
-        if: runner.os == 'macOS'
-        with:
-          go-version: "1.26"
-
       # Caches ~/.cargo + the src-tauri target/ deps. The dominant build cost
       # (~4 min of crate compilation) drops to <1 min on a warm hit.
       - name: Cache Rust
@@ -112,10 +104,10 @@ jobs:
           test "$(curl -fsS http://127.0.0.1:8765/health)" = "ok"
           kill $pid
 
-      # Build the 3 Go service sidecars + stage the dataplane/ tree as a Tauri
-      # resource — the SAME `make` path as a local build. macOS only (Windows
-      # uses the WSL distro). Tauri picks these up via tauri.macos.conf.json.
-      - name: Stage data plane (Go sidecars + dataplane tree) (macOS)
+      # Stage the dataplane/ tree (postgres init SQL + risingwave DDL/apply.sh)
+      # as a Tauri resource — the SAME `make` path as a local build. macOS only
+      # (Windows uses the WSL distro). Tauri picks these up via tauri.macos.conf.json.
+      - name: Stage data plane (dataplane tree) (macOS)
         if: runner.os == 'macOS'
         run: make dataplane-stage
 

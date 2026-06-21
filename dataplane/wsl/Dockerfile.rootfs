@@ -1,44 +1,28 @@
 # syntax=docker/dockerfile:1.6
 #
-# Builds the OpenCapital WSL distro rootfs: the headless data plane as Linux
-# binaries on top of the official RisingWave image (which already wires RW's
-# connector libs + embedded-python UDF — no relinking, unlike the macOS bottle).
+# Builds the OpenCapital WSL distro rootfs: the headless data plane as a
+# serviceless stack (Postgres 17 + RisingWave single-node + the in-distro
+# supervisor) on top of the official RisingWave image (which already wires
+# RW's connector libs + embedded-python UDF — no relinking needed, unlike the
+# macOS bottle). No Go services are included.
 #
 # `docker export` of a container from the final stage yields the flat tar that
 # `wsl --import` consumes (see .github/workflows/wsl-rootfs-artifact.yml).
 #
-# Build context = repo root (the Go modules use `replace => ../../lib/X`):
-#   docker build -f infra/wsl/Dockerfile.rootfs --build-arg RW_VERSION=v2.8.0 -t oc-rootfs .
+# Build context = repo root:
+#   docker build -f dataplane/wsl/Dockerfile.rootfs --build-arg RW_VERSION=v2.8.0 -t oc-rootfs .
 
 ARG RW_VERSION=v2.8.0
-
-# ---------- build the Go services ----------
-# golang:1.26 satisfies read-gateway (1.26) and the others (<=1.25). Copy the
-# whole repo so every `replace => ../../lib/X` resolves without per-service
-# COPY juggling. gateway needs CGo + the bundled-librdkafka build deps; the
-# other two are pure Go.
-FROM golang:1.26-bookworm AS gobuild
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential zlib1g-dev libssl-dev libsasl2-dev pkg-config ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    set -eux; \
-    cd services/control-plane && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/control-plane ./cmd/control-plane; \
-    cd /src/services/read-gateway && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/read-gateway ./cmd/read-gateway; \
-    cd /src/services/gateway && CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/gateway ./cmd/gateway
 
 # ---------- assemble the rootfs ----------
 FROM risingwavelabs/risingwave:${RW_VERSION} AS rootfs
 USER root
 
-# postgres-17 (PGDG — RisingWave's postgres-cdc rejects pg>17) + python3 for
-# the gateway's runtime deps and psql. bash/procps for the supervisor.
+# postgres-17 (PGDG — RisingWave's postgres-cdc rejects pg>17).
+# bash/procps for the supervisor; psql for the bootstrap steps.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release bash procps libsasl2-2; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release bash procps; \
     install -d /usr/share/postgresql-common/pgdg; \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list; \
@@ -47,15 +31,14 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # Data-plane payload. Run the supervisor as a non-root user (postgres + RW
-# refuse to run as root); it owns /data (state) + /opt/opencapital (binaries).
-COPY --from=gobuild /out/control-plane /out/gateway /out/read-gateway /opt/opencapital/bin/
+# refuse to run as root); it owns /data (state) + /opt/opencapital (config).
 COPY dataplane/risingwave /opt/opencapital/infra/risingwave
 COPY dataplane/postgres/init /opt/opencapital/infra/postgres/init
 COPY dataplane/wsl/supervisor.sh /opt/opencapital/supervisor.sh
 RUN set -eux; \
     install -d /opt/opencapital/risingwave /opt/opencapital/logs /data; \
     printf '[udf]\nenable_embedded_python_udf = true\n' > /opt/opencapital/risingwave/config.toml; \
-    chmod +x /opt/opencapital/supervisor.sh /opt/opencapital/bin/*; \
+    chmod +x /opt/opencapital/supervisor.sh; \
     useradd --create-home --uid 1000 --shell /bin/bash dataplane; \
     chown -R dataplane:dataplane /opt/opencapital /data
 

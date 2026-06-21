@@ -82,7 +82,7 @@ pub fn render(
         match p.plugin_type.as_str() {
             "datasource" => {
                 if p.platform_plugin {
-                    render_datasource(p, plugins, dirs, cfg)?;
+                    render_datasource(p, dirs, cfg)?;
                 } else {
                     render_minimal_datasource(p, dirs, cfg)?;
                 }
@@ -129,8 +129,8 @@ fn render_app(
     json_data.insert("controlDb".into(), cfg.control_db.clone().into());
     json_data.insert("pluginsRoot".into(), dirs_plugin_state(cfg).into());
 
-    let mut secure: HashMap<String, String> = HashMap::new();
-    secure.insert("platformToken".into(), p.platform_token.clone());
+    // No secrets: the platform token was removed (single-user loopback trust).
+    let secure: HashMap<String, String> = HashMap::new();
 
     let doc = ProvisioningDoc {
         api_version: 1,
@@ -157,19 +157,9 @@ fn render_app(
 
 fn render_datasource(
     p: &ResolvedPlugin,
-    all_plugins: &[ResolvedPlugin],
     dirs: &ReconcileDirs,
     cfg: &ProvisioningConfig,
 ) -> Result<(), String> {
-    // Build the pluginTokens map: plugin_id -> platformToken for every installed plugin.
-    let token_map: HashMap<String, String> = all_plugins
-        .iter()
-        .filter(|pl| !pl.platform_token.is_empty())
-        .map(|pl| (pl.plugin_id.clone(), pl.platform_token.clone()))
-        .collect();
-    let tokens_json = serde_json::to_string(&token_map)
-        .map_err(|e| format!("marshal pluginTokens for {}: {}", p.plugin_id, e))?;
-
     let mut json_data: HashMap<String, serde_json::Value> = HashMap::new();
     json_data.insert("computeUrl".into(), cfg.compute_url.clone().into());
     json_data.insert("pluginId".into(), p.plugin_id.clone().into());
@@ -182,9 +172,8 @@ fn render_datasource(
         dirs.plugins_dir.to_string_lossy().into_owned().into(),
     );
 
-    let mut secure: HashMap<String, String> = HashMap::new();
-    secure.insert("platformToken".into(), p.platform_token.clone());
-    secure.insert("pluginTokens".into(), tokens_json);
+    // No secrets: platform token + pluginTokens were removed (loopback trust).
+    let secure: HashMap<String, String> = HashMap::new();
 
     let doc = DatasourceDoc {
         api_version: 1,
@@ -360,7 +349,6 @@ mod tests {
             platform_plugin: false,
             required: false,
             version: "v0.1.0".into(),
-            platform_token: "tok-abc".into(),
             artifact: None,
         }
     }
@@ -437,14 +425,12 @@ mod tests {
             platform_plugin: true,
             required: true,
             version: "v0.1.0".into(),
-            platform_token: "tok-ds".into(),
             artifact: None,
         };
         let dirs = test_dirs(&provisioning);
         let cfg = test_cfg();
-        let all_plugins = vec![p.clone()];
 
-        render_datasource(&p, &all_plugins, &dirs, &cfg).unwrap();
+        render_datasource(&p, &dirs, &cfg).unwrap();
 
         let yaml_path = provisioning.join("datasources").join("core-datasource.yaml");
         assert!(yaml_path.exists());

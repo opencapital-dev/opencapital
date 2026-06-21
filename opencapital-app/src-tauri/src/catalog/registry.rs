@@ -231,6 +231,44 @@ const PLATFORM_ANNOTATION: &str = "io.opencapital.platform";
 // GHCR anonymous token dance + artifact resolution
 // ---------------------------------------------------------------------------
 
+/// ghcr_authed_get performs a GET that handles GHCR's anonymous token dance:
+/// on a 401 carrying a Bearer challenge it fetches an anonymous token and
+/// retries with it. GHCR requires a token for BOTH manifests and blobs (config
+/// blobs and layer tarballs) — a plain GET returns 401. Blob requests then
+/// redirect (307) to a pre-signed CDN URL; reqwest follows the redirect and
+/// drops the Authorization header on the cross-host hop, so the pre-signed URL
+/// serves the bytes. Returns the final response for the caller to inspect.
+pub async fn ghcr_authed_get(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<reqwest::Response, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if resp.status().as_u16() != 401 {
+        return Ok(resp);
+    }
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if www_auth.is_empty() {
+        // 401 with no challenge — nothing to retry; let the caller see it.
+        return Ok(resp);
+    }
+    let token = fetch_ghcr_token(client, &www_auth).await?;
+    client
+        .get(url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url} (authed retry): {e}"))
+}
+
 /// fetch_oci_manifest fetches the OCI image manifest for (host, namespace, id,
 /// tag). On a 401 from GHCR it reads the WWW-Authenticate header, fetches an
 /// anonymous token from the GHCR token endpoint, and retries.
@@ -387,13 +425,13 @@ fn parse_bearer_challenge(s: &str) -> Result<(String, String, String), String> {
 }
 
 /// tag_forms returns the tag candidates for a version: a v-prefixed version is
-/// taken verbatim; a bare semver is tried verbatim then v-prefixed.
-/// Mirrors Go's tagForms.
+/// taken verbatim; a bare semver is tried v-prefixed first (GHCR's published
+/// form) then verbatim — v-first avoids a wasted token+404 roundtrip per plugin.
 pub fn tag_forms(v: &str) -> Vec<String> {
     if v.starts_with('v') {
         vec![v.to_string()]
     } else {
-        vec![v.to_string(), format!("v{}", v)]
+        vec![format!("v{}", v), v.to_string()]
     }
 }
 
@@ -581,7 +619,8 @@ mod tests {
 
     #[test]
     fn tag_forms_bare_gives_both() {
-        assert_eq!(tag_forms("0.1.2"), vec!["0.1.2", "v0.1.2"]);
+        // v-prefixed first (GHCR's published form), then bare fallback.
+        assert_eq!(tag_forms("0.1.2"), vec!["v0.1.2", "0.1.2"]);
     }
 
     #[test]

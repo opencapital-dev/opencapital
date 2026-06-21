@@ -268,22 +268,6 @@ async fn exchange_code(
     resp.json().await.map_err(|e| format!("decode token: {e}"))
 }
 
-/// me_orgs returns the orgs the logged-in user belongs to.
-#[tauri::command]
-pub async fn me_orgs(
-    cfg: State<'_, AppConfig>,
-    session: State<'_, Session>,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = shared_http_client()
-        .get(format!("{}/v1/me/orgs", cfg.control_plane_url))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/me/orgs: {e}"))?;
-    read_json(resp, "/v1/me/orgs").await
-}
-
 /// me_profile returns the human identity decoded from the id_token at login.
 /// `preferred_email` is empty when the id_token carried no email claim (e.g.
 /// the openid/email scopes weren't granted).
@@ -301,92 +285,51 @@ pub fn logout(session: State<'_, Session>) {
     *session.email.lock().unwrap() = None;
 }
 
-#[derive(serde::Serialize)]
-#[allow(dead_code)] // kept for reference; mint_instance_token is now a local stub
-struct InstanceTokenRequest<'a> {
-    org_id: &'a str,
-}
-
-/// instance_token exchanges the Kinde session for a control-plane instance
-/// token scoped to one org (Option A). Plugins present this to /jwt/mint.
+/// instance_token returns a static local instance token for the loopback proxy
+/// and plugin instanceTokenUrl. The control-plane sidecar has been removed;
+/// single-user local mode needs no JWT signing.
 #[tauri::command]
 pub async fn instance_token(
-    org_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    mint_instance_token(cfg.inner(), session.inner(), &org_id).await
+    mint_instance_token(cfg.inner(), session.inner()).await
 }
 
 /// mint_instance_token returns a static local instance token.
 /// The control-plane sidecar has been removed; single-user local mode needs
 /// no JWT signing — a fixed opaque token is sufficient for the loopback proxy
-/// and plugin instanceTokenUrl. The `{token, exp, org_id}` shape is preserved
-/// so callers that extract `.token` continue to work unchanged.
+/// and plugin instanceTokenUrl.
 pub async fn mint_instance_token(
     cfg: &AppConfig,
     session: &Session,
-    org_id: &str,
 ) -> Result<serde_json::Value, String> {
     let _ = (cfg, session); // no HTTP call needed in serviceless mode
     Ok(serde_json::json!({
         "token": "local",
         "exp": 9999999999i64,
-        "org_id": org_id,
     }))
 }
 
-#[derive(serde::Serialize)]
-struct CreateOrgRequest<'a> {
-    name: &'a str,
-    base_currency: &'a str,
-}
-
-/// create_org onboards a logged-in user with no workspace: control-plane
-/// creates the org, makes the caller admin, and installs required plugins.
-#[tauri::command]
-pub async fn create_org(
-    name: String,
-    base_currency: String,
-    cfg: State<'_, AppConfig>,
-    session: State<'_, Session>,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = shared_http_client()
-        .post(format!("{}/v1/orgs", cfg.control_plane_url))
-        .bearer_auth(token)
-        .json(&CreateOrgRequest {
-            name: &name,
-            base_currency: &base_currency,
-        })
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/orgs: {e}"))?;
-    read_json(resp, "/v1/orgs").await
-}
-
-/// marketplace_catalog lists the plugins available to an org with their
-/// installed state. Now served in-process from the federated plugin catalog
-/// (no control-plane HTTP roundtrip). `installed` is approximated from the
-/// local selection file: a plugin is considered installed if it is required
-/// or present in the org's local selection.
+/// marketplace_catalog lists the available plugins with their installed state.
+/// Served in-process from the federated plugin catalog (no control-plane HTTP
+/// roundtrip). `installed` is approximated from the local selection file: a
+/// plugin is considered installed if it is required or present in the selection.
 #[tauri::command]
 pub async fn marketplace_catalog(
-    org_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    let _ = session; // auth check dropped for in-process call; org is local-only
-    catalog_req(cfg.inner(), &org_id).await
+    let _ = session; // auth check dropped for in-process call
+    catalog_req(cfg.inner()).await
 }
 
-/// catalog_req builds the marketplace catalog for an org from the in-process
-/// federated plugin catalog. `installed` is approximated from the local
-/// selection file (required ∪ selection). Reusable by the marketplace_catalog
-/// command and the launch-time selection reconcile.
+/// catalog_req builds the marketplace catalog from the in-process federated
+/// plugin catalog. `installed` is approximated from the local selection file
+/// (required ∪ selection). Reusable by the marketplace_catalog command and the
+/// launch-time selection reconcile.
 pub async fn catalog_req(
     cfg: &AppConfig,
-    org_id: &str,
 ) -> Result<serde_json::Value, String> {
     let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
     let refs = build_refs_cached(&cfg.plugin_list_url, &user_sources).await;
@@ -396,7 +339,7 @@ pub async fn catalog_req(
 
     // Determine installed state: required ∪ local selection.
     let selection: std::collections::HashSet<String> =
-        crate::config::read_selection_in(&cfg.base_dir(), org_id)?
+        crate::config::read_selection_in(&cfg.base_dir())?
             .into_iter()
             .collect();
 
@@ -423,7 +366,6 @@ pub async fn catalog_req(
         .collect();
 
     Ok(serde_json::json!({
-        "org_id": org_id,
         "plugins": entries,
     }))
 }
@@ -490,49 +432,7 @@ pub async fn remove_source(
     Ok(())
 }
 
-/// install_req installs one plugin for an org (idempotent). The control plane
-/// installs the latest validated version; local version pins are honored by the
-/// reconciler, not here.
-pub async fn install_req(
-    cfg: &AppConfig,
-    session: &Session,
-    org_id: &str,
-    plugin_id: &str,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = shared_http_client()
-        .post(format!(
-            "{}/v1/orgs/{}/plugins/{}",
-            cfg.control_plane_url, org_id, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("install {plugin_id}: {e}"))?;
-    read_json(resp, "install plugin").await
-}
-
-/// uninstall_req removes one (non-required) plugin from an org.
-pub async fn uninstall_req(
-    cfg: &AppConfig,
-    session: &Session,
-    org_id: &str,
-    plugin_id: &str,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = shared_http_client()
-        .delete(format!(
-            "{}/v1/orgs/{}/plugins/{}",
-            cfg.control_plane_url, org_id, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("uninstall {plugin_id}: {e}"))?;
-    read_json(resp, "uninstall plugin").await
-}
-
-/// reconcile_plugin_selection updates the org's local selection to include all
+/// reconcile_plugin_selection updates the local selection to include all
 /// required plugins (self-heal) and seeds the selection file on first launch.
 /// No HTTP calls: the control-plane sidecar has been removed. The actual binary
 /// install/uninstall is handled by the Rust reconciler in grafana.rs.
@@ -540,11 +440,10 @@ pub async fn reconcile_plugin_selection(
     app: &tauri::AppHandle,
     cfg: &AppConfig,
     session: &Session,
-    org_id: &str,
 ) -> Result<(), String> {
     use std::collections::BTreeSet;
     let _ = session; // auth not needed; catalog is in-process
-    let catalog = catalog_req(cfg, org_id).await?;
+    let catalog = catalog_req(cfg).await?;
     let entries = catalog
         .get("plugins")
         .and_then(|v| v.as_array())
@@ -562,10 +461,10 @@ pub async fn reconcile_plugin_selection(
 
     // Seed selection on first launch (no-op if already seeded).
     let base = cfg.base_dir();
-    if !crate::config::selection_exists_in(&base, org_id) {
-        crate::config::write_selection_in(&base, org_id, &[])?;
+    if !crate::config::selection_exists_in(&base) {
+        crate::config::write_selection_in(&base, &[])?;
     }
-    let mut selection: BTreeSet<String> = crate::config::read_selection_in(&base, org_id)?
+    let mut selection: BTreeSet<String> = crate::config::read_selection_in(&base)?
         .into_iter()
         .collect();
 
@@ -573,7 +472,7 @@ pub async fn reconcile_plugin_selection(
     for id in &required {
         selection.insert(id.clone());
     }
-    crate::config::write_selection_in(&base, org_id, &selection.into_iter().collect::<Vec<_>>())?;
+    crate::config::write_selection_in(&base, &selection.into_iter().collect::<Vec<_>>())?;
 
     let _ = app.emit("reconcile-progress", "Plugin selection reconciled.");
     Ok(())
@@ -619,33 +518,31 @@ pub async fn plugin_versions(
     }
 }
 
-/// get_plugin_selection returns the org's desired OPTIONAL plugins (the local
+/// get_plugin_selection returns the desired OPTIONAL plugins (the local
 /// selection the plugins view writes). Required plugins are always installed at
 /// launch regardless and are not part of this list.
 #[tauri::command]
 pub fn get_plugin_selection(
-    org_id: String,
     cfg: State<'_, AppConfig>,
 ) -> Result<Vec<String>, String> {
-    crate::config::read_selection_in(&cfg.base_dir(), &org_id)
+    crate::config::read_selection_in(&cfg.base_dir())
 }
 
-/// seed_plugin_selection initializes an org's selection from the plugins already
+/// seed_plugin_selection initializes the selection from the plugins already
 /// installed (passed by the caller) the FIRST time — i.e. only when no selection
-/// file exists yet. This migrates an org installed under the old immediate-install
+/// file exists yet. This migrates an instance from the old immediate-install
 /// UI so the plugins view and launch agree that those plugins stay selected. A
 /// no-op once a selection exists (so a deliberately-empty selection is honored).
 /// Launch performs the same seed via config helpers; both go through
 /// selection_exists_in + write_selection_in, so the rule lives in one place.
 #[tauri::command]
 pub fn seed_plugin_selection(
-    org_id: String,
     installed: Vec<String>,
     cfg: State<'_, AppConfig>,
 ) -> Result<(), String> {
     let base = cfg.base_dir();
-    if !crate::config::selection_exists_in(&base, &org_id) {
-        crate::config::write_selection_in(&base, &org_id, &installed)?;
+    if !crate::config::selection_exists_in(&base) {
+        crate::config::write_selection_in(&base, &installed)?;
     }
     Ok(())
 }
@@ -656,12 +553,11 @@ pub fn seed_plugin_selection(
 /// on the next launch.
 #[tauri::command]
 pub fn set_plugin_selection(
-    org_id: String,
     plugin_id: String,
     selected: bool,
     cfg: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    crate::config::set_selection_in(&cfg.base_dir(), &org_id, &plugin_id, selected)
+    crate::config::set_selection_in(&cfg.base_dir(), &plugin_id, selected)
 }
 
 /// get_show_preview returns the global preview-version toggle from shell settings.
@@ -676,27 +572,25 @@ pub fn set_show_preview(on: bool, cfg: State<'_, AppConfig>) -> Result<(), Strin
     crate::config::set_show_preview_in(&cfg.base_dir(), on)
 }
 
-/// get_plugin_pin returns the locally-pinned version for one (org, plugin) pair,
+/// get_plugin_pin returns the locally-pinned version for a plugin,
 /// or None if no pin is set (meaning "use latest validated").
 #[tauri::command]
 pub fn get_plugin_pin(
-    org_id: String,
     plugin_id: String,
     cfg: State<'_, AppConfig>,
 ) -> Result<Option<String>, String> {
-    let pins = crate::config::read_pins_in(&cfg.base_dir(), &org_id)?;
+    let pins = crate::config::read_pins_in(&cfg.base_dir())?;
     Ok(pins.get(&plugin_id).cloned())
 }
 
-/// set_plugin_pin writes or removes a local version pin for one (org, plugin) pair.
+/// set_plugin_pin writes or removes a local version pin for a plugin.
 #[tauri::command]
 pub fn set_plugin_pin(
-    org_id: String,
     plugin_id: String,
     version: Option<String>,
     cfg: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    crate::config::set_pin_in(&cfg.base_dir(), &org_id, &plugin_id, version.as_deref())
+    crate::config::set_pin_in(&cfg.base_dir(), &plugin_id, version.as_deref())
 }
 
 fn current_token(session: &Session) -> Result<String, String> {

@@ -21,7 +21,7 @@ pub use registry::{
 };
 pub use sources::{SourceRecord, add_source_in, read_sources_in, remove_source_in};
 
-use registry::{Footprint, blob_url, fetch_oci_manifest, tag_forms};
+use registry::{Footprint, blob_url, fetch_oci_manifest, ghcr_authed_get, tag_forms};
 
 // ---------------------------------------------------------------------------
 // Required plugin IDs (control-plane policy, not self-declared by plugins)
@@ -38,12 +38,14 @@ pub async fn list(client: &reqwest::Client, refs: &[PluginRef]) -> Vec<Plugin> {
     let required_set: std::collections::HashSet<&str> =
         DEFAULT_REQUIRED.iter().copied().collect();
 
-    let mut out: Vec<Plugin> = Vec::new();
-    for r in refs {
-        if let Some(p) = ref_to_plugin(client, r, &required_set).await {
-            out.push(p);
-        }
-    }
+    // Resolve every plugin concurrently. Each ref_to_plugin does several
+    // sequential GHCR roundtrips (manifest + config blob); serial resolution
+    // made the marketplace take many seconds to load with N plugins.
+    let resolved = futures::future::join_all(
+        refs.iter().map(|r| ref_to_plugin(client, r, &required_set)),
+    )
+    .await;
+    let mut out: Vec<Plugin> = resolved.into_iter().flatten().collect();
 
     // Required first, then alpha by plugin_id.
     out.sort_by(|a, b| {
@@ -170,11 +172,10 @@ fn pick_version(r: &PluginRef) -> Option<(String, String, bool)> {
 /// The blob URL is pre-constructed via blob_url() — no OCI token dance needed
 /// for public blobs (GHCR serves anonymous blob GETs after a manifest fetch).
 async fn fetch_config_blob(client: &reqwest::Client, url: &str) -> Result<Footprint, String> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("GET config blob: {e}"))?;
+    // GHCR blobs require the anonymous token dance — a plain GET returns 401,
+    // which left every footprint empty; install_all then skips plugins whose
+    // grafana_slug is empty, so nothing got installed.
+    let resp = ghcr_authed_get(client, url).await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

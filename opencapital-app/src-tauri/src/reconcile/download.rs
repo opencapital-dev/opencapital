@@ -166,18 +166,15 @@ pub(crate) fn bytes_sha256(data: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// download_artifact streams a URL to a temp file, returning the path.
-/// Mirrors Go's download(). No OCI token dance here: the catalog module's
-/// resolve_artifact already builds a blob URL accessible anonymously (GHCR
-/// grants anonymous blob reads after an anonymous manifest fetch via token).
-/// If GHCR ever requires a token for blobs, add it here matching catalog.rs's
-/// fetch_ghcr_token.
+/// Mirrors Go's download(). GHCR requires the anonymous token dance for blobs,
+/// so this goes through registry::ghcr_authed_get (a plain GET 401s).
 pub(crate) async fn download_artifact(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<PathBuf, String> {
-    let resp = client
-        .get(url)
-        .send()
+    // GHCR requires the anonymous token dance for blobs too — a plain GET
+    // returns 401, then redirects (307) to a pre-signed CDN URL.
+    let resp = crate::catalog::registry::ghcr_authed_get(client, url)
         .await
         .map_err(|e| format!("download {}: {}", url, e))?;
 

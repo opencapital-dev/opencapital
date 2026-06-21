@@ -76,10 +76,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             kinde::kinde_login,
-            kinde::me_orgs,
             kinde::me_profile,
             kinde::logout,
-            kinde::create_org,
             kinde::instance_token,
             kinde::marketplace_catalog,
             kinde::list_sources,

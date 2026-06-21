@@ -87,8 +87,6 @@ pub struct ResolvedPlugin {
     pub required: bool,
     /// Resolved version string (e.g. "v0.1.3").
     pub version: String,
-    /// Per-org platform token (written to secureJsonData).
-    pub platform_token: String,
     /// Resolved artifact for the running platform, or None when no artifact is
     /// published for this platform (e.g. a panel plugin with no binary).
     pub artifact: Option<crate::catalog::Artifact>,
@@ -141,13 +139,19 @@ pub async fn reconcile(
 pub fn host_platform() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    // Map Rust's arch names to the Go / plugindist convention.
+    // Map Rust's OS/arch names to the Go / plugindist convention. plugindist
+    // stamps layers with GOOS-GOARCH (e.g. "darwin-arm64"); Rust reports the OS
+    // as "macos" and arch as "aarch64", which would never match.
+    let os_tag = match os {
+        "macos" => "darwin",
+        other => other,
+    };
     let arch_tag = match arch {
         "aarch64" => "arm64",
         "x86_64" => "amd64",
         other => other,
     };
-    format!("{}-{}", os, arch_tag)
+    format!("{}-{}", os_tag, arch_tag)
 }
 
 /// plugin_display_name reads the "name" field from the installed bundle's

@@ -30,28 +30,26 @@ fn emit(app: &AppHandle, status: &str, detail: &str) {
 
 /// LaunchArgs is everything the blocking launch flow needs.
 pub struct LaunchArgs {
-    pub org_id: String,
     pub webauth_user: String,
     pub webauth_email: String,
 }
 
-/// launch_grafana is the single command the shell calls after the user picks
-/// an org: mint the instance token, start the loopback, reconcile + spawn
-/// grafana, then open the embedded Grafana webview. Progress streams to the
-/// frontend via `launch-progress` + `reconcile-progress` events.
+/// launch_grafana is the single command the shell calls after login: mint the
+/// instance token, start the loopback, reconcile + spawn grafana, then open the
+/// embedded Grafana webview. Progress streams to the frontend via
+/// `launch-progress` + `reconcile-progress` events.
 #[tauri::command]
 pub async fn launch_grafana(
     app: AppHandle,
-    org_id: String,
     user_email: String,
     user_name: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
     shared: State<'_, std::sync::Arc<Shared>>,
 ) -> Result<(), String> {
-    // 1. Mint the org-scoped instance token and stash it on the loopback for
+    // 1. Mint the local instance token and stash it on the loopback for
     //    plugins to fetch.
-    let tok_val = kinde::mint_instance_token(cfg.inner(), session.inner(), &org_id).await?;
+    let tok_val = kinde::mint_instance_token(cfg.inner(), session.inner()).await?;
     let token = tok_val
         .get("token")
         .and_then(|v| v.as_str())
@@ -62,20 +60,20 @@ pub async fn launch_grafana(
     proxy::start(shared_arc.clone())?;
     *shared_arc.instance_token.lock().unwrap() = Some(token);
 
-    // 1b. Reconcile the org's installed plugins to (required ∪ local selection):
+    // 1b. Reconcile the installed plugins to (required ∪ local selection):
     //     the single install/uninstall/self-heal path. Required plugins are
-    //     ensured every launch (self-heals an org whose onboarding missed them);
+    //     ensured every launch (self-heals any that were missed);
     //     the plugins view only edits the selection, never installs. Runs here in
     //     the async context so it finishes before the blocking grafana reconcile
     //     provisions whatever is now installed.
     emit(&app, "reconcile", "Reconciling plugin selection…");
-    kinde::reconcile_plugin_selection(&app, cfg.inner(), session.inner(), &org_id).await?;
+    kinde::reconcile_plugin_selection(&app, cfg.inner(), session.inner()).await?;
 
     // 2. Heavy lifting (downloads, reconcile, spawn) off the async runtime.
     let cfg_owned = cfg.inner().clone();
     let app_task = app.clone();
     let webauth_user = if user_email.is_empty() { user_name } else { user_email.clone() };
-    let args = LaunchArgs { org_id, webauth_user, webauth_email: user_email };
+    let args = LaunchArgs { webauth_user, webauth_email: user_email };
     let shared_task = shared_arc.clone();
     tokio::task::spawn_blocking(move || launch(&app_task, &cfg_owned, &shared_task, &args))
         .await
@@ -158,7 +156,7 @@ pub fn launch(
         }
     }
 
-    let inst = cfg.instance_dir(&args.org_id);
+    let inst = cfg.instance_dir();
     let provisioning = inst.join("provisioning");
     let plugins_dir = inst.join("plugins");
     let cache_dir = cfg.runtime_dir.join("plugin-cache");
@@ -288,17 +286,16 @@ fn dsn_field(dsn: &str, field: &str) -> Option<String> {
 
 // --- reconcile (Rust reconciler) -------------------------------------------
 
-/// build_resolved_plugins constructs the Vec<ResolvedPlugin> for the current
-/// org's installed set (required ∪ selection) by fetching the catalog in-process.
+/// build_resolved_plugins constructs the Vec<ResolvedPlugin> for the installed
+/// set (required ∪ selection) by fetching the catalog in-process.
 /// Runs a temporary tokio Runtime so it can be called from spawn_blocking.
-fn build_resolved_plugins(cfg: &AppConfig, org_id: &str) -> Result<Vec<crate::reconcile::ResolvedPlugin>, String> {
+fn build_resolved_plugins(cfg: &AppConfig) -> Result<Vec<crate::reconcile::ResolvedPlugin>, String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
-    rt.block_on(build_resolved_plugins_async(cfg, org_id))
+    rt.block_on(build_resolved_plugins_async(cfg))
 }
 
 async fn build_resolved_plugins_async(
     cfg: &AppConfig,
-    org_id: &str,
 ) -> Result<Vec<crate::reconcile::ResolvedPlugin>, String> {
     let client = reqwest::Client::new();
     let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
@@ -312,7 +309,7 @@ async fn build_resolved_plugins_async(
         refs.iter().map(|r| (r.plugin_id.as_str(), r)).collect();
 
     let selection: std::collections::HashSet<String> =
-        crate::config::read_selection_in(&cfg.base_dir(), org_id)?
+        crate::config::read_selection_in(&cfg.base_dir())?
             .into_iter()
             .collect();
 
@@ -344,8 +341,6 @@ async fn build_resolved_plugins_async(
             platform_plugin: plugin.footprint.platform_plugin,
             required: plugin.required,
             version: plugin.version.clone(),
-            // Single-user local: no per-org JWT token needed.
-            platform_token: String::new(),
             artifact,
         });
     }
@@ -369,7 +364,7 @@ fn reconcile(
     compute_url: &str,
 ) -> Result<(), String> {
     let _ = app.emit("reconcile-progress", "Resolving plugins from catalog…");
-    let plugins = build_resolved_plugins(cfg, &args.org_id)?;
+    let plugins = build_resolved_plugins(cfg)?;
 
     let plugin_state = cfg.runtime_dir.join("plugin-state");
     let dirs = crate::reconcile::ReconcileDirs {
@@ -379,7 +374,7 @@ fn reconcile(
         plugin_state_dir: plugin_state.clone(),
     };
     let prov_cfg = crate::reconcile::ProvisioningConfig {
-        org_id: args.org_id.clone(),
+        org_id: String::new(), // single local instance — no org namespace
         control_plane_url: String::new(), // control-plane removed
         otlp_endpoint: cfg.otlp_endpoint.clone(),
         instance_token_url: instance_token_url.to_string(),
@@ -421,7 +416,7 @@ fn provision_library_panels(
     let grafana_url = format!("http://127.0.0.1:{}", port);
     let webauth_user = args.webauth_user.clone();
 
-    let plugins = match build_resolved_plugins(cfg, &args.org_id) {
+    let plugins = match build_resolved_plugins(cfg) {
         Ok(p) => p,
         Err(e) => {
             let _ = app.emit("library-panels-progress", format!("WARN: {e}"));

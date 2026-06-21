@@ -237,7 +237,6 @@ mod tests {
             platform_plugin: false,
             required: false,
             version: "v0.1.0".into(),
-            platform_token: "tok".into(),
             artifact: None,
         };
 
@@ -269,7 +268,6 @@ mod tests {
             platform_plugin: false,
             required: false,
             version: "v0.1.0".into(),
-            platform_token: "".into(),
             artifact: None,
         };
 

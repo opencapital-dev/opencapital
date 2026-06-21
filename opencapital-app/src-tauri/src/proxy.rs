@@ -41,9 +41,6 @@ pub struct Shared {
     /// replaces its own handle on crash-restart.
     pub pg_child: Mutex<Option<std::process::Child>>,
     pub rw_child: Mutex<Option<std::process::Child>>,
-    pub cp_child: Mutex<Option<std::process::Child>>,
-    pub gw_child: Mutex<Option<std::process::Child>>,
-    pub rg_child: Mutex<Option<std::process::Child>>,
     /// On Windows the whole plane runs in one WSL distro; this is the
     /// long-lived `wsl … supervisor.sh` child the crash monitor wait()s on.
     #[cfg_attr(not(windows), allow(dead_code))]

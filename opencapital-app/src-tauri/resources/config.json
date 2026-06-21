@@ -1,7 +1,5 @@
 {
   "control_plane_url": "http://localhost:18080",
-  "gateway_url": "http://localhost:8090",
-  "read_gateway_url": "http://localhost:8095",
   "otlp_endpoint": "http://localhost:4317",
   "local_data_plane": "true",
   "risingwave_dsn": "",

@@ -7,12 +7,11 @@ SHELL := /bin/bash
 # Cloud operations, secrets (SOPS), and plugin gating live in the private repo.
 
 PYTEST ?= .venv/bin/python -m pytest
-GO_SVCS := control-plane gateway read-gateway
 
-.PHONY: help test test-unit go-build go-test \
+.PHONY: help test test-unit \
         compute-venv compute-freeze compute-smoke compute-sidecar-stage \
         grafana-ui grafana-ui-build grafana-ui-dev grafana-overlay-pull \
-        go-sidecars dataplane-resource dataplane-stage artifacts-stage \
+        dataplane-resource dataplane-stage artifacts-stage \
         app app-stage app-deps signing-key \
         rw-apply rw-parity schemas install-local
 
@@ -24,7 +23,7 @@ help:
 	@echo "Individual build prereqs (invoked by app-stage; CI calls the same targets):"
 	@echo "  compute-venv              - create .venv + install the compute freeze deps"
 	@echo "  compute-sidecar-stage     - freeze compute + stage it as the Tauri externalBin sidecar"
-	@echo "  dataplane-stage           - build the 3 Go service sidecars + stage the dataplane/ tree"
+	@echo "  dataplane-stage           - stage the dataplane/ tree (postgres init SQL + risingwave DDL)"
 	@echo "  artifacts-stage           - download Postgres/RisingWave/Grafana tarballs into the bundle"
 	@echo "  grafana-overlay-pull      - pull the pinned Grafana overlay (grafana-overlay.pin) into the bundle"
 	@echo "  app-deps                  - npm ci for the shell frontend"
@@ -32,7 +31,6 @@ help:
 	@echo ""
 	@echo "Other:"
 	@echo "  test / test-unit          - python unit tests (compute; no data plane required)"
-	@echo "  go-build / go-test        - build / test the Go data-plane services"
 	@echo "  compute-freeze / -smoke   - freeze / smoke-test the frozen compute binary"
 	@echo "  grafana-ui / -dev         - OPT-IN (fork devs): build the overlay from ../grafana source"
 	@echo "  rw-apply / rw-parity      - apply local RisingWave DDL / run the parity check"
@@ -41,13 +39,6 @@ help:
 # ── Python unit tests ──────────────────────────────────────────────────
 test test-unit:
 	@$(PYTEST) services/compute/tests -q -m "not integration and not freeze"; rc=$$?; [ $$rc -eq 0 ] || [ $$rc -eq 5 ]
-
-# ── Go data-plane services ─────────────────────────────────────────────
-go-build:
-	@for s in $(GO_SVCS); do echo ">>> build $$s"; (cd services/$$s && go build ./... && go vet ./...) || exit 1; done
-
-go-test:
-	@for s in $(GO_SVCS); do echo ">>> test $$s"; (cd services/$$s && go test ./...) || exit 1; done
 
 # ── App build paths ────────────────────────────────────────────────────
 APP_DIR := opencapital-app
@@ -129,26 +120,10 @@ compute-smoke: compute-freeze
 
 compute-sidecar-stage: $(COMPUTE_SIDECAR) ## Freeze + stage the compute binary as the Tauri externalBin sidecar
 
-# ── Go data-plane service sidecars + dataplane tree ────────────────────
-# Bundled the same way as the compute sidecar: the 3 Go services are built per
-# host triple and staged as Tauri externalBin (binaries/<name>-<triple>), then
-# resolved at runtime next to the app exe (see dataplane.rs ensure_service). The
-# dataplane/ tree (postgres init SQL + risingwave DDL/apply.sh) is staged as a
-# Tauri resource so a downloaded app can bootstrap without the repo checkout.
-# macOS/Linux only — Windows runs the plane via the bundled WSL distro.
+# ── dataplane tree (postgres init SQL + risingwave DDL/apply.sh) ───────
+# Staged as a Tauri resource so a downloaded app can bootstrap without the repo
+# checkout. macOS/Linux only — Windows runs the plane via the bundled WSL distro.
 DATAPLANE_RESOURCE_DST := ./$(APP_DIR)/src-tauri/resources/dataplane
-
-go-sidecars: ## Build the Go data-plane services + the grafana reconciler as Tauri externalBin sidecars
-	@mkdir -p $(COMPUTE_SIDECAR_DIR)
-	@for s in $(GO_SVCS); do \
-	  echo ">>> building $$s sidecar"; \
-	  (cd services/$$s && go build -o $(CURDIR)/$(COMPUTE_SIDECAR_DIR)/$$s-$(HOST_TRIPLE) ./cmd/$$s) || exit 1; \
-	  chmod +x $(COMPUTE_SIDECAR_DIR)/$$s-$(HOST_TRIPLE); \
-	done
-	@echo ">>> building instance-bootstrap sidecar (grafana reconciler)"
-	@(cd lib/instance-bootstrap && go build -o $(CURDIR)/$(COMPUTE_SIDECAR_DIR)/instance-bootstrap-$(HOST_TRIPLE) ./cmd/instance-bootstrap) || exit 1
-	@chmod +x $(COMPUTE_SIDECAR_DIR)/instance-bootstrap-$(HOST_TRIPLE)
-	@echo ">>> Go sidecars staged in $(COMPUTE_SIDECAR_DIR)"
 
 dataplane-resource: ## Stage dataplane/ (postgres init SQL + risingwave DDL/apply.sh) as a Tauri resource
 	rm -rf $(DATAPLANE_RESOURCE_DST)
@@ -157,7 +132,7 @@ dataplane-resource: ## Stage dataplane/ (postgres init SQL + risingwave DDL/appl
 	cp -R dataplane/risingwave $(DATAPLANE_RESOURCE_DST)/risingwave
 	@echo ">>> dataplane tree staged at $(DATAPLANE_RESOURCE_DST)"
 
-dataplane-stage: go-sidecars dataplane-resource ## Build Go sidecars + stage the dataplane tree for the bundle
+dataplane-stage: dataplane-resource ## Stage the dataplane tree for the bundle
 
 # ── Bundled data-plane artifacts (Postgres / RisingWave / Grafana) ─────
 # Downloaded into the bundle resources so the .app is fully self-contained: the

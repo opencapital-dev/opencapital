@@ -1,11 +1,10 @@
 // Grafana lifecycle for the desktop shell: provision datasources +
-// dashboards, reconcile plugins (instance-bootstrap), render grafana.ini,
+// dashboards, reconcile plugins (Rust reconciler), render grafana.ini,
 // spawn grafana-server, health-poll, and keep it alive (bounded crash
 // restart). The webview points at the loopback proxy (/grafana/*), never
 // at grafana directly, so auth.proxy can inject the user identity.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -50,8 +49,8 @@ pub async fn launch_grafana(
     session: State<'_, Session>,
     shared: State<'_, std::sync::Arc<Shared>>,
 ) -> Result<(), String> {
-    // 1. Mint the org-scoped instance token (Option A) and stash it on the
-    //    loopback for plugins to fetch.
+    // 1. Mint the org-scoped instance token and stash it on the loopback for
+    //    plugins to fetch.
     let tok_val = kinde::mint_instance_token(cfg.inner(), session.inner(), &org_id).await?;
     let token = tok_val
         .get("token")
@@ -139,7 +138,7 @@ pub fn launch(
     let instance_token_url = format!("http://127.0.0.1:{}/instance-token", loopback);
 
     // Start the compute sidecar first: its loopback URL must be available
-    // before reconcile so instance-bootstrap can stamp it into plugin jsonData
+    // before reconcile so the reconciler can stamp it into plugin jsonData
     // (Grafana sanitizes the plugin env, so this travels as data).
     emit(app, "compute", "Starting compute sidecar…");
     let compute_port = compute::start(app, cfg, shared)?;
@@ -221,7 +220,7 @@ pub fn launch(
     // Grafana is up and usable; the panels can be re-pushed on next launch.
     emit(app, "library-panels", "Publishing library panels…");
     provision_library_panels(
-        app, cfg, args, &provisioning, &plugins_dir, &cache_dir, &instance_token_url, &rw_host, &rw_port, &compute_url, port,
+        app, cfg, args, &provisioning, &plugins_dir, &cache_dir, port,
     );
 
     start_crash_monitor(app.clone(), shared.clone(), spec, port, my_gen);
@@ -236,15 +235,14 @@ fn write_provisioning(cfg: &AppConfig, provisioning: &Path) -> Result<(), String
     let ds_dir = provisioning.join("datasources");
     let plugins_dir = provisioning.join("plugins"); // reconciler writes here
     // Dashboard provisioning (provider YAML + plugin-bundled dashboards under
-    // dashboards/plugins/) is now written by the reconciler (instance-bootstrap),
-    // not here — see Phase 2.
+    // dashboards/plugins/) is now written by the reconciler, not here.
     for d in [&ds_dir, &plugins_dir] {
         fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
     }
 
     // Only the RisingWave (ops/diagnostics) datasource is rendered here. The
-    // core-datasource datasource is rendered by the reconciler (instance-bootstrap)
-    // because it needs the per-org platform token the reconciler fetches.
+    // core-datasource datasource is rendered by the Rust reconciler because it
+    // needs the per-org platform token.
     let ds = format!(
         r#"apiVersion: 1
 datasources:
@@ -288,69 +286,75 @@ fn dsn_field(dsn: &str, field: &str) -> Option<String> {
     }
 }
 
-// --- reconcile ---------------------------------------------------------------
+// --- reconcile (Rust reconciler) -------------------------------------------
 
-/// instance_bootstrap_command builds an invocation of the bundled
-/// `instance-bootstrap` sidecar binary (resolved next to the app exe, the same
-/// way as the data-plane services — built + staged by `make dataplane-stage`),
-/// pre-loaded with the shared Config env that both subcommands (reconcile +
-/// library-panels) read. The caller appends the subcommand arg and any
-/// step-specific env (e.g. GRAFANA_URL for library-panels). stdout + stderr are
-/// piped so progress can be streamed line by line. Returns an error if the
-/// sidecar is missing (a packaging bug — the app never shells out to `go`).
-#[allow(clippy::too_many_arguments)]
-fn instance_bootstrap_command(
+/// build_resolved_plugins constructs the Vec<ResolvedPlugin> for the current
+/// org's installed set (required ∪ selection) by fetching the catalog in-process.
+/// Runs a temporary tokio Runtime so it can be called from spawn_blocking.
+fn build_resolved_plugins(cfg: &AppConfig, org_id: &str) -> Result<Vec<crate::reconcile::ResolvedPlugin>, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(build_resolved_plugins_async(cfg, org_id))
+}
+
+async fn build_resolved_plugins_async(
     cfg: &AppConfig,
-    args: &LaunchArgs,
-    provisioning: &Path,
-    plugins_dir: &Path,
-    cache_dir: &Path,
-    instance_token_url: &str,
-    rw_host: &str,
-    rw_port: &str,
-    compute_url: &str,
-) -> Result<Command, String> {
-    let bin = crate::dataplane::sidecar_bin("instance-bootstrap")?;
-    // Writable SQLite root stamped into every plugin's jsonData as pluginsRoot.
-    // Grafana sanitizes the plugin subprocess env, so this must travel as data,
-    // not as a PLUGINS_ROOT env on grafana-server.
-    let plugin_state = cfg.runtime_dir.join("plugin-state");
-    let mut cmd = Command::new(&bin);
-    cmd.env("ORG_ID", &args.org_id)
-        .env("PLUGIN_STATE_DIR", &plugin_state)
-        .env("CONTROL_PLANE_URL", &cfg.control_plane_url)
-        .env("BOOTSTRAP_TOKEN", &cfg.bootstrap_token)
-        .env("GRAFANA_PROVISIONING_DIR", provisioning)
-        .env("GRAFANA_PLUGINS_DIR", plugins_dir)
-        .env("PLUGIN_CACHE_DIR", cache_dir)
-        .env("PLUGIN_CONTROL_PLANE_URL", &cfg.control_plane_url)
-        .env("PLUGIN_GATEWAY_URL", &cfg.gateway_url)
-        .env("PLUGIN_READ_GATEWAY_URL", &cfg.read_gateway_url)
-        .env("PLUGIN_OTLP_ENDPOINT", &cfg.otlp_endpoint)
-        .env("INSTANCE_TOKEN_URL", instance_token_url)
-        .env("PLUGIN_RISINGWAVE_HOST", rw_host)
-        .env("PLUGIN_RISINGWAVE_PORT", rw_port)
-        .env("PLUGIN_COMPUTE_URL", compute_url)
-        .env("PLUGIN_PINS", crate::config::pins_env_value(&cfg.base_dir(), &args.org_id))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    Ok(cmd)
+    org_id: &str,
+) -> Result<Vec<crate::reconcile::ResolvedPlugin>, String> {
+    let client = reqwest::Client::new();
+    let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let refs = crate::catalog::sources::build_plugin_refs(&client, &cfg.plugin_list_url, &user_sources).await;
+
+    // Full catalog with footprints (fetches OCI config blobs).
+    let plugins = crate::catalog::list(&client, &refs).await;
+
+    // Build a map from plugin_id to PluginRef for artifact resolution.
+    let ref_map: std::collections::HashMap<&str, &crate::catalog::PluginRef> =
+        refs.iter().map(|r| (r.plugin_id.as_str(), r)).collect();
+
+    let selection: std::collections::HashSet<String> =
+        crate::config::read_selection_in(&cfg.base_dir(), org_id)?
+            .into_iter()
+            .collect();
+
+    let platform = crate::reconcile::host_platform();
+    let mut resolved = Vec::new();
+
+    for plugin in &plugins {
+        let pid = &plugin.footprint.plugin_id;
+        if !plugin.required && !selection.contains(pid.as_str()) {
+            continue;
+        }
+        // Preview-only plugins have version="" in the catalog; skip them (no
+        // validated artifact to install).
+        if plugin.version.is_empty() {
+            continue;
+        }
+        let artifact = if let Some(pr) = ref_map.get(pid.as_str()) {
+            crate::catalog::resolve_artifact(&client, pr, &plugin.version, &platform)
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
+
+        resolved.push(crate::reconcile::ResolvedPlugin {
+            plugin_id: pid.clone(),
+            grafana_slug: plugin.footprint.grafana_slug.clone(),
+            plugin_type: plugin.footprint.plugin_type.clone(),
+            platform_plugin: plugin.footprint.platform_plugin,
+            required: plugin.required,
+            version: plugin.version.clone(),
+            // Single-user local: no per-org JWT token needed.
+            platform_token: String::new(),
+            artifact,
+        });
+    }
+    Ok(resolved)
 }
 
-/// drain_stderr reads whatever the child wrote to stderr (best-effort).
-fn drain_stderr(child: &mut Child) -> String {
-    child
-        .stderr
-        .take()
-        .map(|mut s| {
-            let mut buf = String::new();
-            use std::io::Read;
-            let _ = s.read_to_string(&mut buf);
-            buf
-        })
-        .unwrap_or_default()
-}
-
+/// reconcile installs plugins and writes Grafana provisioning by calling the
+/// Rust reconciler (crate::reconcile::reconcile). This replaces the Go
+/// instance-bootstrap sidecar.
 #[allow(clippy::too_many_arguments)]
 fn reconcile(
     app: &AppHandle,
@@ -364,37 +368,46 @@ fn reconcile(
     rw_port: &str,
     compute_url: &str,
 ) -> Result<(), String> {
-    if cfg.bootstrap_token.is_empty() {
-        return Err("bootstrap token not set (local data plane provides it automatically; for a remote control plane set BOOTSTRAP_TOKEN)".into());
-    }
-    let mut child = instance_bootstrap_command(
-        cfg, args, provisioning, plugins_dir, cache_dir, instance_token_url, rw_host, rw_port, compute_url,
-    )?
-    .spawn()
-    .map_err(|e| format!("spawn reconciler: {e}"))?;
+    let _ = app.emit("reconcile-progress", "Resolving plugins from catalog…");
+    let plugins = build_resolved_plugins(cfg, &args.org_id)?;
 
-    if let Some(out) = child.stdout.take() {
-        let reader = BufReader::new(out);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = app.emit("reconcile-progress", &line);
-        }
-    }
-    let status = child.wait().map_err(|e| format!("reconciler wait: {e}"))?;
-    if !status.success() {
-        return Err(format!("reconciler failed ({status}): {}", drain_stderr(&mut child)));
-    }
+    let plugin_state = cfg.runtime_dir.join("plugin-state");
+    let dirs = crate::reconcile::ReconcileDirs {
+        provisioning: provisioning.to_path_buf(),
+        plugins_dir: plugins_dir.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        plugin_state_dir: plugin_state.clone(),
+    };
+    let prov_cfg = crate::reconcile::ProvisioningConfig {
+        org_id: args.org_id.clone(),
+        control_plane_url: String::new(), // control-plane removed
+        otlp_endpoint: cfg.otlp_endpoint.clone(),
+        instance_token_url: instance_token_url.to_string(),
+        risingwave_host: rw_host.to_string(),
+        risingwave_port: rw_port.to_string(),
+        postgres_host: "127.0.0.1".to_string(),
+        postgres_port: "5432".to_string(),
+        control_db: "control_db".to_string(),
+        compute_url: compute_url.to_string(),
+        plugin_state_dir: plugin_state.to_string_lossy().into_owned(),
+    };
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        crate::reconcile::reconcile(&plugins, &dirs, &prov_cfg, &client).await
+    })?;
+
+    let _ = app.emit("reconcile-progress", "Plugin reconcile complete.");
     Ok(())
 }
 
-/// provision_library_panels runs the post-start `library-panels` subcommand
-/// once Grafana is healthy: it upserts each installed plugin's library panels
-/// via the Grafana HTTP API. Auth is the webauth admin user (no password) —
-/// the loopback auth.proxy injects identity, and library-panels passes the
-/// user via GRAFANA_WEBAUTH_USER.
+/// provision_library_panels pushes each plugin's library panels via the Grafana
+/// HTTP API once Grafana is healthy. Uses the Rust library-panels reconciler
+/// (crate::reconcile::library_panels::provision_library_panels).
 ///
-/// Non-fatal: unlike reconcile, a failure here must NOT abort the launch.
-/// Grafana is already up and usable; missing library panels is a degraded but
-/// recoverable state. On failure we emit a labelled warning and return Ok.
+/// Non-fatal: a failure here must NOT abort the launch. Grafana is already up
+/// and usable; missing library panels is a degraded but recoverable state.
 #[allow(clippy::too_many_arguments)]
 fn provision_library_panels(
     app: &AppHandle,
@@ -403,52 +416,48 @@ fn provision_library_panels(
     provisioning: &Path,
     plugins_dir: &Path,
     cache_dir: &Path,
-    instance_token_url: &str,
-    rw_host: &str,
-    rw_port: &str,
-    compute_url: &str,
     port: u16,
 ) {
-    let mut cmd = match instance_bootstrap_command(
-        cfg, args, provisioning, plugins_dir, cache_dir, instance_token_url, rw_host, rw_port, compute_url,
-    ) {
-        Ok(c) => c,
+    let grafana_url = format!("http://127.0.0.1:{}", port);
+    let webauth_user = args.webauth_user.clone();
+
+    let plugins = match build_resolved_plugins(cfg, &args.org_id) {
+        Ok(p) => p,
         Err(e) => {
             let _ = app.emit("library-panels-progress", format!("WARN: {e}"));
             return;
         }
     };
-    cmd.arg("library-panels")
-        .env("GRAFANA_URL", format!("http://127.0.0.1:{}", port))
-        .env("GRAFANA_WEBAUTH_USER", &args.webauth_user);
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = app.emit(
-                "library-panels-progress",
-                format!("WARN: failed to spawn library-panels: {e}"),
-            );
-            return;
-        }
+    let plugin_state = cfg.runtime_dir.join("plugin-state");
+    let dirs = crate::reconcile::ReconcileDirs {
+        provisioning: provisioning.to_path_buf(),
+        plugins_dir: plugins_dir.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        plugin_state_dir: plugin_state,
     };
 
-    if let Some(out) = child.stdout.take() {
-        let reader = BufReader::new(out);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = app.emit("library-panels-progress", &line);
-        }
-    }
-    match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            let _ = app.emit(
-                "library-panels-progress",
-                format!("WARN: library-panels failed ({status}); panels may be missing: {}", drain_stderr(&mut child)),
-            );
+    let auth = crate::reconcile::library_panels::GrafanaAuth {
+        web_auth_user: if webauth_user.is_empty() { None } else { Some(webauth_user) },
+        basic_user: None,
+        basic_pass: None,
+    };
+
+    match crate::reconcile::library_panels::provision_library_panels(
+        &plugins,
+        &dirs,
+        &grafana_url,
+        auth,
+        Duration::from_secs(30),
+    ) {
+        Ok(()) => {
+            let _ = app.emit("library-panels-progress", "Library panels provisioned.");
         }
         Err(e) => {
-            let _ = app.emit("library-panels-progress", format!("WARN: library-panels wait: {e}"));
+            let _ = app.emit(
+                "library-panels-progress",
+                format!("WARN: library-panels failed; panels may be missing: {e}"),
+            );
         }
     }
 }
@@ -560,7 +569,7 @@ fn spawn_grafana(spec: &SpawnSpec) -> Result<Child, String> {
         .arg(format!("--config={}", spec.config.to_string_lossy()))
         // NOTE: only GF_* env survives into plugin subprocesses (Grafana
         // sanitizes the rest), so plugin config like the SQLite root and the RW
-        // host travels via jsonData (instance-bootstrap), NOT env. These two are
+        // host travels via jsonData (Rust reconciler), NOT env. These two are
         // set for any non-sanitizing tooling but are not relied upon.
         .env("RISINGWAVE_HOST", &spec.rw_host)
         .env("RISINGWAVE_PORT", &spec.rw_port)

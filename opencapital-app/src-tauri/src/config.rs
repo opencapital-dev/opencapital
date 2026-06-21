@@ -27,11 +27,6 @@ pub struct AppConfig {
     pub plugin_list_url: String,
 
     // --- Grafana runtime (the "launch Grafana" half) -------------------
-    /// Gateway base plugins POST data to (host-reachable), e.g. http://localhost:8090.
-    pub gateway_url: String,
-    /// Read-gateway base the core-datasource datasource posts metric queries to
-    /// (host-reachable), e.g. http://localhost:8095.
-    pub read_gateway_url: String,
     /// OTLP collector endpoint plugins ship spans to, e.g. http://localhost:4317.
     pub otlp_endpoint: String,
     /// RisingWave DSN the RisingWave (ops) datasource connects with.
@@ -101,8 +96,6 @@ impl AppConfig {
                 file.get("plugin_list_url"),
                 "https://raw.githubusercontent.com/opencapital-dev/opencapital-releases/main/plugins.json",
             ),
-            gateway_url: pick("PLUGIN_GATEWAY_URL", file.get("gateway_url"), "http://localhost:8090"),
-            read_gateway_url: pick("PLUGIN_READ_GATEWAY_URL", file.get("read_gateway_url"), "http://localhost:8095"),
             otlp_endpoint: pick("PLUGIN_OTLP_ENDPOINT", file.get("otlp_endpoint"), "http://localhost:4317"),
             risingwave_dsn: pick(
                 "RISINGWAVE_DSN",
@@ -220,7 +213,7 @@ fn default_runtime_dir() -> PathBuf {
 }
 
 /// resolve_repo_dir finds the monorepo root. REPO_DIR wins; otherwise walk
-/// up from the current dir looking for the lib/instance-bootstrap marker
+/// up from the current dir looking for the dataplane marker
 /// (tauri dev runs with CWD = src-tauri, two levels under the repo).
 fn resolve_repo_dir() -> PathBuf {
     if let Ok(d) = env::var("REPO_DIR") {
@@ -229,7 +222,7 @@ fn resolve_repo_dir() -> PathBuf {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir = cwd.as_path();
     loop {
-        if dir.join("lib/instance-bootstrap/go.mod").exists() {
+        if dir.join("dataplane/postgres/init/01-schema.sql").exists() {
             return dir.to_path_buf();
         }
         match dir.parent() {

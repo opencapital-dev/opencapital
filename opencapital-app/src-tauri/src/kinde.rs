@@ -302,6 +302,7 @@ pub fn logout(session: State<'_, Session>) {
 }
 
 #[derive(serde::Serialize)]
+#[allow(dead_code)] // kept for reference; mint_instance_token is now a local stub
 struct InstanceTokenRequest<'a> {
     org_id: &'a str,
 }
@@ -317,24 +318,22 @@ pub async fn instance_token(
     mint_instance_token(cfg.inner(), session.inner(), &org_id).await
 }
 
-/// mint_instance_token is the shared implementation: POST the Kinde session
-/// to /v1/instance/token and return the JSON {token, exp, org_id}. Used by
-/// the instance_token command and the grafana launch flow (which stores the
-/// token on the loopback for plugins to fetch).
+/// mint_instance_token returns a static local instance token.
+/// The control-plane sidecar has been removed; single-user local mode needs
+/// no JWT signing — a fixed opaque token is sufficient for the loopback proxy
+/// and plugin instanceTokenUrl. The `{token, exp, org_id}` shape is preserved
+/// so callers that extract `.token` continue to work unchanged.
 pub async fn mint_instance_token(
     cfg: &AppConfig,
     session: &Session,
     org_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = shared_http_client()
-        .post(format!("{}/v1/instance/token", cfg.control_plane_url))
-        .bearer_auth(token)
-        .json(&InstanceTokenRequest { org_id })
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/instance/token: {e}"))?;
-    read_json(resp, "/v1/instance/token").await
+    let _ = (cfg, session); // no HTTP call needed in serviceless mode
+    Ok(serde_json::json!({
+        "token": "local",
+        "exp": 9999999999i64,
+        "org_id": org_id,
+    }))
 }
 
 #[derive(serde::Serialize)]
@@ -533,14 +532,10 @@ pub async fn uninstall_req(
     read_json(resp, "uninstall plugin").await
 }
 
-/// reconcile_plugin_selection is the SINGLE install/uninstall/self-heal path,
-/// run at launch before the grafana reconcile. It makes the org's installed set
-/// equal `required ∪ local-selection`: required plugins are always installed
-/// (self-heals an org whose onboarding missed them), user-selected optionals are
-/// installed, and deselected optionals are uninstalled. The plugins view only
-/// edits the local selection; it never installs. A failed REQUIRED plugin is
-/// fatal; a failed optional is logged and skipped so one bad plugin can't block
-/// launch.
+/// reconcile_plugin_selection updates the org's local selection to include all
+/// required plugins (self-heal) and seeds the selection file on first launch.
+/// No HTTP calls: the control-plane sidecar has been removed. The actual binary
+/// install/uninstall is handled by the Rust reconciler in grafana.rs.
 pub async fn reconcile_plugin_selection(
     app: &tauri::AppHandle,
     cfg: &AppConfig,
@@ -548,63 +543,39 @@ pub async fn reconcile_plugin_selection(
     org_id: &str,
 ) -> Result<(), String> {
     use std::collections::BTreeSet;
-    // marketplace_catalog returns { org_id, plugins: [...] }.
-    // catalog_req now resolves the catalog in-process (no control-plane roundtrip).
+    let _ = session; // auth not needed; catalog is in-process
     let catalog = catalog_req(cfg, org_id).await?;
     let entries = catalog
         .get("plugins")
         .and_then(|v| v.as_array())
         .ok_or("catalog: missing plugins array")?;
 
-    let mut catalog_ids = BTreeSet::new();
     let mut required = BTreeSet::new();
-    let mut installed = BTreeSet::new();
     for e in entries {
         let Some(id) = e.get("plugin_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
             continue;
         };
-        catalog_ids.insert(id.to_string());
         if e.get("required").and_then(|v| v.as_bool()).unwrap_or(false) {
             required.insert(id.to_string());
         }
-        if e.get("installed").and_then(|v| v.as_bool()).unwrap_or(false) {
-            installed.insert(id.to_string());
-        }
     }
 
-    // First time we reconcile an org (no selection file yet), seed the selection
-    // from the optional plugins already installed — otherwise desired-state would
-    // uninstall plugins a user installed under the old immediate-install UI.
+    // Seed selection on first launch (no-op if already seeded).
     let base = cfg.base_dir();
     if !crate::config::selection_exists_in(&base, org_id) {
-        let seed: Vec<String> = installed.difference(&required).cloned().collect();
-        crate::config::write_selection_in(&base, org_id, &seed)?;
+        crate::config::write_selection_in(&base, org_id, &[])?;
     }
-    let selection: BTreeSet<String> = crate::config::read_selection_in(&base, org_id)?
+    let mut selection: BTreeSet<String> = crate::config::read_selection_in(&base, org_id)?
         .into_iter()
         .collect();
-    // Desired = required ∪ selection, restricted to plugins the catalog offers
-    // (a stale selection for a withdrawn plugin can't be installed).
-    let mut desired: BTreeSet<String> = required.union(&selection).cloned().collect();
-    desired.retain(|id| catalog_ids.contains(id));
 
-    for id in desired.difference(&installed) {
-        let _ = app.emit("reconcile-progress", format!("Installing plugin {id}…"));
-        if let Err(e) = install_req(cfg, session, org_id, id).await {
-            if required.contains(id) {
-                return Err(format!("install required plugin {id}: {e}"));
-            }
-            let _ = app.emit("reconcile-progress", format!("WARN: install {id} failed, skipping: {e}"));
-        }
+    // Ensure required plugins are in selection (self-heal).
+    for id in &required {
+        selection.insert(id.clone());
     }
-    // installed ⊆ catalog_ids, and required ⊆ desired, so this never uninstalls a
-    // required plugin.
-    for id in installed.difference(&desired) {
-        let _ = app.emit("reconcile-progress", format!("Uninstalling plugin {id}…"));
-        if let Err(e) = uninstall_req(cfg, session, org_id, id).await {
-            let _ = app.emit("reconcile-progress", format!("WARN: uninstall {id} failed: {e}"));
-        }
-    }
+    crate::config::write_selection_in(&base, org_id, &selection.into_iter().collect::<Vec<_>>())?;
+
+    let _ = app.emit("reconcile-progress", "Plugin selection reconciled.");
     Ok(())
 }
 

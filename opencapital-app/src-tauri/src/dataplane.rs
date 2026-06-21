@@ -39,20 +39,10 @@ pub(crate) const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 const PG_PORT: u16 = 5432;
 pub(crate) const RW_PORT: u16 = 4566;
-pub(crate) const CP_PORT: u16 = 18080;
-pub(crate) const GW_PORT: u16 = 8090;
-pub(crate) const RG_PORT: u16 = 8095;
 
-// Local dev creds, matching dataplane/postgres/init/01-schema.sql (trust auth on a
-// loopback-only single-user cluster — not secrets).
-const CONTROL_DB_DSN: &str = "postgres://control_plane:control_plane_pw@127.0.0.1:5432/control_db?sslmode=disable";
-const GATEWAY_REPLICA_DSN: &str = "postgres://postgres@127.0.0.1:5432/control_db?sslmode=disable";
-const RW_DSN: &str = "postgres://root@127.0.0.1:4566/dev?sslmode=disable";
-const CONTROL_PLANE_URL: &str = "http://127.0.0.1:18080";
-/// Operator/admin token for the locally-spawned control-plane. The shell passes
-/// this as ADMIN_BOOTSTRAP_TOKEN here and uses the SAME value as its
-/// bootstrap_token (see config::load) so the reconciler can mint instance tokens
-/// — no synced repo secret needed in the fully-local data plane.
+/// Kept for config.rs's load_bootstrap_token (local_data_plane mode). No longer
+/// used as a control-plane bootstrap token because the control-plane sidecar has
+/// been removed; kept to avoid changing config.rs's public API.
 pub(crate) const LOCAL_TOKEN: &str = "localbootstrap";
 
 /// start brings the local data plane up on a background thread (so app boot is
@@ -99,22 +89,12 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
             Arc::new(move || spawn_postgres(&s, &c)));
     }
 
-    // 2. Bootstrap control_db (db + roles) once, before control-plane migrates.
+    // 2. Bootstrap control_db (db + roles + portfolios table idempotently).
+    //    The control-plane sidecar has been removed; portfolios DDL is now applied
+    //    here on every boot (CREATE TABLE IF NOT EXISTS / IF NOT EXISTS guards).
     bootstrap_control_db(&pg, cfg, &progress)?;
 
-    // 3. control-plane — auto-migrates control_db on boot (creates portfolios +
-    //    the rw_v6_pub publication the RW CDC source needs).
-    let cp = sidecar_bin("control-plane")?;
-    {
-        let c = cp.clone();
-        *shared.cp_child.lock().unwrap() = Some(spawn_control_plane(&cp, cfg)?);
-        health_tcp(CP_PORT, HEALTH_TIMEOUT)?;
-        let cfg2 = cfg.clone();
-        supervise(app.clone(), shared.clone(), |s| &s.cp_child, "control-plane", CP_PORT,
-            Arc::new(move || spawn_control_plane(&c, &cfg2)));
-    }
-
-    // 4. RisingWave.
+    // 3. RisingWave.
     let rw = ensure_risingwave(cfg, &progress)?;
     {
         let (c, s) = (cfg.clone(), rw.clone());
@@ -124,44 +104,21 @@ fn bring_up(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<()
             Arc::new(move || spawn_risingwave(&s, &c)));
     }
 
-    // 5. Apply the local RW schema (connector-less tables + MVs + pg CDC source).
-    //    Needs control-plane migrated (portfolios + publication) and RW up.
+    // 4. Apply the local RW schema (connector-less tables + MVs + pg CDC source).
+    //    Needs portfolios table + publication (done in bootstrap_control_db) and RW up.
     apply_rw_schema(&pg, cfg, &progress)?;
-
-    // 6. gateway (SINK_MODE=rw — writes pgwire DML into RW).
-    let gw = sidecar_bin("gateway")?;
-    {
-        let c = gw.clone();
-        *shared.gw_child.lock().unwrap() = Some(spawn_gateway(&gw, cfg)?);
-        health_tcp(GW_PORT, HEALTH_TIMEOUT)?;
-        let cfg2 = cfg.clone();
-        supervise(app.clone(), shared.clone(), |s| &s.gw_child, "gateway", GW_PORT,
-            Arc::new(move || spawn_gateway(&c, &cfg2)));
-    }
-
-    // 7. read-gateway (sole RW reader).
-    let rg = sidecar_bin("read-gateway")?;
-    {
-        let c = rg.clone();
-        *shared.rg_child.lock().unwrap() = Some(spawn_read_gateway(&rg, cfg)?);
-        health_tcp(RG_PORT, HEALTH_TIMEOUT)?;
-        let cfg2 = cfg.clone();
-        supervise(app.clone(), shared.clone(), |s| &s.rg_child, "read-gateway", RG_PORT,
-            Arc::new(move || spawn_read_gateway(&c, &cfg2)));
-    }
 
     Ok(())
 }
 
-// --- Go services (control-plane, gateway, read-gateway) --------------------
+// --- Sidecar binary resolution ---------------------------------------------
 
-/// sidecar_bin resolves a Go binary bundled as a Tauri externalBin sidecar next
+/// sidecar_bin resolves a binary bundled as a Tauri externalBin sidecar next
 /// to the app executable — the same mechanism as the compute sidecar (see
 /// compute::resolve_compute_bin), built + staged by `make dataplane-stage`.
 /// Tauri strips the `-<triple>` suffix when staging next to the app binary in a
 /// bundle; fall back to the suffixed name for unbundled layouts where the stager
-/// left it as `<name>-<triple>`. Shared by the data-plane services and the
-/// grafana reconciler (instance-bootstrap) so neither shells out to `go`.
+/// left it as `<name>-<triple>`.
 pub(crate) fn sidecar_bin(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = exe.parent().ok_or("exe has no parent dir")?;
@@ -180,87 +137,33 @@ pub(crate) fn sidecar_bin(name: &str) -> Result<PathBuf, String> {
     ))
 }
 
-fn spawn_control_plane(bin: &Path, cfg: &AppConfig) -> Result<Child, String> {
-    // Validate the shell's Kinde access tokens against the SAME tenant the shell
-    // logs into, so /v1/me/orgs (the desktop login -> org flow) works.
-    let domain = cfg.kinde_domain.trim_end_matches('/');
-    let jwks = format!("{domain}/.well-known/jwks.json");
-    // Per-(plugin,org) plugin state dir. control-plane defaults to the system
-    // path /var/lib/plugins (root-owned, unwritable for a desktop app → install
-    // 500s); point it at the persistent shell base dir instead. control-plane
-    // MkdirAll's the subtree, so ~/.opencapital just needs to exist (it does).
-    let plugins_root = cfg.base_dir().join("plugins").to_string_lossy().into_owned();
-    spawn_svc(bin, cfg, "control-plane.log", &[
-        ("LISTEN_ADDR", ":18080"),
-        ("PLUGINS_ROOT", plugins_root.as_str()),
-        ("CONTROL_DB_DSN", CONTROL_DB_DSN),
-        ("IDP_STATIC_USERS", r#"[{"user_id":"admin","token":"localbootstrap"}]"#),
-        ("ADMIN_BOOTSTRAP_TOKEN", LOCAL_TOKEN),
-        ("CONTROL_PLANE_JWKS_URL", "http://127.0.0.1:18080/jwt/jwks"),
-        ("KINDE_JWKS_URL", jwks.as_str()),
-        ("KINDE_ISSUER", domain),
-        ("KINDE_AUDIENCE", cfg.kinde_audience.as_str()),
-        // RW DSN: plugin install creates the per-(plugin,org) RW schema/role.
-        ("RISINGWAVE_DSN", RW_DSN),
-        // Catalog coords come from each per-plugin manifest; the local
-        // control-plane's staging janitor no-ops without creds. Only the
-        // curated marketplace list URL is needed.
-        ("PLUGINS_MANIFEST_URL", "https://raw.githubusercontent.com/opencapital-dev/opencapital/main/plugins.json"),
-    ])
-}
-
-fn spawn_gateway(bin: &Path, cfg: &AppConfig) -> Result<Child, String> {
-    spawn_svc(bin, cfg, "gateway.log", &[
-        ("LISTEN_ADDR", ":8090"),
-        ("SINK_MODE", "rw"),
-        ("RW_DSN", RW_DSN),
-        ("CONTROL_PLANE_URL", CONTROL_PLANE_URL),
-        ("CONTROL_DB_REPLICA_DSN", GATEWAY_REPLICA_DSN),
-        ("LRU_PRIME_TOKEN", LOCAL_TOKEN),
-    ])
-}
-
-fn spawn_read_gateway(bin: &Path, cfg: &AppConfig) -> Result<Child, String> {
-    spawn_svc(bin, cfg, "read-gateway.log", &[
-        ("LISTEN_ADDR", ":8095"),
-        ("CONTROL_PLANE_URL", CONTROL_PLANE_URL),
-        ("RISINGWAVE_DSN", RW_DSN),
-    ])
-}
-
-fn spawn_svc(bin: &Path, cfg: &AppConfig, log_name: &str, env: &[(&str, &str)]) -> Result<Child, String> {
-    let log = log_file(cfg, log_name)?;
-    let err = log.try_clone().map_err(|e| format!("clone log: {e}"))?;
-    let mut cmd = Command::new(bin);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.stdout(Stdio::from(log))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", bin.display()))
-}
-
 // --- schema bootstrap ------------------------------------------------------
 
-/// bootstrap_control_db creates the control_db database + roles once (idempotent
-/// via the existence check). control-plane then auto-migrates it on boot.
+/// bootstrap_control_db creates the control_db database + roles on first boot,
+/// then applies the portfolios DDL (idempotent: CREATE TABLE IF NOT EXISTS, etc.)
+/// on every boot. The control-plane sidecar has been removed; DDL that was
+/// previously migrated by control-plane on startup is now applied here.
 fn bootstrap_control_db<F: Fn(&str)>(pg: &PgPaths, cfg: &AppConfig, progress: &F) -> Result<(), String> {
     let psql = pg.bindir.join("psql");
     // health_tcp(PG_PORT) only proved the port is open: postgres opens its
     // listener BEFORE finishing crash recovery, during which it rejects every
     // query with "the database system is starting up". Querying in that window
     // made the existence check below see empty output (read as "absent") and the
-    // subsequent CREATE DATABASE fail with "already exists", aborting bring_up so
-    // control-plane never started. Wait for postgres to actually answer a query.
+    // subsequent CREATE DATABASE fail with "already exists", aborting bring_up.
+    // Wait for postgres to actually answer a query.
     let exists = wait_control_db_exists(&psql, HEALTH_TIMEOUT)?;
-    if exists {
-        return Ok(());
+    if !exists {
+        progress("Bootstrapping control_db…");
+        psql_run(&psql, "postgres", &["-c", "CREATE DATABASE control_db;"])?;
+        let schema = cfg.dataplane_dir.join("postgres/init/01-schema.sql");
+        psql_run(&psql, "control_db", &["-v", "ON_ERROR_STOP=1", "-f", &schema.to_string_lossy()])?;
     }
-    progress("Bootstrapping control_db…");
-    psql_run(&psql, "postgres", &["-c", "CREATE DATABASE control_db;"])?;
-    let schema = cfg.dataplane_dir.join("postgres/init/01-schema.sql");
-    psql_run(&psql, "control_db", &["-v", "ON_ERROR_STOP=1", "-f", &schema.to_string_lossy()])?;
+    // Always run portfolios DDL (idempotent: CREATE TABLE IF NOT EXISTS, etc.)
+    // Previously applied by the control-plane sidecar on boot; now applied here.
+    let portfolios = cfg.dataplane_dir.join("postgres/init/02-portfolios.sql");
+    if portfolios.exists() {
+        psql_run(&psql, "control_db", &["-v", "ON_ERROR_STOP=1", "-f", &portfolios.to_string_lossy()])?;
+    }
     Ok(())
 }
 
@@ -322,7 +225,6 @@ fn apply_rw_schema<F: Fn(&str)>(pg: &PgPaths, cfg: &AppConfig, progress: &F) -> 
     let status = Command::new("bash")
         .arg(&apply)
         .current_dir(apply.parent().unwrap())
-        .env("PACKAGING", "local")
         .env("CDC_PG_HOST", "127.0.0.1")
         .env("RW_HOST", "localhost")
         .env("RW_PORT", "4566")

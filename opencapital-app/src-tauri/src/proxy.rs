@@ -49,6 +49,10 @@ pub struct Shared {
     /// superseded launch sees the mismatch and exits instead of respawning a
     /// grafana the relaunch already replaced.
     pub generation: std::sync::atomic::AtomicU64,
+    /// Set by the RunEvent::Exit teardown. Each supervisor checks it the
+    /// instant its child exits and returns instead of respawning, so on-close
+    /// child-killing isn't undone by the crash monitor.
+    pub shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {

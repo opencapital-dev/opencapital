@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { api, errMsg } from "./api";
 import type { KindeProfile } from "./types";
+import { prefetchCatalog } from "./queries";
 import { Login } from "./components/Login";
 import { AppShell, NavKey } from "./components/AppShell";
 import { LaunchView } from "./components/LaunchView";
@@ -12,6 +14,7 @@ import { useUpdater } from "./updater";
 import "./App.css";
 
 function App() {
+  const queryClient = useQueryClient();
   const [loggedIn, setLoggedIn] = useState(false);
   const [profile, setProfile] = useState<KindeProfile | null>(null);
   const [nav, setNav] = useState<NavKey>("launch");
@@ -32,6 +35,8 @@ function App() {
         setProfile(null);
       }
       setLoggedIn(true);
+      // Warm the plugin catalog now so the Plugins page is instant when opened.
+      void prefetchCatalog(queryClient);
       // Best-effort update check on launch; never blocks usage.
       void updater.checkForUpdate();
     } catch (e) {

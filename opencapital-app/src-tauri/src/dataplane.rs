@@ -434,8 +434,18 @@ pub(crate) fn health_tcp(port: u16, timeout: Duration) -> Result<(), String> {
     }
 }
 
+/// should_respawn decides whether supervise restarts a child that just exited:
+/// never while the app is shutting down (a child killed during teardown must
+/// stay dead, not re-orphan), otherwise only while under the 3-restarts-per-
+/// window cap.
+pub(crate) fn should_respawn(shutting_down: bool, restarts: u32) -> bool {
+    !shutting_down && restarts < 3
+}
+
 /// supervise wait()s on a service child and respawns on unexpected exit, capped
 /// at 3 restarts per 5-minute window. `slot` selects the child handle in Shared.
+/// Respawning is suppressed once `shared.shutting_down` is set, so on-close
+/// teardown can kill children without the monitor reviving them.
 pub(crate) fn supervise(
     app: AppHandle,
     shared: Arc<Shared>,
@@ -454,12 +464,19 @@ pub(crate) fn supervise(
                 None => return, // taken for shutdown
             };
             let _ = child.wait();
+            // Teardown (RunEvent::Exit) sets this before killing children;
+            // honor it the instant wait() returns so we never re-spawn a
+            // process the app is trying to shut down.
+            let shutting_down = shared.shutting_down.load(Ordering::SeqCst);
             if window.elapsed() > Duration::from_secs(300) {
                 window = Instant::now();
                 restarts.store(0, Ordering::SeqCst);
             }
-            if restarts.fetch_add(1, Ordering::SeqCst) >= 3 {
-                let _ = app.emit("dataplane-crashed", format!("{name} exited too many times; giving up"));
+            let n = restarts.fetch_add(1, Ordering::SeqCst);
+            if !should_respawn(shutting_down, n) {
+                if !shutting_down {
+                    let _ = app.emit("dataplane-crashed", format!("{name} exited too many times; giving up"));
+                }
                 return;
             }
             let _ = app.emit("dataplane-restarting", format!("{name} exited; restarting…"));
@@ -481,6 +498,19 @@ pub(crate) fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervise_stops_respawning_on_shutdown() {
+        // Under the cap, not shutting down → respawn.
+        assert!(should_respawn(false, 0));
+        assert!(should_respawn(false, 2));
+        // Restart cap reached → give up.
+        assert!(!should_respawn(false, 3));
+        // Shutting down gates respawn regardless of restart count — a child
+        // killed during teardown must stay dead, never re-orphan.
+        assert!(!should_respawn(true, 0));
+        assert!(!should_respawn(true, 2));
+    }
 
     #[test]
     fn health_tcp_times_out_on_dead_port() {

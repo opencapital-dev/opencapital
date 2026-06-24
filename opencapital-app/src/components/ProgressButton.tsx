@@ -89,8 +89,11 @@ const sweep = keyframes({
   "0%": { transform: "translateX(-120%)" },
   "100%": { transform: "translateX(320%)" },
 });
+// One-directional sweep: glide left→right across the fill, then hold off-screen
+// for the second half so the loop reset is invisible (no perceived reversal).
 const gloss = keyframes({
   "0%": { transform: "translateX(-100%)" },
+  "50%": { transform: "translateX(100%)" },
   "100%": { transform: "translateX(100%)" },
 });
 
@@ -138,6 +141,9 @@ const getStyles = (theme: GrafanaTheme2) => ({
     top: 0,
     height: "100%",
     borderRadius: "inherit",
+    // Clip the gloss to the filled region so the shimmer never spills past the
+    // blue into the empty track.
+    overflow: "hidden",
     transition: "width 0.45s cubic-bezier(0.22, 1, 0.36, 1)",
     // Moving gloss so a determinate bar still reads as working between updates.
     "&::after": {
@@ -146,7 +152,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
       inset: 0,
       background: "linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.28), transparent)",
       transform: "translateX(-100%)",
-      animation: `${gloss} 1.5s ease-in-out infinite`,
+      animation: `${gloss} 2s linear infinite`,
     },
     "@media (prefers-reduced-motion: reduce)": {
       transition: "none",

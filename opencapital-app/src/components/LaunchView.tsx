@@ -99,9 +99,6 @@ export function LaunchView({ userEmail }: Props) {
             <Text element="h2" variant="h4">
               OpenCapital is live
             </Text>
-            <Text color="secondary">
-              Grafana opened in its own window. You can relaunch any time.
-            </Text>
             <Button variant="secondary" icon="external-link-alt" onClick={launch}>
               Relaunch
             </Button>

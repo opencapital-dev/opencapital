@@ -19,14 +19,14 @@ import {
   useStyles2,
 } from "@grafana/ui";
 import { api, errMsg } from "../api";
-import type { CatalogEntry, VersionStatus } from "../types";
+import type { CatalogEntry } from "../types";
 
 // Versions in the registry are mixed: legacy bare ("0.1.0") and new
 // v-prefixed ("v1.0.4"). Display them uniformly as "vX.Y.Z" without
 // double-prefixing. API calls + equality checks use the raw value.
 const fmtVersion = (v?: string | null) => (v ? `v${v.replace(/^v/, "")}` : v);
 
-// Sentinel for the "follow latest validated" option (a null pin).
+// Sentinel for the "follow latest" option (a null pin).
 const LATEST = "__latest__";
 
 export function PluginsView() {
@@ -36,13 +36,12 @@ export function PluginsView() {
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [dirty, setDirty] = useState(false);
-  const [versions, setVersions] = useState<Record<string, VersionStatus[]>>({});
+  const [versions, setVersions] = useState<Record<string, string[]>>({});
   const [pins, setPins] = useState<Record<string, string | null>>({});
   // Desired OPTIONAL plugins (local selection). Required plugins are always
   // installed at launch and are not stored here. The Switch reflects
   // required || selection; launch reconciles installed to match.
   const [selection, setSelection] = useState<Set<string>>(new Set());
-  const [showPreview, setShowPreview] = useState(false);
   // A third-party plugin pending a trust confirm before it's selected.
   const [confirm, setConfirm] = useState<CatalogEntry | null>(null);
 
@@ -80,7 +79,6 @@ export function PluginsView() {
 
   useEffect(() => {
     setDirty(false);
-    api.getShowPreview().then(setShowPreview).catch(() => {});
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -134,11 +132,6 @@ export function PluginsView() {
     }
   }
 
-  async function handleShowPreview(v: boolean) {
-    setShowPreview(v);
-    await api.setShowPreview(v).catch(() => {});
-  }
-
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return catalog;
@@ -164,9 +157,6 @@ export function PluginsView() {
           </Text>
         </div>
         <Stack alignItems="center" gap={2}>
-          <InlineField label="Show preview versions" transparent>
-            <Switch value={showPreview} onChange={(e) => handleShowPreview(e.currentTarget.checked)} />
-          </InlineField>
           <FilterInput
             value={search}
             onChange={setSearch}
@@ -201,10 +191,6 @@ export function PluginsView() {
             const vsList = versions[p.plugin_id] ?? [];
             const loaded = versions[p.plugin_id] !== undefined;
 
-            const visibleVersions = vsList.filter(
-              (vs) => vs.validated || showPreview || vs.version === pin
-            );
-
             // "Latest" is the recommended default; specific versions pin (freeze)
             // the plugin. Always include the current pin so the control shows it
             // even before the version list has loaded.
@@ -212,18 +198,14 @@ export function PluginsView() {
               {
                 label: "Latest",
                 value: LATEST,
-                description: "Auto-updates to the newest validated build",
+                description: "Auto-updates to the newest published build",
                 icon: "arrow-up",
               },
             ];
             const seen = new Set<string>();
-            visibleVersions.forEach((vs) => {
-              seen.add(vs.version);
-              versionOptions.push({
-                label: fmtVersion(vs.version)!,
-                value: vs.version,
-                description: vs.validated ? undefined : "preview",
-              });
+            vsList.forEach((v) => {
+              seen.add(v);
+              versionOptions.push({ label: fmtVersion(v)!, value: v });
             });
             if (pin && !seen.has(pin)) {
               versionOptions.push({ label: fmtVersion(pin)!, value: pin });

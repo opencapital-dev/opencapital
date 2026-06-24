@@ -6,8 +6,6 @@ export type KindeProfile = {
   picture?: string;
 };
 
-export type VersionStatus = { version: string; validated: boolean };
-
 export type SourceInfo = {
   url: string;
   publisher: string;

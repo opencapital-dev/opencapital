@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Catalog, KindeProfile, PluginSource, VersionStatus } from "./types";
+import type { Catalog, KindeProfile, PluginSource } from "./types";
 
 export const api = {
   kindeLogin: () => invoke<void>("kinde_login"),
@@ -7,7 +7,7 @@ export const api = {
   logout: () => invoke<void>("logout"),
   catalog: () => invoke<Catalog>("marketplace_catalog"),
   pluginVersions: (pluginId: string) =>
-    invoke<VersionStatus[]>("plugin_versions", { pluginId }),
+    invoke<string[]>("plugin_versions", { pluginId }),
   listSources: () => invoke<PluginSource[]>("list_sources"),
   addSource: (manifestUrl: string) =>
     invoke<PluginSource>("add_source", { manifestUrl }),
@@ -23,8 +23,6 @@ export const api = {
   // selection exists), so migrated instances don't show installed plugins as pending-uninstall.
   seedPluginSelection: (installed: string[]) =>
     invoke<void>("seed_plugin_selection", { installed }),
-  getShowPreview: () => invoke<boolean>("get_show_preview"),
-  setShowPreview: (on: boolean) => invoke<void>("set_show_preview", { on }),
   getPluginPin: (pluginId: string) =>
     invoke<string | null>("get_plugin_pin", { pluginId }),
   setPluginPin: (pluginId: string, version: string | null) =>

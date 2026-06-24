@@ -1,5 +1,7 @@
 # Federated Plugin Sources — Desktop UI Implementation Plan (Plan 2)
 
+> **Superseded by `docs/superpowers/specs/2026-06-24-direct-to-production-plugins-design.md`** — single `plugins` namespace; no staging namespace; versions are plain strings.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add the desktop "Sources" management screen (list/add-by-URL/remove user-added plugin manifest URLs), badge marketplace cards by source (verified vs third-party), warn before selecting third-party plugins, and validate the whole federated path end-to-end by tagging one plugin to production.
@@ -568,13 +570,7 @@ Validate the full federated path: a new production version of one official plugi
 
 The artifact for `0.1.3` must exist at `ghcr.io/opencapital-dev/plugins/yfinance-app:v0.1.3` (the per-plugin manifest's `namespace`, which validated `versions` resolve from). Two paths:
 
-- **Preferred (real publish):** in `~/trading-code/oc-plugin-yfinance-app`, bump `package.json` to `0.1.3`, push tag `v0.1.3` → the publish action builds + pushes `ghcr.io/opencapital-dev/plugins-staging/yfinance-app:v0.1.3` + cosign-signs. Then, because central promotion is removed, copy it into the trusted namespace:
-
-  ```bash
-  oras cp ghcr.io/opencapital-dev/plugins-staging/yfinance-app:v0.1.3 \
-          ghcr.io/opencapital-dev/plugins/yfinance-app:v0.1.3
-  ```
-  (Requires `oras login ghcr.io` with a PAT carrying `write:packages` on opencapital-dev. The cosign signature referrer copies with `--recursive` if you also want the signature in trusted: add `-r`.)
+- **Preferred (real publish):** in `~/trading-code/oc-plugin-yfinance-app`, bump `package.json` to `0.1.3`, push tag `v0.1.3` → the publish action builds + pushes `ghcr.io/opencapital-dev/plugins/yfinance-app:v0.1.3` directly + cosign-signs. No namespace copy needed — the action publishes straight to the trusted namespace and updates `versions[]` in `oc-plugin.json`.
 
 - **If you cannot publish a real build,** confirm an existing `0.1.3` artifact is already in the trusted namespace before proceeding (`oras repo tags ghcr.io/opencapital-dev/plugins/yfinance-app`). If neither, STOP — do not invent a version that has no artifact (the reconciler's sha256 verify would fail at install).
 

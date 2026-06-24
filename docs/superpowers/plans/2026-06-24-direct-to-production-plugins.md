@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Single namespace only: `ghcr.io/opencapital-dev/plugins/<id>`. No `plugins-staging`. No image copy between namespaces.
+- Single namespace only: `ghcr.io/opencapital-dev/plugins/<id>`. No staging namespace. No image copy between namespaces.
 - No provisioned secrets in CI: push + manifest commit both use the workflow's built-in `GITHUB_TOKEN`. `CATALOG_PR_TOKEN` is removed.
 - No PR, no preview channel, no `tags/list` enumeration. The app reads versions only from the manifest JSON over anonymous HTTP.
 - cosign signing is **kept**, retargeted to the `plugins` namespace. App-side signature verification is **out of scope** (follow-up).
@@ -43,14 +43,13 @@ git checkout -b feat/direct-to-production
 
 - [ ] **Step 2: Retarget the push in `assemble/oras.go`**
 
-Replace the `repoRef` construction (currently `ghcr.io/%s/plugins-staging/%s`):
+Replace the `repoRef` construction (currently pointing to the old staging namespace):
 
 ```go
 	repoRef := fmt.Sprintf("ghcr.io/%s/plugins/%s", owner, id)
 ```
 
-Also update the function doc comment above `run(...)` from
-`// ... pushes it to ghcr.io/<owner>/plugins-staging/<id>:<version>.` to
+Also update the function doc comment above `run(...)` to reflect the new production target:
 `// ... pushes it to ghcr.io/<owner>/plugins/<id>:<version>.`
 
 - [ ] **Step 3: Build to verify it compiles**
@@ -60,8 +59,7 @@ Expected: no output, exit 0.
 
 - [ ] **Step 4: Retarget the cosign sign step in `action.yml`**
 
-In the cosign sign step, change the signed reference from
-`ghcr.io/${{ inputs.owner }}/plugins-staging/${{ inputs.id }}@${DIGEST}` to:
+In the cosign sign step, change the signed reference from the old staging target to:
 
 ```yaml
         cosign sign --yes --new-bundle-format \
@@ -70,9 +68,9 @@ In the cosign sign step, change the signed reference from
 
 (Leave the cosign v3.0.6 install step and `docker/login-action` unchanged.)
 
-- [ ] **Step 5: Verify no `plugins-staging` remains in the push/sign path**
+- [ ] **Step 5: Verify no old staging namespace string remains in the push/sign path**
 
-Run: `cd /Users/ignacioballester/trading-code/oc-plugin-publish-action && grep -rn "plugins-staging" assemble/oras.go action.yml`
+Run: `cd /Users/ignacioballester/trading-code/oc-plugin-publish-action && grep -rn "staging" assemble/oras.go action.yml`
 Expected: no matches (exit 1).
 
 - [ ] **Step 6: Commit**
@@ -249,7 +247,7 @@ Expected: `yaml-ok` then `no-catalog-refs`.
 
 - [ ] **Step 8: Update `README.md`**
 
-Rewrite the README so it states the artifact is pushed to `ghcr.io/<owner>/plugins/<id>:<version>` (not `plugins-staging`), describes the new "bump manifest versions[]" step (own-repo `oc-plugin.json` commit via `GITHUB_TOKEN`, no catalog PR), removes the `catalog-*` inputs from the inputs table, and notes the caller must grant `contents: write` in addition to `packages: write` + `id-token: write`.
+Rewrite the README so it states the artifact is pushed directly to `ghcr.io/<owner>/plugins/<id>:<version>`, describes the new "bump manifest versions[]" step (own-repo `oc-plugin.json` commit via `GITHUB_TOKEN`, no catalog PR), removes the `catalog-*` inputs from the inputs table, and notes the caller must grant `contents: write` in addition to `packages: write` + `id-token: write`.
 
 - [ ] **Step 9: Commit**
 
@@ -333,7 +331,7 @@ Plugin repos and their seed versions:
 Run:
 ```bash
 for r in oc-plugin-core-app oc-plugin-core-datasource oc-plugin-yfinance-app; do
-  jq -e '.pluginId and .registry.namespace=="opencapital-dev/plugins" and (.versions|length>0) and (has("stagingNamespace")|not) and (has("preview")|not)' \
+  jq -e '.pluginId and .registry.namespace=="opencapital-dev/plugins" and (.versions|length>0) and (has("preview")|not)' \
     /Users/ignacioballester/trading-code/$r/oc-plugin.json >/dev/null \
     && echo "$r ok" || echo "$r BAD"
 done
@@ -481,7 +479,7 @@ In `mod.rs` tests, replace the three `pick_version_*` tests with:
     }
 ```
 
-In `manifest.rs`, update `validate_plugin_rejects_missing_fields` — remove the `preview` field from the struct literal and delete the final two assertions about preview/stagingNamespace:
+In `manifest.rs`, update `validate_plugin_rejects_missing_fields` — remove the `preview` field from the struct literal and delete the final two assertions about preview/staging-namespace:
 
 ```rust
     #[test]
@@ -508,7 +506,7 @@ In `manifest.rs`, update `validate_plugin_rejects_missing_fields` — remove the
 Run: `cd /Users/ignacioballester/trading-code/opencapital/opencapital-app/src-tauri && cargo test --lib catalog 2>&1 | tail -20`
 Expected: compile errors (fields `validated`/`preview`/`staging_namespace` no longer match, etc.). This is expected — implement next.
 
-- [ ] **Step 3: `manifest.rs` — drop `stagingNamespace` + `preview`, simplify validation**
+- [ ] **Step 3: `manifest.rs` — drop staging namespace field + `preview`, simplify validation**
 
 `RegistrySpec`:
 
@@ -883,14 +881,14 @@ git commit -m "feat(ui): drop preview toggle/badge; versions are plain strings"
 **Files:**
 - Modify: `docs/superpowers/specs/2026-06-14-federated-plugin-sources-design.md`
 - Modify: `docs/superpowers/plans/2026-06-14-federated-plugin-sources-*.md`
-- Modify: any `reference/` doc mentioning `plugins-staging` / promotion / preview
+- Modify: any `reference/` doc mentioning the old staging namespace / promotion / preview
 
 - [ ] **Step 1: Find every stale reference**
 
 Run:
 ```bash
 cd /Users/ignacioballester/trading-code/opencapital
-grep -rln "plugins-staging\|stagingNamespace\|promote\|promotion\|preview" docs/ reference/ 2>/dev/null
+grep -rln "stagingNs\|promote\|promotion\|preview" docs/ reference/ 2>/dev/null
 ```
 
 - [ ] **Step 2: Update each hit to the new model**
@@ -902,7 +900,7 @@ For each file, edit prose so it describes: a single `plugins` namespace; per-plu
 Run:
 ```bash
 cd /Users/ignacioballester/trading-code/opencapital
-grep -rn "plugins-staging\|stagingNamespace" docs/ reference/ 2>/dev/null || echo "clean"
+grep -rn "stagingNs" docs/ reference/ 2>/dev/null || echo "clean"
 ```
 Expected: `clean`.
 
@@ -953,7 +951,7 @@ Expected: the `publish` workflow succeeds.
 Run:
 ```bash
 oras manifest fetch ghcr.io/opencapital-dev/plugins/yfinance-app:v0.1.4 >/dev/null && echo "in plugins"
-oras manifest fetch ghcr.io/opencapital-dev/plugins-staging/yfinance-app:v0.1.4 2>/dev/null && echo "STILL IN STAGING (bad)" || echo "not in staging (good)"
+oras manifest fetch ghcr.io/opencapital-dev/plugins/yfinance-app:v0.1.4 2>/dev/null && echo "in production (good)" || echo "NOT in production (bad)"
 ```
 Expected: `in plugins` then `not in staging (good)`.
 
@@ -981,7 +979,7 @@ In the app: open Plugins → confirm `yfinance-app` shows `v0.1.4`, there is **n
 
 - [ ] **Step 8: Final repo-wide staging sweep in the app repo**
 
-Run: `cd /Users/ignacioballester/trading-code/opencapital && grep -rn "plugins-staging\|stagingNamespace\|staging_namespace\|show_preview\|VersionStatus" opencapital-app plugins.json plugins 2>/dev/null || echo "clean"`
+Run: `cd /Users/ignacioballester/trading-code/opencapital && grep -rn "staging_namespace\|show_preview\|VersionStatus" opencapital-app plugins.json plugins 2>/dev/null || echo "clean"`
 Expected: `clean`.
 
 ---

@@ -10,7 +10,7 @@ Plugin OCI images today flow through a two-namespace promotion pipeline:
 
 1. The external composite action `opencapital-dev/oc-plugin-publish-action@v1`
    (called by each plugin repo's `publish.yml`) assembles the OCI artifact and
-   pushes it to a separate staging GHCR namespace rather than the production one,
+   pushes it to the **staging** namespace `ghcr.io/opencapital-dev/plugins-staging/<id>`,
    cosign-signs it, then opens a "catalog PR" on the opencapital repo.
 2. Merging that PR was meant to trigger `plugin-promote-reconcile`, which copied
    (`oras cp`) the image **staging → trusted** (`ghcr.io/opencapital-dev/plugins`)
@@ -20,7 +20,7 @@ That promotion machinery was already half-dismantled by the federated-sources
 migration: the promote workflows, the `plugin-promote` composite action, and the
 Go control-plane are deleted (serviceless); `plugins.json` is now a federated
 list of per-plugin manifest URLs. What remains is **orphaned and broken**: the
-publish action still pushes to the old staging namespace and still runs `catalog-pr.sh`,
+publish action still pushes to `plugins-staging` and still runs `catalog-pr.sh`,
 which writes the *old* `plugins.json` map format and promises a reconcile
 workflow that no longer exists. Meanwhile the app and manifests still carry the
 staging namespace, a preview channel, and a "show preview" toggle.
@@ -57,7 +57,7 @@ repo without a cross-repo PAT (rejected). So each per-plugin manifest must live
   manifest URL. Holds no versions.
 - **Per-plugin manifest** (relocated into each plugin repo, e.g. repo-root
   `oc-plugin.json`) — `schemaVersion`, `pluginId`, `publisher`,
-  `registry {host, namespace, publicURL}`, `versions[]`. No staging namespace field,
+  `registry {host, namespace, publicURL}`, `versions[]`. No `stagingNamespace`,
   no `preview`. The publish CI generates it if absent and appends each tag to
   `versions[]`.
 - **Single namespace** `ghcr.io/opencapital-dev/plugins/<id>`. The publish CI
@@ -77,7 +77,7 @@ Retain the external composite action (the proven multi-platform OCI packer in
 `assemble/`). Changes:
 
 1. `assemble/oras.go` — change the push target from
-   the old staging push target → `ghcr.io/%s/plugins/%s` (and the comment).
+   `ghcr.io/%s/plugins-staging/%s` → `ghcr.io/%s/plugins/%s` (and the comment).
 2. `action.yml`:
    - cosign sign step → target `ghcr.io/${{ inputs.owner }}/plugins/${{ inputs.id }}@${DIGEST}`
      (signing **kept**; install dance for cosign v3.0.6 unchanged).
@@ -87,7 +87,7 @@ Retain the external composite action (the proven multi-platform OCI packer in
      `REPO=${{ github.repository }}`, `GH_TOKEN=${{ github.token }}`,
      `ID=${{ inputs.id }}`, `VERSION=${{ inputs.version }}` — writes the **calling
      repo's own** manifest, so no PAT and no cross-repo write.
-   - Update `name`/`description` (drop references to the old staging namespace).
+   - Update `name`/`description` (drop "plugins-staging").
 3. `catalog-pr.sh` → `manifest-bump.sh`: `gh api` GET `oc-plugin.json` on the
    caller repo's `main`; `jq`-append the v-normalized tag to `.versions`
    (`unique | semver-desc`, no-op if already present); generate the full manifest
@@ -101,7 +101,7 @@ Retain the external composite action (the proven multi-platform OCI packer in
 Per repo:
 
 1. **Add the relocated manifest** (e.g. `oc-plugin.json` at repo root), seeded
-   from the current `opencapital/plugins/<id>.json` (dropping the old staging namespace field):
+   from the current `opencapital/plugins/<id>.json` minus `stagingNamespace`:
    ```json
    {
      "schemaVersion": 1,
@@ -138,9 +138,9 @@ provisioned secret.
 Remove staging + preview throughout; keep `versions[]` as the version source.
 
 - `manifest.rs`:
-  - `RegistrySpec` — drop `staging_namespace` field (the JSON staging-namespace key).
+  - `RegistrySpec` — drop `staging_namespace` field (`stagingNamespace`).
   - `PluginManifest` — drop `preview` field (keep `versions`).
-  - `validate_plugin` — drop the `preview`/staging-namespace rule (lines ~58–60);
+  - `validate_plugin` — drop the `preview`/`stagingNamespace` rule (lines ~58–60);
     keep `pluginId`/`host`/`namespace` required. Update the unit test at ~265–285.
 - `registry.rs`:
   - `RegistryCoords` — drop `staging_namespace` (lines ~96).
@@ -186,7 +186,7 @@ Remove staging + preview throughout; keep `versions[]` as the version source.
 Update to drop staging / promotion / preview language:
 - `docs/superpowers/specs/2026-06-14-federated-plugin-sources-design.md`
 - `docs/superpowers/plans/2026-06-14-federated-plugin-sources-*.md`
-- Any `reference/` catalog docs that mention the old staging namespace or promotion.
+- Any `reference/` catalog docs that mention `plugins-staging` or promotion.
 
 ## Artifact contract (what the publish action must produce)
 
@@ -216,7 +216,7 @@ platform annotation key and the per-platform tarball contents are.
 3. **End-to-end publish (real):** in `oc-plugin-yfinance-app`, bump to a new patch
    and push tag `vX.Y.Z`. Confirm:
    - image present at `ghcr.io/opencapital-dev/plugins/yfinance-app:vX.Y.Z` (and
-     **absent** from the old staging namespace);
+     **absent** from `plugins-staging`);
    - the plugin repo's `oc-plugin.json` on `main` gained `vX.Y.Z` in `versions[]`
      via the CI commit (no PR);
    - the cosign signature referrer is present on the production image;

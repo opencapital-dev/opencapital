@@ -1,15 +1,17 @@
 # Federated plugin sources — design
 
+> **Superseded by `docs/superpowers/specs/2026-06-24-direct-to-production-plugins-design.md`** — single `plugins` namespace; no staging namespace; per-plugin manifest owns `versions[]` directly.
+
 - **Date:** 2026-06-14
-- **Status:** Approved design (pre-implementation)
+- **Status:** Superseded
 - **Topic:** Decentralized, federated plugin discovery for the OpenCapital marketplace
 
 ## Problem
 
 Today the marketplace catalog reads a single public `plugins.json` (ids + versions)
 and pulls every artifact from one GHCR registry whose coordinates are static
-control-plane env (`REGISTRY_INTERNAL_URL/PUBLIC_URL/NAMESPACE/STAGING_NAMESPACE`).
-`plugins`/`plugins-staging` are the official OpenCapital namespaces, published from
+control-plane env (`REGISTRY_INTERNAL_URL/PUBLIC_URL/NAMESPACE`).
+`plugins` is the official OpenCapital namespace, published from
 each opencapital repo's CI. There is no way for:
 
 1. OpenCapital to **curate/feature** plugins it did not build (hosted in other
@@ -77,11 +79,9 @@ list. This is the unit a user adds by URL, and the unit `plugins.json` points to
   "registry": {
     "host": "ghcr.io",
     "namespace": "acme/oc-plugins",
-    "stagingNamespace": "acme/oc-plugins-staging",
     "publicURL": "https://ghcr.io"
   },
-  "versions": ["1.4.0", "1.3.0"],
-  "preview": ["1.5.0-rc1"]
+  "versions": ["1.4.0", "1.3.0"]
 }
 ```
 
@@ -92,15 +92,13 @@ list. This is the unit a user adds by URL, and the unit `plugins.json` points to
 - `registry` (required):
   - `host` (required) — OCI registry host.
   - `namespace` (required) — repository prefix: `<host>/<namespace>/<pluginId>:<tag>`.
-  - `stagingNamespace` (optional) — powers `preview`; omit if no preview channel.
   - `publicURL` (optional) — host-reachable base stamped into the reconciler's
     direct blob URL. Defaults to `https://<host>`.
-- `versions` (required, may be empty) — validated versions, bare semver,
+- `versions` (required, may be empty) — published versions, bare semver,
   highest-is-productive. Owned + updated by the plugin's own repo/CI on release.
-- `preview` (optional) — preview versions; resolved from `stagingNamespace`.
 
 **Validation:** reject a manifest missing `pluginId`, `registry.host`, or
-`registry.namespace`; or with a non-empty `preview` but no `stagingNamespace`.
+`registry.namespace`.
 
 ### 1b. Marketplace list (`plugins.json`, OpenCapital-curated)
 

@@ -128,8 +128,6 @@ pub fn run() {
             kinde::get_plugin_selection,
             kinde::set_plugin_selection,
             kinde::seed_plugin_selection,
-            kinde::get_show_preview,
-            kinde::set_show_preview,
             kinde::get_plugin_pin,
             kinde::set_plugin_pin,
             grafana::launch_grafana,

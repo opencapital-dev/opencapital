@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Data types (mirror Go's Plugin / Artifact / VersionStatus / SourceInfo)
+// Data types (mirror Go's Plugin / Artifact / SourceInfo)
 // ---------------------------------------------------------------------------
 
 /// Footprint is the plugin's install metadata read from the OCI config blob.
@@ -62,18 +62,9 @@ pub struct Artifact {
     pub size_bytes: i64,
 }
 
-/// VersionStatus pairs a version tag with whether it has been promoted to the
-/// trusted namespace (validated=true) or exists only in staging (validated=false).
-/// Mirrors Go's registry.VersionStatus.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionStatus {
-    pub version: String,
-    pub validated: bool,
-}
-
 /// PluginRef holds the resolution inputs for one plugin: its manifest URL
 /// (identity), display + trust metadata, the registry hosting it, and its
-/// version sets (semver-desc). Mirrors Go's registry.PluginRef.
+/// version list (semver-desc). Mirrors Go's registry.PluginRef.
 #[derive(Debug, Clone)]
 pub struct PluginRef {
     pub manifest_url: String,
@@ -81,10 +72,8 @@ pub struct PluginRef {
     pub publisher: String,
     pub verified: bool,
     pub reg: RegistryCoords,
-    /// Validated versions, semver-desc.
-    pub validated: Vec<String>,
-    /// Preview versions, semver-desc.
-    pub preview: Vec<String>,
+    /// Published versions, semver-desc.
+    pub versions: Vec<String>,
 }
 
 /// RegistryCoords holds the OCI registry coordinates for one plugin.
@@ -93,7 +82,6 @@ pub struct PluginRef {
 pub struct RegistryCoords {
     pub host: String,
     pub namespace: String,
-    pub staging_namespace: String,
     pub public_url: String,
 }
 
@@ -435,10 +423,9 @@ pub fn tag_forms(v: &str) -> Vec<String> {
     }
 }
 
-/// resolve_artifact returns the per-platform tarball blob for (id, version),
-/// trying the trusted namespace first then staging. Returns None when neither
-/// namespace has a layer for that platform.
-/// Mirrors Go's Client.ResolveArtifact.
+/// resolve_artifact returns the per-platform tarball blob for (id, version)
+/// from the plugin's namespace. Returns None when the namespace has no layer
+/// for that platform.
 pub async fn resolve_artifact(
     client: &reqwest::Client,
     plugin_ref: &PluginRef,
@@ -446,70 +433,25 @@ pub async fn resolve_artifact(
     platform: &str,
 ) -> Result<Option<Artifact>, String> {
     let reg = &plugin_ref.reg;
-    let mut namespaces = vec![reg.namespace.clone()];
-    if !reg.staging_namespace.is_empty() {
-        namespaces.push(reg.staging_namespace.clone());
-    }
-
-    for ns in &namespaces {
-        for tag in tag_forms(version) {
-            let manifest = fetch_oci_manifest(client, &reg.host, ns, &plugin_ref.plugin_id, &tag).await?;
-            let Some(man) = manifest else { continue };
-            for layer in &man.layers {
-                if layer.annotations.get(PLATFORM_ANNOTATION).map(String::as_str) == Some(platform) {
-                    let digest = &layer.digest;
-                    // Strip "sha256:" prefix to get just the hex for Sha256 field.
-                    let sha256 = digest
-                        .strip_prefix("sha256:")
-                        .unwrap_or(digest)
-                        .to_string();
-                    return Ok(Some(Artifact {
-                        download_url: blob_url(&reg.public_base(), ns, &plugin_ref.plugin_id, digest),
-                        sha256,
-                        size_bytes: layer.size,
-                    }));
-                }
+    for tag in tag_forms(version) {
+        let Some(man) =
+            fetch_oci_manifest(client, &reg.host, &reg.namespace, &plugin_ref.plugin_id, &tag).await?
+        else {
+            continue;
+        };
+        for layer in &man.layers {
+            if layer.annotations.get(PLATFORM_ANNOTATION).map(String::as_str) == Some(platform) {
+                let digest = &layer.digest;
+                let sha256 = digest.strip_prefix("sha256:").unwrap_or(digest).to_string();
+                return Ok(Some(Artifact {
+                    download_url: blob_url(&reg.public_base(), &reg.namespace, &plugin_ref.plugin_id, digest),
+                    sha256,
+                    size_bytes: layer.size,
+                }));
             }
         }
     }
     Ok(None)
-}
-
-/// versions_with_status returns every known version of a plugin, newest first.
-/// A version is Validated when it is in the ref's validated set; otherwise it
-/// is preview. The list is the union of validated and preview sets, compared on
-/// normalized semver so a version in both collapses to one entry (in its
-/// validated form).
-/// Mirrors Go's Client.VersionsWithStatus.
-pub fn versions_with_status(plugin_ref: &PluginRef) -> Vec<VersionStatus> {
-    use std::collections::HashMap;
-
-    let mut validated_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for v in &plugin_ref.validated {
-        if let Some(n) = normalize_semver(v) {
-            validated_set.insert(n);
-        }
-    }
-
-    // Build repr map: normalized -> original, letting validated overwrite preview
-    // for the same version (so validated form is used).
-    let mut repr: HashMap<String, String> = HashMap::new();
-    // Preview first, then validated overwrites.
-    for v in plugin_ref.preview.iter().chain(plugin_ref.validated.iter()) {
-        if let Some(n) = normalize_semver(v) {
-            repr.insert(n, v.clone());
-        }
-    }
-
-    let mut all: Vec<String> = repr.into_values().collect();
-    all = sort_semver_desc(&all);
-
-    all.iter()
-        .map(|v| VersionStatus {
-            version: v.clone(),
-            validated: normalize_semver(v).map(|n| validated_set.contains(&n)).unwrap_or(false),
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -586,26 +528,6 @@ mod tests {
             u,
             "https://ghcr.io/v2/ns/plugins/my-plugin/blobs/sha256:deadbeef"
         );
-    }
-
-    #[test]
-    fn versions_with_status_union_and_dedup() {
-        let ref_ = PluginRef {
-            manifest_url: "http://example.com/m.json".into(),
-            plugin_id: "test".into(),
-            publisher: "test".into(),
-            verified: true,
-            reg: RegistryCoords::default(),
-            validated: vec!["v0.1.2".into()],
-            preview: vec!["v0.1.3".into(), "v0.1.2".into()],
-        };
-        let vs = versions_with_status(&ref_);
-        // v0.1.3 preview, v0.1.2 validated. Newest first.
-        assert_eq!(vs.len(), 2);
-        assert_eq!(vs[0].version, "v0.1.3");
-        assert!(!vs[0].validated);
-        assert_eq!(vs[1].version, "v0.1.2");
-        assert!(vs[1].validated);
     }
 
     #[test]

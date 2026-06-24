@@ -14,7 +14,7 @@
 - Tests run with `go test ./pkg/plugin/` from the repo root; vet with `go vet ./pkg/plugin/`.
 - `vendor_meta` is JSONB stored via `a.client.PGExec` to the control PG; `data_log`/MVs are RisingWave via `a.client.Exec`/`Query`.
 - go-yfinance types (verbatim): REST `models.ChartMeta{ Currency string; Symbol string; ExchangeName string }` from `ticker.GetHistoryMetadata()`; live `models.PricingData{ ID string; Price float32; Currency string; Exchange string }`.
-- Ship/promote per existing flow: tag `v*` → publish to `plugins-staging` → `oras copy` to trusted `opencapital-dev/plugins` → bump `plugins/yfinance-app.json` `versions[]` on `opencapital` `main`. (Not part of this plan's tasks; release after merge.)
+- Ship per direct-to-production flow: tag `v*` → publish action pushes directly to `opencapital-dev/plugins` and bumps `versions[]` in the plugin repo's `oc-plugin.json`. (Not part of this plan's tasks; release after merge.)
 - Do NOT drop/quarantine quotes; do NOT change the data-plane valuation; ignore the harmless CPKR currency-label flip.
 
 ---

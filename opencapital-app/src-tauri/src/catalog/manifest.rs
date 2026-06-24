@@ -21,8 +21,6 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
 pub struct RegistrySpec {
     pub host: String,
     pub namespace: String,
-    #[serde(rename = "stagingNamespace", default)]
-    pub staging_namespace: String,
     #[serde(rename = "publicURL", default)]
     pub public_url: String,
 }
@@ -40,8 +38,6 @@ pub struct PluginManifest {
     pub registry: RegistrySpec,
     #[serde(default)]
     pub versions: Vec<String>,
-    #[serde(default)]
-    pub preview: Vec<String>,
 }
 
 /// validate_plugin validates a PluginManifest, mirroring Go's validatePlugin.
@@ -54,9 +50,6 @@ pub fn validate_plugin(m: &PluginManifest) -> Result<(), String> {
     }
     if m.registry.namespace.is_empty() {
         return Err("registry.namespace required".into());
-    }
-    if !m.preview.is_empty() && m.registry.staging_namespace.is_empty() {
-        return Err("preview set but registry.stagingNamespace missing".into());
     }
     Ok(())
 }
@@ -269,7 +262,6 @@ mod tests {
             publisher: "".into(),
             registry: RegistrySpec::default(),
             versions: vec![],
-            preview: vec![],
         };
         assert!(validate_plugin(&m).is_err()); // missing pluginId
         m.plugin_id = "test".into();
@@ -277,10 +269,6 @@ mod tests {
         m.registry.host = "ghcr.io".into();
         assert!(validate_plugin(&m).is_err()); // missing registry.namespace
         m.registry.namespace = "ns/p".into();
-        assert!(validate_plugin(&m).is_ok()); // OK
-        m.preview = vec!["v0.1.0".into()];
-        assert!(validate_plugin(&m).is_err()); // preview but no stagingNamespace
-        m.registry.staging_namespace = "ns/p-staging".into();
         assert!(validate_plugin(&m).is_ok()); // OK
     }
 }

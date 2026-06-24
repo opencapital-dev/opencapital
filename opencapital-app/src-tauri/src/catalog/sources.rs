@@ -169,11 +169,9 @@ fn manifest_to_ref(manifest_url: String, verified: bool, m: PluginManifest) -> P
         reg: RegistryCoords {
             host: m.registry.host,
             namespace: m.registry.namespace,
-            staging_namespace: m.registry.staging_namespace,
             public_url: m.registry.public_url,
         },
-        validated: sort_semver_desc(&m.versions),
-        preview: sort_semver_desc(&m.preview),
+        versions: sort_semver_desc(&m.versions),
     }
 }
 

@@ -321,11 +321,6 @@ async fn build_resolved_plugins_async(
         if !plugin.required && !selection.contains(pid.as_str()) {
             continue;
         }
-        // Preview-only plugins have version="" in the catalog; skip them (no
-        // validated artifact to install).
-        if plugin.version.is_empty() {
-            continue;
-        }
         let artifact = if let Some(pr) = ref_map.get(pid.as_str()) {
             crate::catalog::resolve_artifact(&client, pr, &plugin.version, &platform)
                 .await

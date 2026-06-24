@@ -204,13 +204,13 @@ function PluginCard({ p, pin, selected, onToggle, onPin }: CardProps) {
     {
       label: "Latest",
       value: LATEST,
-      description: "Auto-updates to the newest validated build",
+      description: "Auto-updates to the newest published build",
     },
   ];
   const seen = new Set<string>();
-  vsList.forEach((vs) => {
-    seen.add(vs.version);
-    versionOptions.push({ label: fmtVersion(vs.version)!, value: vs.version });
+  vsList.forEach((v) => {
+    seen.add(v);
+    versionOptions.push({ label: fmtVersion(v)!, value: v });
   });
   if (pin && !seen.has(pin)) {
     versionOptions.push({ label: fmtVersion(pin)!, value: pin });

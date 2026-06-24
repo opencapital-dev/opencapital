@@ -478,43 +478,20 @@ pub async fn reconcile_plugin_selection(
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-pub struct VersionStatus {
-    pub version: String,
-    pub validated: bool,
-}
-
-/// plugin_versions lists the published versions of a plugin with their
-/// validation status, newest first. Now served in-process from the federated
-/// plugin catalog (no control-plane HTTP roundtrip). Uses the shared refs
-/// cache to avoid re-fetching all manifests on every version-dropdown open.
+/// plugin_versions lists the published versions of a plugin, newest first,
+/// served in-process from the federated catalog (versions[] in the manifest).
 #[tauri::command]
 pub async fn plugin_versions(
     plugin_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
-) -> Result<Vec<VersionStatus>, String> {
+) -> Result<Vec<String>, String> {
     let _ = session; // auth check dropped for in-process call
     let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
     let refs = build_refs_cached(&cfg.plugin_list_url, &user_sources).await;
-
-    // Find the ref for this plugin_id.
-    let plugin_ref = refs
-        .iter()
-        .find(|r| r.plugin_id == plugin_id);
-
-    match plugin_ref {
-        None => Ok(vec![]), // unknown id → empty list
-        Some(r) => {
-            let vs = crate::catalog::versions_with_status(r);
-            Ok(vs
-                .into_iter()
-                .map(|v| VersionStatus {
-                    version: v.version,
-                    validated: v.validated,
-                })
-                .collect())
-        }
+    match refs.iter().find(|r| r.plugin_id == plugin_id) {
+        None => Ok(vec![]),
+        Some(r) => Ok(r.versions.clone()),
     }
 }
 

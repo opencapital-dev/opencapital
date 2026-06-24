@@ -6,18 +6,17 @@
 //
 // Public surface:
 //   - catalog::list(client, refs) -> Vec<Plugin>
-//   - catalog::versions_with_status(ref) -> Vec<VersionStatus>
 //   - catalog::resolve_artifact(client, ref, version, platform) -> Option<Artifact>
 //   - catalog::sources::{read_sources_in, add_source_in, remove_source_in, build_plugin_refs}
-//   - catalog::registry::{PluginRef, Plugin, Artifact, VersionStatus, SourceInfo}
+//   - catalog::registry::{PluginRef, Plugin, Artifact, SourceInfo}
 
 pub mod manifest;
 pub mod registry;
 pub mod sources;
 
 pub use registry::{
-    Artifact, Plugin, PluginRef, RegistryCoords, SourceInfo, VersionStatus,
-    resolve_artifact, sort_semver_desc, versions_with_status,
+    Artifact, Plugin, PluginRef, RegistryCoords, SourceInfo,
+    resolve_artifact, sort_semver_desc,
 };
 pub use sources::{SourceRecord, add_source_in, read_sources_in, remove_source_in};
 
@@ -58,17 +57,16 @@ pub async fn list(client: &reqwest::Client, refs: &[PluginRef]) -> Vec<Plugin> {
 }
 
 /// ref_to_plugin converts a PluginRef into a Plugin catalog entry.
-/// Uses the highest validated version (or highest preview with version="").
-/// Fetches the OCI config blob to populate display_name, description, type,
-/// grafana_slug. Mirrors Go's Client.latest + Client.read + fetchFootprint.
-/// Returns None when neither validated nor preview versions exist, or the OCI
-/// manifest is absent.
+/// Uses the highest published version. Fetches the OCI config blob to
+/// populate display_name, description, type, grafana_slug.
+/// Mirrors Go's Client.latest + Client.read + fetchFootprint.
+/// Returns None when no versions exist, or the OCI manifest is absent.
 async fn ref_to_plugin(
     client: &reqwest::Client,
     r: &PluginRef,
     required_set: &std::collections::HashSet<&str>,
 ) -> Option<Plugin> {
-    let (version, namespace, preview_only) = pick_version(r)?;
+    let (version, namespace) = pick_version(r)?;
 
     // Try each tag form (bare, then v-prefixed) until we get an OCI manifest.
     // Mirrors Go's Client.read loop.
@@ -135,14 +133,10 @@ async fn ref_to_plugin(
         footprint.plugin_id = r.plugin_id.clone();
     }
 
-    // Preview-only: blank the version so latest_validated_version is "".
-    // Mirrors Go's catalog.go:155-157: if preview { p.Version = "" }
-    let emitted_version = if preview_only { String::new() } else { version };
-
     Some(Plugin {
         footprint,
         required: required_set.contains(r.plugin_id.as_str()),
-        version: emitted_version,
+        version,
         platforms,
         source: SourceInfo {
             url: r.manifest_url.clone(),
@@ -152,19 +146,10 @@ async fn ref_to_plugin(
     })
 }
 
-/// pick_version returns (version, namespace, preview_only):
-///   - validated: (highest validated version, trusted namespace, false)
-///   - preview-only: (highest preview version, staging namespace, true)
-/// Returns None when no versions exist.
-/// Mirrors Go's pick() in catalog.go.
-fn pick_version(r: &PluginRef) -> Option<(String, String, bool)> {
-    if let Some(v) = r.validated.first() {
-        return Some((v.clone(), r.reg.namespace.clone(), false));
-    }
-    if let Some(v) = r.preview.first() {
-        return Some((v.clone(), r.reg.staging_namespace.clone(), true));
-    }
-    None
+/// pick_version returns (highest version, namespace), or None when the plugin
+/// has no published versions.
+fn pick_version(r: &PluginRef) -> Option<(String, String)> {
+    r.versions.first().map(|v| (v.clone(), r.reg.namespace.clone()))
 }
 
 /// fetch_config_blob fetches a raw blob URL and deserializes it as a Footprint.
@@ -196,7 +181,7 @@ mod tests {
     use crate::catalog::registry::RegistryCoords;
 
     #[test]
-    fn pick_version_validated_wins() {
+    fn pick_version_picks_highest() {
         let r = PluginRef {
             manifest_url: "http://example.com/m.json".into(),
             plugin_id: "test".into(),
@@ -204,39 +189,14 @@ mod tests {
             verified: true,
             reg: RegistryCoords {
                 host: "ghcr.io".into(),
-                namespace: "ns/trusted".into(),
-                staging_namespace: "ns/staging".into(),
+                namespace: "ns/plugins".into(),
                 public_url: String::new(),
             },
-            validated: vec!["v1.0.0".into()],
-            preview: vec!["v1.1.0".into()],
+            versions: vec!["v1.1.0".into(), "v1.0.0".into()],
         };
-        let (ver, ns, preview) = pick_version(&r).unwrap();
-        assert_eq!(ver, "v1.0.0");
-        assert_eq!(ns, "ns/trusted");
-        assert!(!preview);
-    }
-
-    #[test]
-    fn pick_version_preview_only() {
-        let r = PluginRef {
-            manifest_url: "http://example.com/m.json".into(),
-            plugin_id: "test".into(),
-            publisher: "pub".into(),
-            verified: true,
-            reg: RegistryCoords {
-                host: "ghcr.io".into(),
-                namespace: "ns/trusted".into(),
-                staging_namespace: "ns/staging".into(),
-                public_url: String::new(),
-            },
-            validated: vec![],
-            preview: vec!["v0.9.0".into()],
-        };
-        let (ver, ns, preview) = pick_version(&r).unwrap();
-        assert_eq!(ver, "v0.9.0");
-        assert_eq!(ns, "ns/staging");
-        assert!(preview);
+        let (ver, ns) = pick_version(&r).unwrap();
+        assert_eq!(ver, "v1.1.0");
+        assert_eq!(ns, "ns/plugins");
     }
 
     #[test]
@@ -247,8 +207,7 @@ mod tests {
             publisher: "pub".into(),
             verified: true,
             reg: RegistryCoords::default(),
-            validated: vec![],
-            preview: vec![],
+            versions: vec![],
         };
         assert!(pick_version(&r).is_none());
     }

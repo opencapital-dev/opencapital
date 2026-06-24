@@ -32,6 +32,7 @@ import polars as pl
 
 from compute import metrics
 from compute.contract import ContractError, QuerySpec, Window, make_contract
+from compute.httpfetch import fetch_json
 from compute.store import Store, pg, rw
 
 log = logging.getLogger("compute.endpoint")
@@ -94,6 +95,7 @@ def build_namespace(contract, window: Window, store) -> dict:
     ns["rw"] = rw
     ns["pg"] = pg
     ns["sql"] = lambda q, *p: store.run(_auto_spec(q, tuple(p)))
+    ns["fetch_json"] = fetch_json
     return ns
 
 

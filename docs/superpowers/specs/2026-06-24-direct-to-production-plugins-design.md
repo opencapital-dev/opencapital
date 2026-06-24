@@ -62,17 +62,39 @@ repo without a cross-repo PAT (rejected). So each per-plugin manifest must live
   `versions[]`.
 - **Single namespace** `ghcr.io/opencapital-dev/plugins/<id>`. The publish CI
   pushes directly here.
-- **No external action.** The publish logic is inlined into each plugin repo's
-  `publish.yml`. The `oc-plugin-publish-action` repo is deleted.
+- **Publish action retained, modified.** `oc-plugin-publish-action@v1` keeps the
+  proven multi-platform packer and cosign signing; it is changed to push to the
+  single namespace, drop the catalog-PR bridge, and append the tag to the
+  calling repo's own manifest `versions[]`. The plugin manifest gets the OCI
+  image's cosign signature; the app is the intended verifier (deferred — see
+  out-of-scope).
 
 ## Changes by repo
 
-### A. `oc-plugin-publish-action` — delete
+### A. `oc-plugin-publish-action` — keep, modify
 
-Remove the external composite action entirely (repo + the `@v1` tag). Its
-assemble/push logic is inlined into each plugin repo's `publish.yml` (see the
-"OPEN DECISION" section for where the packer code lives). The `catalog-pr.sh`
-bridge and the cosign-promotion-gate concept are dropped.
+Retain the external composite action (the proven multi-platform OCI packer in
+`assemble/`). Changes:
+
+1. `assemble/oras.go` — change the push target from
+   `ghcr.io/%s/plugins-staging/%s` → `ghcr.io/%s/plugins/%s` (and the comment).
+2. `action.yml`:
+   - cosign sign step → target `ghcr.io/${{ inputs.owner }}/plugins/${{ inputs.id }}@${DIGEST}`
+     (signing **kept**; install dance for cosign v3.0.6 unchanged).
+   - Remove the `catalog-repo`, `catalog-channel`, `catalog-token` inputs and the
+     "open catalog PR" step.
+   - Add a **manifest-bump** step running the rewritten script with
+     `REPO=${{ github.repository }}`, `GH_TOKEN=${{ github.token }}`,
+     `ID=${{ inputs.id }}`, `VERSION=${{ inputs.version }}` — writes the **calling
+     repo's own** manifest, so no PAT and no cross-repo write.
+   - Update `name`/`description` (drop "plugins-staging").
+3. `catalog-pr.sh` → `manifest-bump.sh`: `gh api` GET `oc-plugin.json` on the
+   caller repo's `main`; `jq`-append the v-normalized tag to `.versions`
+   (`unique | semver-desc`, no-op if already present); generate the full manifest
+   from constants + `pluginId` if the file is absent (first publish); `gh api` PUT
+   back to `main`. No PR, no channel, no cross-repo.
+4. README: drop staging / promotion / catalog-PR language.
+5. Re-tag `v1` so the plugin repos pick up the new behavior.
 
 ### B. Plugin sibling repos (`oc-plugin-core-app`, `oc-plugin-core-datasource`, `oc-plugin-yfinance-app`)
 
@@ -90,23 +112,19 @@ Per repo:
    }
    ```
    (The CI maintains `versions[]` going forward; the seed preserves history.)
-2. **Rewrite `.github/workflows/publish.yml`** — remove the `uses: opencapital-dev/oc-plugin-publish-action@v1` step; inline assemble + push-to-production + manifest-bump (§ open decision). Required changes:
-   - `permissions:` add `contents: write` (was `contents: read`) so the
-     manifest-bump step can commit to the repo's own `main`.
-   - Drop the `catalog-token: ${{ secrets.CATALOG_PR_TOKEN }}` input (and the
-     `CATALOG_PR_TOKEN` secret is no longer needed).
+2. **Edit `.github/workflows/publish.yml`** — keep the
+   `uses: opencapital-dev/oc-plugin-publish-action@v1` step (it now pushes to
+   production and bumps the manifest itself). Required changes:
+   - `permissions:` add `contents: write` (was `contents: read`) so the action's
+     manifest-bump step can commit to this repo's own `main`. (`packages: write`
+     and `id-token: write` stay.)
+   - Drop the `catalog-token: ${{ secrets.CATALOG_PR_TOKEN }}` input (the input no
+     longer exists; the `CATALOG_PR_TOKEN` secret is no longer needed).
    - The existing native-runner backend build matrix and frontend build stay.
-   - Final inline steps: (a) assemble + push to
-     `ghcr.io/${{ github.repository_owner }}/plugins/<id>:<tag>` using
-     `GITHUB_TOKEN` (which already has `packages: write`); (b) bump manifest —
-     `gh api` GET `oc-plugin.json` on `main`, `jq`-append the v-normalized tag to
-     `.versions` (`unique | semver-desc`, no-op if present; generate the full
-     manifest from constants + `src/plugin.json` `opencapital.plugin_id` if the
-     file is absent), `gh api` PUT back to `main`. Uses `GH_TOKEN=${{ github.token }}`,
-     `REPO=${{ github.repository }}` — own repo, no PAT, no PR.
 
-The assemble step must reproduce the artifact shape the app reads (see
-"Artifact contract" below).
+Push auth + manifest-bump both use the workflow's built-in `GITHUB_TOKEN` (which
+has `packages: write` for the push and `contents: write` for the commit) — no
+provisioned secret.
 
 ### C. `opencapital` repo
 
@@ -170,7 +188,7 @@ Update to drop staging / promotion / preview language:
 - `docs/superpowers/plans/2026-06-14-federated-plugin-sources-*.md`
 - Any `reference/` catalog docs that mention `plugins-staging` or promotion.
 
-## Artifact contract (what the inline assemble must produce)
+## Artifact contract (what the publish action must produce)
 
 The app's resolver (`registry.rs::resolve_artifact`, `mod.rs::ref_to_plugin`)
 reads, per `<id>:<tag>` in the production namespace:
@@ -188,31 +206,6 @@ platform_plugin, logical_views, query_entities}` block (see the current
 media types, so media-type strings are not load-bearing for resolution — but the
 platform annotation key and the per-platform tarball contents are.
 
-## OPEN DECISION — how to inline the assembler (confirm at review)
-
-The deleted action's core is a ~400-line Go program (`assemble/`) that packs the
-multi-platform OCI artifact. "Inline" needs a home for that logic:
-
-- **Option A (recommended): relocate the assembler into `oc-plugin-sdk` as a
-  command** (e.g. `cmd/oc-assemble`), retargeted to the `plugins` namespace, and
-  invoke it inline from `publish.yml` via `go run
-  github.com/opencapital-dev/oc-plugin-sdk/cmd/oc-assemble@<ver> ...`. No
-  composite action; the proven, tested packer is reused (the 3 plugin repos
-  already depend on `oc-plugin-sdk`); identical OCI output → lowest install-break
-  risk.
-- **Option B: pure shell + `oras` CLI in `publish.yml`.** Build the footprint
-  with `jq`, the per-platform tarballs with `tar`, push with `oras push --config
-  ... --artifact-type ... <tarball>:<mediaType>` + `--annotation-file` for the
-  platform annotations. Zero Go, fully self-contained per repo, but bespoke shell
-  that must exactly reproduce the artifact contract — higher risk, needs careful
-  end-to-end install verification.
-
-Both delete the action and put the publish step inline in YAML. **Recommendation:
-Option A** (safety + DRY). Also to confirm: **cosign signing** — proposed
-**dropped** in the inline flow (nothing verifies signatures now that the
-control-plane is gone; re-add when signature verification returns). Easily kept
-if preferred.
-
 ## Verification
 
 1. **Rust unit tests:** `cargo test` in `opencapital-app/src-tauri` — catalog
@@ -226,6 +219,7 @@ if preferred.
      **absent** from `plugins-staging`);
    - the plugin repo's `oc-plugin.json` on `main` gained `vX.Y.Z` in `versions[]`
      via the CI commit (no PR);
+   - the cosign signature referrer is present on the production image;
    - no `CATALOG_PR_TOKEN` / cross-repo write occurred.
 4. **App catalog E2E:** launch the app → Plugins view shows `yfinance-app` at the
    new version, no "Show preview versions" toggle, no "preview" badges; pin the
@@ -243,6 +237,9 @@ if preferred.
   not just append.
 - **CI commits to `main`** — the manifest-bump pushes to the plugin repo's `main`
   on every release. Acceptable (release-bot pattern, own repo, `GITHUB_TOKEN`).
-- **Signature provenance** — dropped with cosign (pending decision); reversible.
-- **`oc-plugin-sdk` versioning** (Option A) — `go run @<ver>` must pin a tag that
-  contains the assembler command.
+- **App-side cosign verification** — deferred to a follow-up spec. cosign signing
+  is **retained** (retargeted to the `plugins` namespace) so the signature exists
+  to verify later. This is the intended replacement for the deleted control-plane
+  `signers.yaml` gate: the app fetches the signature referrer and verifies the
+  keyless sigstore bundle against an allowlist of OIDC identities. Out of scope
+  here to keep this change focused.

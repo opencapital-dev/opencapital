@@ -393,34 +393,6 @@ pub fn set_selection_in(
         .map_err(|e| format!("write selection: {e}"))
 }
 
-fn settings_path(base: &std::path::Path) -> PathBuf {
-    base.join("settings.json")
-}
-
-pub fn read_show_preview_in(base: &std::path::Path) -> Result<bool, String> {
-    match std::fs::read_to_string(settings_path(base)) {
-        Ok(s) => {
-            let v: serde_json::Value =
-                serde_json::from_str(&s).map_err(|e| format!("parse settings: {e}"))?;
-            Ok(v.get("show_preview").and_then(|b| b.as_bool()).unwrap_or(false))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("read settings: {e}")),
-    }
-}
-
-pub fn set_show_preview_in(base: &std::path::Path, on: bool) -> Result<(), String> {
-    let p = settings_path(base);
-    let mut v: serde_json::Value = match std::fs::read_to_string(&p) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
-        Err(_) => serde_json::json!({}),
-    };
-    v["show_preview"] = serde_json::Value::Bool(on);
-    std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| format!("mkdir: {e}"))?;
-    std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap())
-        .map_err(|e| format!("write settings: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,24 +457,4 @@ mod tests {
         assert_eq!(v.get("yfinance").and_then(|s| s.as_str()), Some("v1.0.3"));
     }
 
-    #[test]
-    fn show_preview_defaults_false_and_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!read_show_preview_in(dir.path()).unwrap());
-        set_show_preview_in(dir.path(), true).unwrap();
-        assert!(read_show_preview_in(dir.path()).unwrap());
-    }
-
-    #[test]
-    fn set_show_preview_preserves_other_settings_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("settings.json"), br#"{"theme":"dark"}"#).unwrap();
-        set_show_preview_in(dir.path(), true).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.path().join("settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"));
-        assert_eq!(v.get("show_preview").and_then(|b| b.as_bool()), Some(true));
-    }
 }

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Data types (mirror Go's Plugin / Artifact / VersionStatus / SourceInfo)
+// Data types (mirror Go's Plugin / Artifact / SourceInfo)
 // ---------------------------------------------------------------------------
 
 /// Footprint is the plugin's install metadata read from the OCI config blob.

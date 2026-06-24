@@ -537,18 +537,6 @@ pub fn set_plugin_selection(
     crate::config::set_selection_in(&cfg.base_dir(), &plugin_id, selected)
 }
 
-/// get_show_preview returns the global preview-version toggle from shell settings.
-#[tauri::command]
-pub fn get_show_preview(cfg: State<'_, AppConfig>) -> Result<bool, String> {
-    crate::config::read_show_preview_in(&cfg.base_dir())
-}
-
-/// set_show_preview persists the global preview-version toggle.
-#[tauri::command]
-pub fn set_show_preview(on: bool, cfg: State<'_, AppConfig>) -> Result<(), String> {
-    crate::config::set_show_preview_in(&cfg.base_dir(), on)
-}
-
 /// get_plugin_pin returns the locally-pinned version for a plugin,
 /// or None if no pin is set (meaning "use latest validated").
 #[tauri::command]

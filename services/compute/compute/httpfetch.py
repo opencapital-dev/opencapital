@@ -29,10 +29,11 @@ class TTLCache:
             if hit and hit[0] > now:
                 return hit[1]
         value = fetch()  # outside the lock — no serialization on slow I/O
+        stored_at = self._clock()  # re-sample after fetch so TTL excludes fetch latency
         with self._lock:
             if len(self._data) >= self._max and key not in self._data:
                 del self._data[min(self._data, key=lambda k: self._data[k][0])]
-            self._data[key] = (now + self._ttl, value)
+            self._data[key] = (stored_at + self._ttl, value)
         return value
 
 
@@ -40,6 +41,7 @@ _CACHE = TTLCache(ttl=float(os.environ.get("OC_COMPUTE_HTTP_TTL", "3600")))
 
 
 def fetch_json(url, *, params=None, headers=None, ttl=None, timeout=15.0):
+    # ``ttl`` is reserved for a future per-call cache override; not yet wired.
     key = (
         url,
         tuple(sorted((params or {}).items())),

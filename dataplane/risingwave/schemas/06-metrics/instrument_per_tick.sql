@@ -20,59 +20,53 @@
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS instrument_per_tick AS
 WITH fold_per_ts AS (
-    -- One fold row per (org_id, portfolio_id, business_ts): max source_id
+    -- One fold row per (portfolio_id, business_ts): max source_id
     -- at that ts carries the latest cumulative state. Prevents ASOF +
     -- lateral from double-counting when multiple events share a
-    -- business_ts. v6 keys the collapse on org_id too so colliding
-    -- portfolio_ids across orgs do not race.
-    SELECT fpe.org_id, fpe.portfolio_id, fpe.business_ts, fpe.instrument_id, fpe.fold_result
+    -- business_ts.
+    SELECT fpe.portfolio_id, fpe.business_ts, fpe.instrument_id, fpe.fold_result
     FROM fold_per_event fpe
     JOIN (
-        SELECT org_id, portfolio_id, business_ts, MAX(source_id) AS source_id
+        SELECT portfolio_id, business_ts, MAX(source_id) AS source_id
         FROM fold_per_event
-        GROUP BY org_id, portfolio_id, business_ts
-    ) m USING (org_id, portfolio_id, business_ts, source_id)
+        GROUP BY portfolio_id, business_ts
+    ) m USING (portfolio_id, business_ts, source_id)
 ),
 ticks AS (
-    -- Prices / option_marks already carry org_id from their unifying MVs;
-    -- the fold-driven branch carries org_id from fold_per_ts.
-    SELECT org_id, instrument_id, price_ts AS tick_ts FROM prices
+    -- Prices / option_marks from their unifying MVs;
+    -- the fold-driven branch carries portfolio_id from fold_per_ts.
+    SELECT instrument_id, price_ts AS tick_ts FROM prices
     UNION ALL
-    SELECT org_id, instrument_id, price_ts AS tick_ts FROM option_marks
+    SELECT instrument_id, price_ts AS tick_ts FROM option_marks
     UNION ALL
     -- Event-time ticks: every fold_per_event row that names an instrument
     -- gives that instrument a fresh state row, so per-trade MtM rows show
     -- up in instrument_per_tick at the trade business_ts.
-    SELECT DISTINCT org_id, instrument_id, business_ts AS tick_ts
+    SELECT DISTINCT instrument_id, business_ts AS tick_ts
       FROM fold_per_ts
      WHERE instrument_id IS NOT NULL
 ),
 portfolio_instruments AS (
-    -- All (org, portfolio, instrument) triples that fold has ever seen
-    -- with qty>0.
-    SELECT DISTINCT fpe.org_id, fpe.portfolio_id, (ep ->> 'instrument_id') AS instrument_id
+    -- All (portfolio, instrument) pairs that fold has ever seen with qty>0.
+    SELECT DISTINCT fpe.portfolio_id, (ep ->> 'instrument_id') AS instrument_id
       FROM fold_per_ts fpe,
            jsonb_array_elements((fpe.fold_result).snapshot -> 'equity_positions') AS t(ep)
 ),
 held_at_tick AS (
     SELECT
-        pi.org_id,
         pi.portfolio_id,
         pi.instrument_id,
         t.tick_ts,
         (fpe.fold_result).snapshot AS snap
     FROM portfolio_instruments pi
     JOIN ticks t
-        ON  t.org_id        = pi.org_id
-        AND t.instrument_id = pi.instrument_id
+        ON  t.instrument_id = pi.instrument_id
     ASOF LEFT JOIN fold_per_ts fpe
-        ON  fpe.org_id       = pi.org_id
-        AND fpe.portfolio_id = pi.portfolio_id
+        ON  fpe.portfolio_id = pi.portfolio_id
         AND t.tick_ts >= fpe.business_ts
 ),
 unpacked AS (
     SELECT
-        h.org_id                                                  AS org_id,
         h.portfolio_id                                            AS scope_id,
         h.instrument_id                                           AS instrument_id,
         h.tick_ts                                                 AS tick_ts,
@@ -103,12 +97,10 @@ with_state AS (
         COALESCE(i.contract_multiplier, 1.0)                      AS contract_multiplier
     FROM unpacked u
     LEFT JOIN instruments i
-        ON  i.org_id        = u.org_id
-        AND i.portfolio_id  = u.scope_id
+        ON  i.portfolio_id  = u.scope_id
         AND i.instrument_id = u.instrument_id
 )
 SELECT
-    with_state.org_id                                 AS org_id,
     'portfolio'                                       AS scope_type,
     with_state.scope_id,
     with_state.instrument_id,
@@ -172,17 +164,14 @@ SELECT
         * with_state.contract_multiplier              AS unrealized_forex_avg_base
 FROM with_state
 ASOF LEFT JOIN prices px
-    ON  px.org_id        = with_state.org_id
-    AND px.portfolio_id  = with_state.scope_id
+    ON  px.portfolio_id  = with_state.scope_id
     AND px.instrument_id = with_state.instrument_id
     AND with_state.tick_ts >= px.price_ts
 ASOF LEFT JOIN option_marks om
-    ON  om.org_id        = with_state.org_id
-    AND om.portfolio_id  = with_state.scope_id
+    ON  om.portfolio_id  = with_state.scope_id
     AND om.instrument_id = with_state.instrument_id
     AND with_state.tick_ts >= om.price_ts
 ASOF LEFT JOIN fx_rates fx
-    ON  fx.org_id   = with_state.org_id
-    AND fx.from_ccy = with_state.currency
+    ON  fx.from_ccy = with_state.currency
     AND fx.to_ccy   = with_state.base_currency
     AND with_state.tick_ts >= fx.ts;

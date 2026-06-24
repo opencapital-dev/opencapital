@@ -5,12 +5,91 @@
 // instance token (POST /v1/instance/token), which it later hands to
 // plugins. The shell never gives the Kinde token to Grafana or plugins.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, State};
+
+// ---------------------------------------------------------------------------
+// Shared HTTP client — one reqwest::Client per process (connection pool reuse).
+// Eliminates per-command-call reqwest::Client::new() allocations.
+// ---------------------------------------------------------------------------
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+// ---------------------------------------------------------------------------
+// Manifest refs cache — avoids re-fetching all per-plugin manifests on every
+// catalog/version-dropdown call.  Keyed by (list_url, user_sources snapshot)
+// with a 60-second TTL that matches the PluginClient manifest TTL.
+// On stale the previous refs are served immediately while the background refresh
+// is triggered on the NEXT call (serve-stale, same pattern as PluginClient).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CachedRefs {
+    refs: Vec<crate::catalog::PluginRef>,
+    /// Serialised representation of the inputs used to build this cache entry,
+    /// used for invalidation when list_url or user_sources changes.
+    cache_key: String,
+    fetched_at: Instant,
+}
+
+fn refs_cache() -> &'static Mutex<Option<CachedRefs>> {
+    static CACHE: OnceLock<Mutex<Option<CachedRefs>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// build_refs_cached builds (or serves from cache) the full PluginRef list.
+/// Shared by catalog_req and plugin_versions to avoid redundant manifest fetches.
+async fn build_refs_cached(
+    list_url: &str,
+    user_sources: &[crate::catalog::SourceRecord],
+) -> Vec<crate::catalog::PluginRef> {
+    const REFS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // Build a cheap cache key from the inputs.
+    let cache_key = format!(
+        "{}|{}",
+        list_url,
+        user_sources
+            .iter()
+            .map(|s| format!("{}:{}", s.manifest_url, s.enabled))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    // Fast path: serve from cache if key matches and TTL hasn't expired.
+    {
+        let guard = refs_cache().lock().unwrap();
+        if let Some(cached) = &*guard {
+            if cached.cache_key == cache_key && cached.fetched_at.elapsed() < REFS_TTL {
+                return cached.refs.clone();
+            }
+        }
+    }
+
+    // Slow path: re-fetch all manifests.
+    let client = shared_http_client();
+    let refs = crate::catalog::sources::build_plugin_refs(client, list_url, user_sources).await;
+
+    // Store in cache.
+    {
+        let mut guard = refs_cache().lock().unwrap();
+        *guard = Some(CachedRefs {
+            refs: refs.clone(),
+            cache_key,
+            fetched_at: Instant::now(),
+        });
+    }
+
+    refs
+}
 
 use crate::config::AppConfig;
 
@@ -93,7 +172,7 @@ pub async fn kinde_login(cfg: State<'_, AppConfig>, session: State<'_, Session>)
 /// any failure so the caller can fall back to the id_token.
 async fn fetch_kinde_email(cfg: &AppConfig, access_token: &str) -> Option<String> {
     let url = format!("{}/oauth2/user_profile", cfg.kinde_domain);
-    let v = reqwest::Client::new()
+    let v = shared_http_client()
         .get(&url)
         .bearer_auth(access_token)
         .send()
@@ -169,7 +248,7 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<TokenResponse, String> {
-    let resp = reqwest::Client::new()
+    let resp = shared_http_client()
         .post(format!("{}/oauth2/token", cfg.kinde_domain))
         .form(&[
             ("grant_type", "authorization_code"),
@@ -189,22 +268,6 @@ async fn exchange_code(
     resp.json().await.map_err(|e| format!("decode token: {e}"))
 }
 
-/// me_orgs returns the orgs the logged-in user belongs to.
-#[tauri::command]
-pub async fn me_orgs(
-    cfg: State<'_, AppConfig>,
-    session: State<'_, Session>,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .get(format!("{}/v1/me/orgs", cfg.control_plane_url))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/me/orgs: {e}"))?;
-    read_json(resp, "/v1/me/orgs").await
-}
-
 /// me_profile returns the human identity decoded from the id_token at login.
 /// `preferred_email` is empty when the id_token carried no email claim (e.g.
 /// the openid/email scopes weren't granted).
@@ -222,355 +285,241 @@ pub fn logout(session: State<'_, Session>) {
     *session.email.lock().unwrap() = None;
 }
 
-#[derive(serde::Serialize)]
-struct InstanceTokenRequest<'a> {
-    org_id: &'a str,
-}
-
-/// instance_token exchanges the Kinde session for a control-plane instance
-/// token scoped to one org (Option A). Plugins present this to /jwt/mint.
+/// instance_token returns a static local instance token for the loopback proxy
+/// and plugin instanceTokenUrl. The control-plane sidecar has been removed;
+/// single-user local mode needs no JWT signing.
 #[tauri::command]
 pub async fn instance_token(
-    org_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    mint_instance_token(cfg.inner(), session.inner(), &org_id).await
+    mint_instance_token(cfg.inner(), session.inner()).await
 }
 
-/// mint_instance_token is the shared implementation: POST the Kinde session
-/// to /v1/instance/token and return the JSON {token, exp, org_id}. Used by
-/// the instance_token command and the grafana launch flow (which stores the
-/// token on the loopback for plugins to fetch).
+/// mint_instance_token returns a static local instance token.
+/// The control-plane sidecar has been removed; single-user local mode needs
+/// no JWT signing — a fixed opaque token is sufficient for the loopback proxy
+/// and plugin instanceTokenUrl.
 pub async fn mint_instance_token(
     cfg: &AppConfig,
     session: &Session,
-    org_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/instance/token", cfg.control_plane_url))
-        .bearer_auth(token)
-        .json(&InstanceTokenRequest { org_id })
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/instance/token: {e}"))?;
-    read_json(resp, "/v1/instance/token").await
+    let _ = (cfg, session); // no HTTP call needed in serviceless mode
+    Ok(serde_json::json!({
+        "token": "local",
+        "exp": 9999999999i64,
+    }))
 }
 
-#[derive(serde::Serialize)]
-struct CreateOrgRequest<'a> {
-    name: &'a str,
-    base_currency: &'a str,
-}
-
-/// create_org onboards a logged-in user with no workspace: control-plane
-/// creates the org, makes the caller admin, and installs required plugins.
-#[tauri::command]
-pub async fn create_org(
-    name: String,
-    base_currency: String,
-    cfg: State<'_, AppConfig>,
-    session: State<'_, Session>,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/orgs", cfg.control_plane_url))
-        .bearer_auth(token)
-        .json(&CreateOrgRequest {
-            name: &name,
-            base_currency: &base_currency,
-        })
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/orgs: {e}"))?;
-    read_json(resp, "/v1/orgs").await
-}
-
-/// marketplace_catalog lists the plugins available to an org with their
-/// installed state (Kinde-authed).
+/// marketplace_catalog lists the available plugins with their installed state.
+/// Served in-process from the federated plugin catalog (no control-plane HTTP
+/// roundtrip). `installed` is approximated from the local selection file: a
+/// plugin is considered installed if it is required or present in the selection.
 #[tauri::command]
 pub async fn marketplace_catalog(
-    org_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    catalog_req(cfg.inner(), session.inner(), &org_id).await
+    let _ = session; // auth check dropped for in-process call
+    catalog_req(cfg.inner()).await
 }
 
-/// catalog_req fetches the marketplace catalog for an org (each entry carries
-/// plugin_id, required, installed). Reusable by the marketplace_catalog command
-/// and the launch-time selection reconcile.
+/// catalog_req builds the marketplace catalog from the in-process federated
+/// plugin catalog. `installed` is approximated from the local selection file
+/// (required ∪ selection). Reusable by the marketplace_catalog command and the
+/// launch-time selection reconcile.
 pub async fn catalog_req(
     cfg: &AppConfig,
-    session: &Session,
-    org_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = reqwest::Client::new()
-        .get(format!("{}/v1/marketplace/catalog", cfg.control_plane_url))
-        .query(&[("org_id", &org_id)])
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call /v1/marketplace/catalog: {e}"))?;
-    read_json(resp, "/v1/marketplace/catalog").await
+    let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let refs = build_refs_cached(&cfg.plugin_list_url, &user_sources).await;
+
+    let client = shared_http_client();
+    let plugins = crate::catalog::list(client, &refs).await;
+
+    // Determine installed state: required ∪ local selection.
+    let selection: std::collections::HashSet<String> =
+        crate::config::read_selection_in(&cfg.base_dir())?
+            .into_iter()
+            .collect();
+
+    let entries: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|p| {
+            let installed = p.required || selection.contains(&p.footprint.plugin_id);
+            serde_json::json!({
+                "plugin_id": p.footprint.plugin_id,
+                "grafana_slug": p.footprint.grafana_slug,
+                "display_name": p.footprint.display_name,
+                "description": p.footprint.description,
+                "type": p.footprint.plugin_type,
+                "required": p.required,
+                "installed": installed,
+                "latest_validated_version": p.version,
+                "source": {
+                    "url": p.source.url,
+                    "publisher": p.source.publisher,
+                    "verified": p.source.verified,
+                }
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "plugins": entries,
+    }))
 }
 
-/// list_sources returns the user-added plugin manifest URLs (GET /v1/sources).
+/// list_sources returns the user-added plugin manifest URLs from the local
+/// JSON store (in-process, no control-plane HTTP roundtrip).
 /// Global (not org-scoped); the official set is implicit in the catalog.
 #[tauri::command]
 pub async fn list_sources(
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .get(format!("{}/v1/sources", cfg.control_plane_url))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call GET /v1/sources: {e}"))?;
-    read_json(resp, "GET /v1/sources").await
+    let _ = session; // auth check dropped for in-process call
+    let records = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let entries: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "manifest_url": r.manifest_url,
+                "publisher": r.publisher,
+                "enabled": r.enabled,
+            })
+        })
+        .collect();
+    Ok(serde_json::Value::Array(entries))
 }
 
-#[derive(serde::Serialize)]
-struct AddSourceRequest<'a> {
-    manifest_url: &'a str,
-}
-
-/// add_source validates + persists a user-added per-plugin manifest URL
-/// (POST /v1/sources). Surfaces the control-plane validation error (422) verbatim
-/// so the UI can show "manifest unreachable or invalid: …".
+/// add_source validates + persists a user-added per-plugin manifest URL to the
+/// local JSON store (in-process). Surfaces validation errors verbatim so the UI
+/// can show "manifest unreachable or invalid: …".
 #[tauri::command]
 pub async fn add_source(
     manifest_url: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<serde_json::Value, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/sources", cfg.control_plane_url))
-        .bearer_auth(token)
-        .json(&AddSourceRequest { manifest_url: &manifest_url })
-        .send()
-        .await
-        .map_err(|e| format!("call POST /v1/sources: {e}"))?;
-    read_json(resp, "POST /v1/sources").await
+    let _ = session; // auth check dropped for in-process call
+    let record = crate::catalog::sources::add_source_in(
+        &cfg.base_dir(),
+        shared_http_client(),
+        &manifest_url,
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "manifest_url": record.manifest_url,
+        "publisher": record.publisher,
+        "enabled": record.enabled,
+    }))
 }
 
-/// remove_source deletes a user-added source (DELETE /v1/sources?manifest_url=…).
+/// remove_source deletes a user-added source from the local JSON store
+/// (in-process, no control-plane HTTP roundtrip).
 #[tauri::command]
 pub async fn remove_source(
     manifest_url: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
 ) -> Result<(), String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .delete(format!("{}/v1/sources", cfg.control_plane_url))
-        .query(&[("manifest_url", &manifest_url)])
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("call DELETE /v1/sources: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("DELETE /v1/sources {status}: {body}"));
+    let _ = session; // auth check dropped for in-process call
+    let deleted = crate::catalog::sources::remove_source_in(&cfg.base_dir(), &manifest_url)?;
+    if !deleted {
+        return Err(format!("source not found: {manifest_url}"));
     }
     Ok(())
 }
 
-/// install_req installs one plugin for an org (idempotent). The control plane
-/// installs the latest validated version; local version pins are honored by the
-/// reconciler, not here.
-pub async fn install_req(
-    cfg: &AppConfig,
-    session: &Session,
-    org_id: &str,
-    plugin_id: &str,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/orgs/{}/plugins/{}",
-            cfg.control_plane_url, org_id, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("install {plugin_id}: {e}"))?;
-    read_json(resp, "install plugin").await
-}
-
-/// uninstall_req removes one (non-required) plugin from an org.
-pub async fn uninstall_req(
-    cfg: &AppConfig,
-    session: &Session,
-    org_id: &str,
-    plugin_id: &str,
-) -> Result<serde_json::Value, String> {
-    let token = current_token(session)?;
-    let resp = reqwest::Client::new()
-        .delete(format!(
-            "{}/v1/orgs/{}/plugins/{}",
-            cfg.control_plane_url, org_id, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("uninstall {plugin_id}: {e}"))?;
-    read_json(resp, "uninstall plugin").await
-}
-
-/// reconcile_plugin_selection is the SINGLE install/uninstall/self-heal path,
-/// run at launch before the grafana reconcile. It makes the org's installed set
-/// equal `required ∪ local-selection`: required plugins are always installed
-/// (self-heals an org whose onboarding missed them), user-selected optionals are
-/// installed, and deselected optionals are uninstalled. The plugins view only
-/// edits the local selection; it never installs. A failed REQUIRED plugin is
-/// fatal; a failed optional is logged and skipped so one bad plugin can't block
-/// launch.
+/// reconcile_plugin_selection updates the local selection to include all
+/// required plugins (self-heal) and seeds the selection file on first launch.
+/// No HTTP calls: the control-plane sidecar has been removed. The actual binary
+/// install/uninstall is handled by the Rust reconciler in grafana.rs.
 pub async fn reconcile_plugin_selection(
     app: &tauri::AppHandle,
     cfg: &AppConfig,
     session: &Session,
-    org_id: &str,
 ) -> Result<(), String> {
     use std::collections::BTreeSet;
-    // marketplace_catalog returns { org_id, plugins: [...] }.
-    let catalog = catalog_req(cfg, session, org_id).await?;
+    let _ = session; // auth not needed; catalog is in-process
+    let catalog = catalog_req(cfg).await?;
     let entries = catalog
         .get("plugins")
         .and_then(|v| v.as_array())
         .ok_or("catalog: missing plugins array")?;
 
-    let mut catalog_ids = BTreeSet::new();
     let mut required = BTreeSet::new();
-    let mut installed = BTreeSet::new();
     for e in entries {
         let Some(id) = e.get("plugin_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
             continue;
         };
-        catalog_ids.insert(id.to_string());
         if e.get("required").and_then(|v| v.as_bool()).unwrap_or(false) {
             required.insert(id.to_string());
         }
-        if e.get("installed").and_then(|v| v.as_bool()).unwrap_or(false) {
-            installed.insert(id.to_string());
-        }
     }
 
-    // First time we reconcile an org (no selection file yet), seed the selection
-    // from the optional plugins already installed — otherwise desired-state would
-    // uninstall plugins a user installed under the old immediate-install UI.
+    // Seed selection on first launch (no-op if already seeded).
     let base = cfg.base_dir();
-    if !crate::config::selection_exists_in(&base, org_id) {
-        let seed: Vec<String> = installed.difference(&required).cloned().collect();
-        crate::config::write_selection_in(&base, org_id, &seed)?;
+    if !crate::config::selection_exists_in(&base) {
+        crate::config::write_selection_in(&base, &[])?;
     }
-    let selection: BTreeSet<String> = crate::config::read_selection_in(&base, org_id)?
+    let mut selection: BTreeSet<String> = crate::config::read_selection_in(&base)?
         .into_iter()
         .collect();
-    // Desired = required ∪ selection, restricted to plugins the catalog offers
-    // (a stale selection for a withdrawn plugin can't be installed).
-    let mut desired: BTreeSet<String> = required.union(&selection).cloned().collect();
-    desired.retain(|id| catalog_ids.contains(id));
 
-    for id in desired.difference(&installed) {
-        let _ = app.emit("reconcile-progress", format!("Installing plugin {id}…"));
-        if let Err(e) = install_req(cfg, session, org_id, id).await {
-            if required.contains(id) {
-                return Err(format!("install required plugin {id}: {e}"));
-            }
-            let _ = app.emit("reconcile-progress", format!("WARN: install {id} failed, skipping: {e}"));
-        }
+    // Ensure required plugins are in selection (self-heal).
+    for id in &required {
+        selection.insert(id.clone());
     }
-    // installed ⊆ catalog_ids, and required ⊆ desired, so this never uninstalls a
-    // required plugin.
-    for id in installed.difference(&desired) {
-        let _ = app.emit("reconcile-progress", format!("Uninstalling plugin {id}…"));
-        if let Err(e) = uninstall_req(cfg, session, org_id, id).await {
-            let _ = app.emit("reconcile-progress", format!("WARN: uninstall {id} failed: {e}"));
-        }
-    }
+    crate::config::write_selection_in(&base, &selection.into_iter().collect::<Vec<_>>())?;
+
+    let _ = app.emit("reconcile-progress", "Plugin selection reconciled.");
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-pub struct VersionStatus {
-    pub version: String,
-    pub validated: bool,
-}
-
-/// plugin_versions lists the published versions of a plugin with their
-/// validation status, newest first.
+/// plugin_versions lists the published versions of a plugin, newest first,
+/// served in-process from the federated catalog (versions[] in the manifest).
 #[tauri::command]
 pub async fn plugin_versions(
     plugin_id: String,
     cfg: State<'_, AppConfig>,
     session: State<'_, Session>,
-) -> Result<Vec<VersionStatus>, String> {
-    let token = current_token(&session)?;
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/marketplace/plugins/{}/versions",
-            cfg.control_plane_url, plugin_id
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("list versions {plugin_id}: {e}"))?;
-    let body = read_json(resp, "plugin versions").await?;
-    let arr = body
-        .get("versions")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "plugin versions: missing versions array".to_string())?;
-    arr.iter()
-        .map(|v| {
-            Ok(VersionStatus {
-                version: v
-                    .get("version")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                validated: v
-                    .get("validated")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false),
-            })
-        })
-        .collect()
+) -> Result<Vec<String>, String> {
+    let _ = session; // auth check dropped for in-process call
+    let user_sources = crate::catalog::sources::read_sources_in(&cfg.base_dir())?;
+    let refs = build_refs_cached(&cfg.plugin_list_url, &user_sources).await;
+    match refs.iter().find(|r| r.plugin_id == plugin_id) {
+        None => Ok(vec![]),
+        Some(r) => Ok(r.versions.clone()),
+    }
 }
 
-/// get_plugin_selection returns the org's desired OPTIONAL plugins (the local
+/// get_plugin_selection returns the desired OPTIONAL plugins (the local
 /// selection the plugins view writes). Required plugins are always installed at
 /// launch regardless and are not part of this list.
 #[tauri::command]
 pub fn get_plugin_selection(
-    org_id: String,
     cfg: State<'_, AppConfig>,
 ) -> Result<Vec<String>, String> {
-    crate::config::read_selection_in(&cfg.base_dir(), &org_id)
+    crate::config::read_selection_in(&cfg.base_dir())
 }
 
-/// seed_plugin_selection initializes an org's selection from the plugins already
+/// seed_plugin_selection initializes the selection from the plugins already
 /// installed (passed by the caller) the FIRST time — i.e. only when no selection
-/// file exists yet. This migrates an org installed under the old immediate-install
+/// file exists yet. This migrates an instance from the old immediate-install
 /// UI so the plugins view and launch agree that those plugins stay selected. A
 /// no-op once a selection exists (so a deliberately-empty selection is honored).
 /// Launch performs the same seed via config helpers; both go through
 /// selection_exists_in + write_selection_in, so the rule lives in one place.
 #[tauri::command]
 pub fn seed_plugin_selection(
-    org_id: String,
     installed: Vec<String>,
     cfg: State<'_, AppConfig>,
 ) -> Result<(), String> {
     let base = cfg.base_dir();
-    if !crate::config::selection_exists_in(&base, &org_id) {
-        crate::config::write_selection_in(&base, &org_id, &installed)?;
+    if !crate::config::selection_exists_in(&base) {
+        crate::config::write_selection_in(&base, &installed)?;
     }
     Ok(())
 }
@@ -581,47 +530,32 @@ pub fn seed_plugin_selection(
 /// on the next launch.
 #[tauri::command]
 pub fn set_plugin_selection(
-    org_id: String,
     plugin_id: String,
     selected: bool,
     cfg: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    crate::config::set_selection_in(&cfg.base_dir(), &org_id, &plugin_id, selected)
+    crate::config::set_selection_in(&cfg.base_dir(), &plugin_id, selected)
 }
 
-/// get_show_preview returns the global preview-version toggle from shell settings.
-#[tauri::command]
-pub fn get_show_preview(cfg: State<'_, AppConfig>) -> Result<bool, String> {
-    crate::config::read_show_preview_in(&cfg.base_dir())
-}
-
-/// set_show_preview persists the global preview-version toggle.
-#[tauri::command]
-pub fn set_show_preview(on: bool, cfg: State<'_, AppConfig>) -> Result<(), String> {
-    crate::config::set_show_preview_in(&cfg.base_dir(), on)
-}
-
-/// get_plugin_pin returns the locally-pinned version for one (org, plugin) pair,
+/// get_plugin_pin returns the locally-pinned version for a plugin,
 /// or None if no pin is set (meaning "use latest validated").
 #[tauri::command]
 pub fn get_plugin_pin(
-    org_id: String,
     plugin_id: String,
     cfg: State<'_, AppConfig>,
 ) -> Result<Option<String>, String> {
-    let pins = crate::config::read_pins_in(&cfg.base_dir(), &org_id)?;
+    let pins = crate::config::read_pins_in(&cfg.base_dir())?;
     Ok(pins.get(&plugin_id).cloned())
 }
 
-/// set_plugin_pin writes or removes a local version pin for one (org, plugin) pair.
+/// set_plugin_pin writes or removes a local version pin for a plugin.
 #[tauri::command]
 pub fn set_plugin_pin(
-    org_id: String,
     plugin_id: String,
     version: Option<String>,
     cfg: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    crate::config::set_pin_in(&cfg.base_dir(), &org_id, &plugin_id, version.as_deref())
+    crate::config::set_pin_in(&cfg.base_dir(), &plugin_id, version.as_deref())
 }
 
 fn current_token(session: &Session) -> Result<String, String> {

@@ -1,5 +1,7 @@
 # Federated Plugin Sources — Control-Plane Backend Implementation Plan
 
+> **Superseded by `docs/superpowers/specs/2026-06-24-direct-to-production-plugins-design.md`** — single `plugins` namespace; no staging namespace; tag-publish writes `versions[]` directly.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the control-plane marketplace catalog federated — each plugin owns a self-describing per-plugin manifest (registry coords + its own version list); `plugins.json` becomes a curated list of pointers to those manifests; users add unknown plugins by manifest URL. Catalog entries are source-qualified (verified vs. third-party).
@@ -81,11 +83,9 @@ const samplePlugin = `{
   "registry": {
     "host": "ghcr.io",
     "namespace": "acme/oc-plugins",
-    "stagingNamespace": "acme/oc-plugins-staging",
     "publicURL": "https://ghcr.io"
   },
-  "versions": ["1.4.0", "1.3.0"],
-  "preview": ["1.5.0-rc1"]
+  "versions": ["1.4.0", "1.3.0"]
 }`
 
 func TestPluginClientParses(t *testing.T) {
@@ -97,7 +97,7 @@ func TestPluginClientParses(t *testing.T) {
 	if m.PluginID != "acme-charting" || m.Publisher != "Acme Corp" {
 		t.Fatalf("bad meta: %+v", m)
 	}
-	if m.Registry.Namespace != "acme/oc-plugins" || m.Registry.StagingNamespace != "acme/oc-plugins-staging" {
+	if m.Registry.Namespace != "acme/oc-plugins" {
 		t.Fatalf("bad registry: %+v", m.Registry)
 	}
 	if len(m.Versions) != 2 || m.Versions[0] != "1.4.0" {
@@ -137,14 +137,12 @@ type PluginManifest struct {
 	Publisher     string       `json:"publisher"`
 	Registry      RegistrySpec `json:"registry"`
 	Versions      []string     `json:"versions"`
-	Preview       []string     `json:"preview,omitempty"`
 }
 
 type RegistrySpec struct {
-	Host             string `json:"host"`
-	Namespace        string `json:"namespace"`
-	StagingNamespace string `json:"stagingNamespace,omitempty"`
-	PublicURL        string `json:"publicURL,omitempty"`
+	Host      string `json:"host"`
+	Namespace string `json:"namespace"`
+	PublicURL string `json:"publicURL,omitempty"`
 }
 
 // PluginClient fetches + caches one per-plugin manifest URL.
@@ -207,9 +205,6 @@ func validatePlugin(m *PluginManifest) error {
 	}
 	if m.Registry.Namespace == "" {
 		return errors.New("registry.namespace required")
-	}
-	if len(m.Preview) > 0 && m.Registry.StagingNamespace == "" {
-		return errors.New("preview set but registry.stagingNamespace missing")
 	}
 	return nil
 }
@@ -804,7 +799,7 @@ func TestListEmptyWhenRegistryAbsent(t *testing.T) {
 
 - [ ] **Step 4: Update `instance_test.go` + `registry_test.go` constructions**
 
-Replace every `registry.New("http://127.0.0.1:0", "", "plugins", "plugins-staging", nil, "", "")` with `registry.NewCatalog(<fakeProvider or nil-provider>, nil)`. For handler auth-guard tests that never reach the registry, pass a provider returning an error or empty:
+Replace every `registry.New(...)` (old single-namespace constructor) with `registry.NewCatalog(<fakeProvider or nil-provider>, nil)`. For handler auth-guard tests that never reach the registry, pass a provider returning an error or empty:
 
 ```go
 reg := registry.NewCatalog(stubProvider{}, nil) // stubProvider.Plugins returns nil,nil
@@ -853,16 +848,15 @@ import (
 // for already-promoted tags. Built from REGISTRY_* config (publish path),
 // decoupled from the federated catalog.
 type StagingClient struct {
-	host             string
-	plainHTTP        bool
-	namespace        string
-	stagingNamespace string
-	basicAuth        *auth.Client
-	deleter          *GHCRDeleter
-	enum             RepoEnumerator
+	host      string
+	plainHTTP bool
+	namespace string
+	basicAuth *auth.Client
+	deleter   *GHCRDeleter
+	enum      RepoEnumerator
 }
 
-func NewStaging(internalURL, namespace, stagingNamespace, username, password string) *StagingClient {
+func NewStaging(internalURL, namespace, username, password string) *StagingClient {
 	host := internalURL
 	plainHTTP := false
 	if rest, ok := strings.CutPrefix(host, "http://"); ok {
@@ -872,7 +866,7 @@ func NewStaging(internalURL, namespace, stagingNamespace, username, password str
 	}
 	host = strings.TrimRight(host, "/")
 	s := &StagingClient{host: host, plainHTTP: plainHTTP,
-		namespace: strings.Trim(namespace, "/"), stagingNamespace: strings.Trim(stagingNamespace, "/")}
+		namespace: strings.Trim(namespace, "/")}
 	if username != "" {
 		s.basicAuth = &auth.Client{
 			Client: retry.DefaultClient, Cache: auth.NewCache(),
@@ -899,7 +893,7 @@ func (s *StagingClient) repo(ns, id string) (*remote.Repository, error) {
 }
 ```
 
-Then move (verbatim, adjusting receiver to `*StagingClient` and `c.namespace/c.stagingNamespace` to `s.*`): `ListVersions`, `ListStagingVersions`, `ListStagingPluginIDs`, `StagingTagSigned`, `DeleteStagingTag` from the old `registry.go`. Each uses `s.repo(...)`, `repoAbsent`, `findSignatureReferrer`, `sortSemverDesc`, `latestTag` as before. `DeleteStagingTag` uses `s.deleter` + `s.stagingNamespace`. `ListStagingPluginIDs` uses `s.enum.ReposWithPrefix(ctx, s.stagingNamespace+"/")`.
+Then move (verbatim, adjusting receiver to `*StagingClient`): `ListVersions`, `ListStagingVersions`, `ListStagingPluginIDs`, `StagingTagSigned`, `DeleteStagingTag` from the old `registry.go`. Each uses `s.repo(...)`, `repoAbsent`, `findSignatureReferrer`, `sortSemverDesc`, `latestTag` as before.
 
 - [ ] **Step 2: Update the janitor** `runner.go`
 
@@ -1082,7 +1076,7 @@ func (f fakePlugins) Fetch(_ context.Context, url string) (*manifest.PluginManif
 
 func TestProviderUnionAndVerified(t *testing.T) {
 	core := &manifest.PluginManifest{PluginID: "core-app", Publisher: "OpenCapital",
-		Registry: manifest.RegistrySpec{Host: "ghcr.io", Namespace: "oc/plugins", StagingNamespace: "oc/plugins-staging"},
+		Registry: manifest.RegistrySpec{Host: "ghcr.io", Namespace: "oc/plugins"},
 		Versions: []string{"0.1.2"}}
 	acme := &manifest.PluginManifest{PluginID: "acme-charting", Publisher: "Acme",
 		Registry: manifest.RegistrySpec{Host: "ghcr.io", Namespace: "acme/p"},
@@ -1379,11 +1373,9 @@ git commit -m "feat(control-plane): wire federated catalog + standalone staging 
   "registry": {
     "host": "ghcr.io",
     "namespace": "opencapital-dev/plugins",
-    "stagingNamespace": "opencapital-dev/plugins-staging",
     "publicURL": "https://ghcr.io"
   },
-  "versions": ["0.1.2"],
-  "preview": []
+  "versions": ["0.1.2"]
 }
 ```
 
@@ -1646,7 +1638,7 @@ git rm .github/workflows/plugin-promote-check.yml \
 
 - [ ] **Step 3: Verify remaining workflows are unaffected**
 
-Run: `grep -rln "plugins.json\|plugins-staging\|REGISTRY_NAMESPACE" .github/workflows/`
+Run: `grep -rln "plugins.json\|REGISTRY_NAMESPACE" .github/workflows/`
 Expected: no matches (`opencapital-release.yml`, `images.yml`, `ci.yml`,
 `opencapital-cache-warm.yml` do not depend on the dropped promotion).
 

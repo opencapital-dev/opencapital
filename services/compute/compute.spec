@@ -28,6 +28,10 @@ _compute_pkg = SPECPATH  # services/compute/ — compute/ lives here
 polars_datas, polars_binaries, polars_hiddenimports = collect_all('polars')
 rt32_datas, rt32_binaries, rt32_hiddenimports = collect_all('_polars_runtime_32')
 
+# sqlglot lazy-imports its dialect modules; collect_submodules ensures every
+# dialect subpackage is included so frozen imports never raise ModuleNotFoundError.
+sqlglot_hiddenimports = collect_submodules('sqlglot')
+
 a = Analysis(
     ['main.py'],
     pathex=[_compute_pkg],
@@ -37,12 +41,15 @@ a = Analysis(
         polars_hiddenimports
         + rt32_hiddenimports
         + collect_submodules('compute')
+        + sqlglot_hiddenimports
         + [
             '_polars_runtime_32',
             '_polars_runtime_32._polars_runtime',
             '_polars_runtime_32.build_feature_flags',
             'polars._plr',
             'polars._cpu_check',
+            'pg8000',
+            'sqlglot',
         ]
     ),
     hookspath=[],

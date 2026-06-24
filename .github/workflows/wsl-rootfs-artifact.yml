@@ -1,17 +1,17 @@
 name: wsl-rootfs-artifact
 
-# Builds the OpenCapital WSL distro rootfs — the headless data plane (RisingWave
-# single-node + control-plane + gateway + read-gateway + postgres-17 + python)
-# as one flat root-filesystem tar that the desktop app feeds to `wsl --import`
-# on first launch (Windows), then publishes it to the public opencapital
-# repo. The Windows analog of risingwave-macos-artifact.yml.
+# Builds the OpenCapital WSL distro rootfs — the headless data plane
+# (Postgres 17 + RisingWave single-node) as one flat root-filesystem tar
+# that the desktop app feeds to `wsl --import` on first launch (Windows),
+# then publishes it to the public opencapital repo. The Windows analog of
+# risingwave-macos-artifact.yml.
 #
 # Why a rootfs: RisingWave ships no Windows binary, so on Windows the whole
 # headless plane runs inside one bundled WSL2 distro (the host runs Grafana +
-# plugins natively for the per-IP / broker-creds constraints). The rootfs is the
-# official RisingWave Linux image (connector libs + embedded-python UDF already
-# wired) with postgres, the Go services, the infra tree, and the in-distro
-# supervisor layered on top (dataplane/wsl/Dockerfile.rootfs).
+# plugins natively). The rootfs is the official RisingWave Linux image
+# (connector libs + embedded-python UDF already wired) with Postgres, the
+# dataplane infra tree, and the in-distro supervisor layered on top
+# (dataplane/wsl/Dockerfile.rootfs). No Go services are included.
 
 on:
   workflow_dispatch:

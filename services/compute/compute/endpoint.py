@@ -1,17 +1,20 @@
-"""``POST /compute`` — run one panel source register -> fetch -> call -> frame.
+"""``POST /compute`` — run one panel source register -> call -> frame.
 
 The HTTP layer (``compute.server``) delegates here.  Given a request body
-``{"source", "jwt", "window": {"from", "to"}}`` this module:
+``{"source", "window": {"from", "to"}}`` this module:
 
   1. builds a fresh, isolated ``Contract`` (no cross-request leakage) and the
-     exec namespace — the metric module's panel-facing names, ``bind`` /
-     ``metric`` / ``window`` / ``pl``, plus a curated set of stdlib names the
-     formulas use;
-  2. ``exec``s the source so the decorators register the entrypoint, its
-     selectors, and the output mode, then asserts the contract is complete;
-  3. fetches each binding's org-scoped rows from read-gateway as a polars frame;
-  4. calls the entrypoint with the frames by parameter name;
-  5. maps the return to the NEUTRAL FRAME the P2 plugin consumes:
+     exec namespace — the metric module's panel-facing names, ``metric`` /
+     ``bind`` / ``rw`` / ``pg`` / ``window`` / ``pl`` / ``sql``, plus a
+     curated set of stdlib names the formulas use;
+  2. ``exec``s the source so the decorator registers the entrypoint, the
+     output mode, and any ``@bind`` QuerySpecs, then asserts the contract is
+     complete;
+  3. runs each registered ``@bind`` QuerySpec through the dual-store ``Store``
+     and calls the ``@metric`` entrypoint with the resulting Polars frames as
+     kwargs; or, for sources without ``@bind``, calls the entrypoint with no
+     arguments (legacy path, entrypoint pulls data via ``sql()``);
+  4. maps the return to the NEUTRAL FRAME the P2 plugin consumes:
      ``{"output", "columns", "rows"}``.
 
 Execution is plain ``exec`` — UNRESTRICTED.  This is single-tenant by
@@ -28,8 +31,8 @@ from itertools import pairwise
 import polars as pl
 
 from compute import metrics
-from compute.contract import ContractError, Window, make_contract
-from compute.gateway import _frame_from, fetch_rows
+from compute.contract import ContractError, QuerySpec, Window, make_contract
+from compute.store import Store, pg, rw
 
 log = logging.getLogger("compute.endpoint")
 
@@ -48,8 +51,7 @@ class ComputeError(Exception):
     """A request the endpoint rejects with a clean HTTP status + message.
 
     ``status`` is the HTTP status to return; ``message`` is the client-facing
-    ``{"error": ...}`` body.  Used for author errors (400) and to re-surface a
-    ``GatewayError``'s status faithfully.
+    ``{"error": ...}`` body.  Used for author errors (400).
     """
 
     def __init__(self, status: int, message: str) -> None:
@@ -58,70 +60,97 @@ class ComputeError(Exception):
         self.message = message
 
 
-def build_namespace(contract, window: Window) -> dict:
+class _NoopStore:
+    """Stub store for /plan — never fetches data, run() returns empty frame."""
+
+    def run(self, spec: QuerySpec) -> pl.DataFrame:  # noqa: ARG002
+        return pl.DataFrame()
+
+    def close(self) -> None:
+        pass
+
+
+def _auto_spec(q: str, p: tuple) -> QuerySpec:
+    """Build an auto-routed QuerySpec for the ``sql()`` convenience function."""
+    return QuerySpec("auto", q, p)
+
+
+def build_namespace(contract, window: Window, store) -> dict:
     """Assemble the exec namespace injected into a panel source.
 
-    The metric module's panel-facing names (``metrics.__all__``), ``bind`` /
-    ``metric`` from *contract*, the injected ``window`` and ``pl`` (polars), and
-    the curated stdlib names.  Returned as a plain dict; Python supplies
-    ``__builtins__`` itself when this is used as ``exec`` globals.
+    The metric module's panel-facing names (``metrics.__all__``), ``metric``
+    and ``bind`` from *contract*, the injected ``window``, ``pl`` (polars),
+    ``rw`` / ``pg`` (store-pinned QuerySpec constructors), ``sql`` (auto-routed
+    convenience that runs immediately via *store*), and the curated stdlib
+    names.  Returned as a plain dict; Python supplies ``__builtins__`` itself
+    when this is used as ``exec`` globals.
     """
     ns: dict = {name: getattr(metrics, name) for name in metrics.__all__}
     ns.update(_CURATED_STDLIB)
-    ns["bind"] = contract.bind
     ns["metric"] = contract.metric
+    ns["bind"] = contract.bind
     ns["window"] = window
     ns["pl"] = pl
+    ns["rw"] = rw
+    ns["pg"] = pg
+    ns["sql"] = lambda q, *p: store.run(_auto_spec(q, tuple(p)))
     return ns
 
 
-def run_compute(body: dict, base_url: str) -> dict:
+def run_compute(body: dict, rw_dsn: str, pg_dsn: str | None = None) -> dict:
     """Run one panel source end to end and return the neutral frame.
 
-    *body* is the parsed request (``source`` / ``jwt`` / ``window``); *base_url*
-    is the read-gateway URL.  Raises ``ComputeError`` for any client-visible
-    failure (malformed request, contract error, author exception, gateway
-    error) so the HTTP layer can render a clean ``{"error": ...}`` body.
+    *body* is the parsed request (``source`` / ``window``); *rw_dsn* is the
+    RisingWave postgres:// DSN; *pg_dsn* is the optional Postgres control-db
+    DSN.  Raises ``ComputeError`` for any client-visible failure (malformed
+    request, contract error, author exception) so the HTTP layer can render a
+    clean ``{"error": ...}`` body.
     """
-    source, jwt, window, prefetched = _parse_body(body)
-
-    contract = make_contract()
-    ns = build_namespace(contract, window)
+    source, window = _parse_body(body)
+    store = Store(rw_dsn, pg_dsn)
     try:
-        exec(source, ns)  # noqa: S102 — unrestricted by design (single-tenant)
-    except ContractError as exc:
-        raise ComputeError(400, str(exc)) from exc
-    except Exception as exc:
-        raise ComputeError(400, f"source error: {exc}") from exc
+        contract = make_contract()
+        ns = build_namespace(contract, window, store)
+        try:
+            exec(source, ns)  # noqa: S102 — unrestricted by design (single-tenant)
+        except ContractError as exc:
+            raise ComputeError(400, str(exc)) from exc
+        except Exception as exc:
+            raise ComputeError(400, f"source error: {exc}") from exc
 
-    reg = contract.registry
-    try:
-        reg.require_complete()
-    except ContractError as exc:
-        raise ComputeError(400, str(exc)) from exc
+        reg = contract.registry
+        try:
+            reg.require_complete()
+        except ContractError as exc:
+            raise ComputeError(400, str(exc)) from exc
 
-    log.debug("compute: output=%s bindings=%d prefetched=%d", reg.output, len(reg.bindings), len(prefetched))
-    fetched = {}
-    for param, binding in reg.bindings.items():
-        if param in prefetched:
-            p = prefetched[param]
-            fetched[param] = _frame_from(p["columns"], p["rows"])
-        else:
-            fetched[param] = fetch_rows(base_url, jwt, binding, window)
+        log.debug("compute: output=%s bindings=%s", reg.output, list(reg.bindings))
 
-    try:
-        result = reg.entrypoint(**fetched)
-    except Exception as exc:
-        raise ComputeError(400, f"entrypoint error: {exc}") from exc
+        frames = {}
+        for name, spec in reg.bindings.items():
+            try:
+                frames[name] = store.run(spec)
+            except Exception as exc:
+                raise ComputeError(400, f"binding {name!r}: {exc}") from exc
 
-    return _to_frame(reg.output, result)
+        try:
+            result = reg.entrypoint(**frames)
+        except Exception as exc:
+            raise ComputeError(400, f"entrypoint error: {exc}") from exc
+
+        return _to_frame(reg.output, result)
+    finally:
+        store.close()
 
 
 def run_plan(body: dict) -> dict:
-    """Exec the source to register decorators and return ``{"bindings": {param: raw_selector}}``.
+    """Exec the source to register decorators and return ``{"bindings": {}}``.
 
     Performs NO data fetch and does NOT call the entrypoint.  Raises
     ``ComputeError(400, ...)`` on body/source/contract errors.
+
+    Returns an empty bindings map — the new contract has no pre-declared
+    selectors; plugins that need binding discovery should use /compute directly.
     """
     if not isinstance(body, dict):
         raise ComputeError(400, "request body must be a JSON object")
@@ -130,8 +159,8 @@ def run_plan(body: dict) -> dict:
         raise ComputeError(400, "missing or invalid 'source'")
 
     contract = make_contract()
-    # Window values are irrelevant; /plan never calls the entrypoint or fetches rows.
-    ns = build_namespace(contract, Window(0, 0))
+    # Use a no-op store for /plan (never calls the entrypoint or fetches data).
+    ns = build_namespace(contract, Window(0, 0), _NoopStore())
     try:
         exec(source, ns)  # noqa: S102 — unrestricted by design (single-tenant)
     except ContractError as exc:
@@ -145,27 +174,24 @@ def run_plan(body: dict) -> dict:
     except ContractError as exc:
         raise ComputeError(400, str(exc)) from exc
 
-    return {"bindings": dict(reg.raw_selectors)}
+    return {"bindings": {}}
 
 
-def _parse_body(body: object) -> tuple[str, str, Window, dict]:
-    """Validate the request and return ``(source, jwt, Window, prefetched)``.
+def _parse_body(body: object) -> tuple[str, Window]:
+    """Validate the request and return ``(source, Window)``.
 
     Raises ``ComputeError(400, ...)`` on a non-object body, a missing/wrong-typed
-    ``source`` / ``jwt`` / ``window``, or non-integer window bounds.
+    ``source`` / ``window``, or non-integer window bounds.
 
-    ``prefetched`` is optional: missing or non-dict → ``{}``.  Each present entry
-    must be ``{"columns": list, "rows": list}``; any other shape is a 400.
+    The ``jwt`` and ``prefetched`` fields are no longer read — the metric pulls
+    its own data via ``sql()`` at call time.
     """
     if not isinstance(body, dict):
         raise ComputeError(400, "request body must be a JSON object")
     source = body.get("source")
-    jwt = body.get("jwt")
     win = body.get("window")
     if not isinstance(source, str):
         raise ComputeError(400, "missing or invalid 'source'")
-    if not isinstance(jwt, str):
-        raise ComputeError(400, "missing or invalid 'jwt'")
     if not isinstance(win, dict) or "from" not in win or "to" not in win:
         raise ComputeError(400, "missing or invalid 'window' (need 'from' and 'to')")
     t0, t1 = win["from"], win["to"]
@@ -173,19 +199,7 @@ def _parse_body(body: object) -> tuple[str, str, Window, dict]:
     if not isinstance(t0, int) or not isinstance(t1, int) or isinstance(t0, bool) or isinstance(t1, bool):
         raise ComputeError(400, "'window.from' and 'window.to' must be integer microseconds")
 
-    raw_pre = body.get("prefetched")
-    prefetched: dict = {}
-    if isinstance(raw_pre, dict):
-        for param, val in raw_pre.items():
-            if (
-                not isinstance(val, dict)
-                or not isinstance(val.get("columns"), list)
-                or not isinstance(val.get("rows"), list)
-            ):
-                raise ComputeError(400, f"prefetched[{param!r}] must have 'columns' (list) and 'rows' (list)")
-            prefetched[param] = val
-
-    return source, jwt, Window(t0, t1), prefetched
+    return source, Window(t0, t1)
 
 
 def _sanitize(v: object) -> object:

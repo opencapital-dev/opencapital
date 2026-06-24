@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "plugins": [
-    "https://raw.githubusercontent.com/opencapital-dev/opencapital/main/plugins/core-app.json",
-    "https://raw.githubusercontent.com/opencapital-dev/opencapital/main/plugins/core-datasource.json",
-    "https://raw.githubusercontent.com/opencapital-dev/opencapital/main/plugins/yfinance-app.json"
+    "https://raw.githubusercontent.com/opencapital-dev/oc-plugin-core-app/main/oc-plugin.json",
+    "https://raw.githubusercontent.com/opencapital-dev/oc-plugin-core-datasource/main/oc-plugin.json",
+    "https://raw.githubusercontent.com/opencapital-dev/oc-plugin-yfinance-app/main/oc-plugin.json"
   ]
 }

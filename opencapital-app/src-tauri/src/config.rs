@@ -20,16 +20,22 @@ pub struct AppConfig {
     /// id_token with the user's email; audience governs API authorization.
     pub kinde_scope: String,
 
+    // --- Plugin catalog (in-process) ------------------------------------
+    /// Curated marketplace list URL — the official array of per-plugin manifest
+    /// URLs the catalog seeds the official set from. Override via
+    /// PLUGINS_MANIFEST_URL. Default: this repo's curated plugins.json on main
+    /// (the opencapital-releases repo is deprecated).
+    pub plugin_list_url: String,
+
     // --- Grafana runtime (the "launch Grafana" half) -------------------
-    /// Gateway base plugins POST data to (host-reachable), e.g. http://localhost:8090.
-    pub gateway_url: String,
-    /// Read-gateway base the core-datasource datasource posts metric queries to
-    /// (host-reachable), e.g. http://localhost:8095.
-    pub read_gateway_url: String,
     /// OTLP collector endpoint plugins ship spans to, e.g. http://localhost:4317.
     pub otlp_endpoint: String,
     /// RisingWave DSN the RisingWave (ops) datasource connects with.
     pub risingwave_dsn: String,
+    /// Postgres DSN for the local control_db (control plane store). Passed to
+    /// the compute sidecar as POSTGRES_DSN so its dual-store query layer can
+    /// reach Postgres without the sidecar needing to know the port itself.
+    pub postgres_dsn: String,
     /// Operator bootstrap token the control plane's instance endpoint
     /// accepts. Read from BOOTSTRAP_TOKEN, else the file at
     /// <repo>/secrets/admin_bootstrap_token. Empty if neither found
@@ -90,13 +96,21 @@ impl AppConfig {
             // access token's API authorization.
             kinde_scope: pick("KINDE_SCOPE", file.get("kinde_scope"), "openid email"),
 
-            gateway_url: pick("PLUGIN_GATEWAY_URL", file.get("gateway_url"), "http://localhost:8090"),
-            read_gateway_url: pick("PLUGIN_READ_GATEWAY_URL", file.get("read_gateway_url"), "http://localhost:8095"),
+            plugin_list_url: pick(
+                "PLUGINS_MANIFEST_URL",
+                file.get("plugin_list_url"),
+                "https://raw.githubusercontent.com/opencapital-dev/opencapital/main/plugins.json",
+            ),
             otlp_endpoint: pick("PLUGIN_OTLP_ENDPOINT", file.get("otlp_endpoint"), "http://localhost:4317"),
             risingwave_dsn: pick(
                 "RISINGWAVE_DSN",
                 file.get("risingwave_dsn"),
                 "postgres://root:root@localhost:4566/dev?sslmode=disable",
+            ),
+            postgres_dsn: pick(
+                "POSTGRES_DSN",
+                file.get("postgres_dsn"),
+                "postgres://postgres@127.0.0.1:5432/control_db?sslmode=disable",
             ),
             bootstrap_token,
             runtime_dir: PathBuf::from(env_or(
@@ -117,10 +131,10 @@ impl AppConfig {
         home_dir().join(".opencapital")
     }
 
-    /// Per-org instance dir holding provisioning/, plugins/, plugin-cache/,
+    /// Single local instance dir holding provisioning/, plugins/, plugin-cache/,
     /// data/, logs/, grafana.ini.
-    pub fn instance_dir(&self, org_id: &str) -> PathBuf {
-        self.base_dir().join("instances").join(org_id)
+    pub fn instance_dir(&self) -> PathBuf {
+        self.base_dir().join("instance")
     }
 
     /// Port the loopback callback listener binds, parsed from the redirect URI.
@@ -209,7 +223,7 @@ fn default_runtime_dir() -> PathBuf {
 }
 
 /// resolve_repo_dir finds the monorepo root. REPO_DIR wins; otherwise walk
-/// up from the current dir looking for the lib/instance-bootstrap marker
+/// up from the current dir looking for the dataplane marker
 /// (tauri dev runs with CWD = src-tauri, two levels under the repo).
 fn resolve_repo_dir() -> PathBuf {
     if let Ok(d) = env::var("REPO_DIR") {
@@ -218,7 +232,7 @@ fn resolve_repo_dir() -> PathBuf {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir = cwd.as_path();
     loop {
-        if dir.join("lib/instance-bootstrap/go.mod").exists() {
+        if dir.join("dataplane/postgres/init/01-schema.sql").exists() {
             return dir.to_path_buf();
         }
         match dir.parent() {
@@ -287,12 +301,12 @@ fn default_wsl_rootfs_url() -> &'static str {
 
 use std::collections::BTreeMap;
 
-fn pins_path(base: &std::path::Path, org: &str) -> PathBuf {
-    base.join("instances").join(org).join("pins.json")
+fn pins_path(base: &std::path::Path) -> PathBuf {
+    base.join("instance").join("pins.json")
 }
 
-pub fn read_pins_in(base: &std::path::Path, org: &str) -> Result<BTreeMap<String, String>, String> {
-    match std::fs::read_to_string(pins_path(base, org)) {
+pub fn read_pins_in(base: &std::path::Path) -> Result<BTreeMap<String, String>, String> {
+    match std::fs::read_to_string(pins_path(base)) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| format!("parse pins: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(format!("read pins: {e}")),
@@ -301,25 +315,24 @@ pub fn read_pins_in(base: &std::path::Path, org: &str) -> Result<BTreeMap<String
 
 pub fn set_pin_in(
     base: &std::path::Path,
-    org: &str,
     plugin: &str,
     version: Option<&str>,
 ) -> Result<(), String> {
-    let mut pins = read_pins_in(base, org)?;
+    let mut pins = read_pins_in(base)?;
     match version {
         Some(v) => { pins.insert(plugin.into(), v.into()); }
         None => { pins.remove(plugin); }
     }
-    let p = pins_path(base, org);
+    let p = pins_path(base);
     std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| format!("mkdir: {e}"))?;
     std::fs::write(&p, serde_json::to_vec_pretty(&pins).unwrap())
         .map_err(|e| format!("write pins: {e}"))
 }
 
-/// pins_env_value renders the org's local pins as a JSON object string for the
+/// pins_env_value renders the local pins as a JSON object string for the
 /// instance-bootstrap PLUGIN_PINS env var. Unreadable/missing -> "{}".
-pub fn pins_env_value(base: &std::path::Path, org: &str) -> String {
-    match read_pins_in(base, org) {
+pub fn pins_env_value(base: &std::path::Path) -> String {
+    match read_pins_in(base) {
         Ok(pins) => serde_json::to_string(&pins).unwrap_or_else(|_| "{}".into()),
         Err(_) => "{}".into(),
     }
@@ -331,33 +344,33 @@ pub fn pins_env_value(base: &std::path::Path, org: &str) -> String {
 // install/uninstall/self-heal path (see grafana::reconcile_plugin_selection).
 // Stored as a sorted id list per org (instances/<org>/selection.json).
 
-fn selection_path(base: &std::path::Path, org: &str) -> PathBuf {
-    base.join("instances").join(org).join("selection.json")
+fn selection_path(base: &std::path::Path) -> PathBuf {
+    base.join("instance").join("selection.json")
 }
 
-pub fn read_selection_in(base: &std::path::Path, org: &str) -> Result<Vec<String>, String> {
-    match std::fs::read_to_string(selection_path(base, org)) {
+pub fn read_selection_in(base: &std::path::Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(selection_path(base)) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| format!("parse selection: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("read selection: {e}")),
     }
 }
 
-/// selection_exists_in reports whether the org has a selection file yet. Used to
-/// distinguish "never selected" (seed from currently-installed) from a
-/// deliberately-empty selection (user deselected everything).
-pub fn selection_exists_in(base: &std::path::Path, org: &str) -> bool {
-    selection_path(base, org).exists()
+/// selection_exists_in reports whether the local instance has a selection file
+/// yet. Used to distinguish "never selected" (seed from currently-installed)
+/// from a deliberately-empty selection (user deselected everything).
+pub fn selection_exists_in(base: &std::path::Path) -> bool {
+    selection_path(base).exists()
 }
 
-/// write_selection_in replaces the org's whole selection with `ids` (sorted,
-/// deduped). Used to seed the selection from the already-installed optional
-/// plugins the first time launch reconciles an org.
-pub fn write_selection_in(base: &std::path::Path, org: &str, ids: &[String]) -> Result<(), String> {
+/// write_selection_in replaces the whole selection with `ids` (sorted, deduped).
+/// Used to seed the selection from the already-installed optional plugins the
+/// first time launch reconciles.
+pub fn write_selection_in(base: &std::path::Path, ids: &[String]) -> Result<(), String> {
     let mut sel: Vec<String> = ids.to_vec();
     sel.sort();
     sel.dedup();
-    let p = selection_path(base, org);
+    let p = selection_path(base);
     std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| format!("mkdir: {e}"))?;
     std::fs::write(&p, serde_json::to_vec_pretty(&sel).unwrap())
         .map_err(|e| format!("write selection: {e}"))
@@ -365,48 +378,19 @@ pub fn write_selection_in(base: &std::path::Path, org: &str, ids: &[String]) -> 
 
 pub fn set_selection_in(
     base: &std::path::Path,
-    org: &str,
     plugin: &str,
     selected: bool,
 ) -> Result<(), String> {
-    let mut sel = read_selection_in(base, org)?;
+    let mut sel = read_selection_in(base)?;
     sel.retain(|p| p != plugin);
     if selected {
         sel.push(plugin.to_string());
     }
     sel.sort();
-    let p = selection_path(base, org);
+    let p = selection_path(base);
     std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| format!("mkdir: {e}"))?;
     std::fs::write(&p, serde_json::to_vec_pretty(&sel).unwrap())
         .map_err(|e| format!("write selection: {e}"))
-}
-
-fn settings_path(base: &std::path::Path) -> PathBuf {
-    base.join("settings.json")
-}
-
-pub fn read_show_preview_in(base: &std::path::Path) -> Result<bool, String> {
-    match std::fs::read_to_string(settings_path(base)) {
-        Ok(s) => {
-            let v: serde_json::Value =
-                serde_json::from_str(&s).map_err(|e| format!("parse settings: {e}"))?;
-            Ok(v.get("show_preview").and_then(|b| b.as_bool()).unwrap_or(false))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("read settings: {e}")),
-    }
-}
-
-pub fn set_show_preview_in(base: &std::path::Path, on: bool) -> Result<(), String> {
-    let p = settings_path(base);
-    let mut v: serde_json::Value = match std::fs::read_to_string(&p) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
-        Err(_) => serde_json::json!({}),
-    };
-    v["show_preview"] = serde_json::Value::Bool(on);
-    std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| format!("mkdir: {e}"))?;
-    std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap())
-        .map_err(|e| format!("write settings: {e}"))
 }
 
 #[cfg(test)]
@@ -425,21 +409,19 @@ mod tests {
     }
 
     #[test]
-    fn selection_roundtrip_sorted_and_isolated_per_org() {
+    fn selection_roundtrip_sorted() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_selection_in(dir.path(), "orgA").unwrap().is_empty());
-        set_selection_in(dir.path(), "orgA", "yfinance-app", true).unwrap();
-        set_selection_in(dir.path(), "orgA", "core-app", true).unwrap();
+        assert!(read_selection_in(dir.path()).unwrap().is_empty());
+        set_selection_in(dir.path(), "yfinance-app", true).unwrap();
+        set_selection_in(dir.path(), "core-app", true).unwrap();
         // sorted, deduped
-        assert_eq!(read_selection_in(dir.path(), "orgA").unwrap(), vec!["core-app", "yfinance-app"]);
+        assert_eq!(read_selection_in(dir.path()).unwrap(), vec!["core-app", "yfinance-app"]);
         // idempotent re-select
-        set_selection_in(dir.path(), "orgA", "core-app", true).unwrap();
-        assert_eq!(read_selection_in(dir.path(), "orgA").unwrap(), vec!["core-app", "yfinance-app"]);
+        set_selection_in(dir.path(), "core-app", true).unwrap();
+        assert_eq!(read_selection_in(dir.path()).unwrap(), vec!["core-app", "yfinance-app"]);
         // deselect removes
-        set_selection_in(dir.path(), "orgA", "core-app", false).unwrap();
-        assert_eq!(read_selection_in(dir.path(), "orgA").unwrap(), vec!["yfinance-app"]);
-        // isolated per org
-        assert!(read_selection_in(dir.path(), "orgB").unwrap().is_empty());
+        set_selection_in(dir.path(), "core-app", false).unwrap();
+        assert_eq!(read_selection_in(dir.path()).unwrap(), vec!["yfinance-app"]);
     }
 
     #[test]
@@ -456,50 +438,23 @@ mod tests {
     }
 
     #[test]
-    fn pins_roundtrip_per_org() {
+    fn pins_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        set_pin_in(dir.path(), "org1", "yfinance", Some("v1.0.3")).unwrap();
-        let pins = read_pins_in(dir.path(), "org1").unwrap();
+        set_pin_in(dir.path(), "yfinance", Some("v1.0.3")).unwrap();
+        let pins = read_pins_in(dir.path()).unwrap();
         assert_eq!(pins.get("yfinance").map(String::as_str), Some("v1.0.3"));
-        set_pin_in(dir.path(), "org1", "yfinance", None).unwrap();
-        assert!(read_pins_in(dir.path(), "org1").unwrap().get("yfinance").is_none());
-    }
-
-    #[test]
-    fn pins_are_isolated_per_org() {
-        let dir = tempfile::tempdir().unwrap();
-        set_pin_in(dir.path(), "orgA", "yfinance", Some("v1")).unwrap();
-        assert!(read_pins_in(dir.path(), "orgB").unwrap().is_empty());
+        set_pin_in(dir.path(), "yfinance", None).unwrap();
+        assert!(read_pins_in(dir.path()).unwrap().get("yfinance").is_none());
     }
 
     #[test]
     fn pins_env_value_renders_json_or_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(pins_env_value(dir.path(), "org1"), "{}");
-        set_pin_in(dir.path(), "org1", "yfinance", Some("v1.0.3")).unwrap();
+        assert_eq!(pins_env_value(dir.path()), "{}");
+        set_pin_in(dir.path(), "yfinance", Some("v1.0.3")).unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&pins_env_value(dir.path(), "org1")).unwrap();
+            serde_json::from_str(&pins_env_value(dir.path())).unwrap();
         assert_eq!(v.get("yfinance").and_then(|s| s.as_str()), Some("v1.0.3"));
     }
 
-    #[test]
-    fn show_preview_defaults_false_and_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!read_show_preview_in(dir.path()).unwrap());
-        set_show_preview_in(dir.path(), true).unwrap();
-        assert!(read_show_preview_in(dir.path()).unwrap());
-    }
-
-    #[test]
-    fn set_show_preview_preserves_other_settings_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("settings.json"), br#"{"theme":"dark"}"#).unwrap();
-        set_show_preview_in(dir.path(), true).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.path().join("settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"));
-        assert_eq!(v.get("show_preview").and_then(|b| b.as_bool()), Some(true));
-    }
 }

@@ -4,12 +4,9 @@ import { css, keyframes } from "@emotion/css";
 import { GrafanaTheme2 } from "@grafana/data";
 import { Alert, Button, Icon, Text, useStyles2 } from "@grafana/ui";
 import { api, errMsg } from "../api";
-import type { MeOrgs, Org } from "../types";
 import { ProgressButton } from "./ProgressButton";
 
 type Props = {
-  me: MeOrgs;
-  org: Org;
   // Preferred human email for the Grafana identity (empty -> falls back to the
   // subject id in the backend).
   userEmail: string;
@@ -28,7 +25,7 @@ const STAGE_KEYS = [
   "ready",
 ] as const;
 
-export function LaunchView({ me, org, userEmail }: Props) {
+export function LaunchView({ userEmail }: Props) {
   const styles = useStyles2(getStyles);
   const [phase, setPhase] = useState<"idle" | "launching" | "live">("idle");
   const [activeKey, setActiveKey] = useState<string | null>(null);
@@ -68,19 +65,12 @@ export function LaunchView({ me, org, userEmail }: Props) {
     return () => unsubs.forEach((p) => p.then((un) => un()));
   }, []);
 
-  // Reset transient launch UI when the selected workspace changes.
-  useEffect(() => {
-    setPhase("idle");
-    setActiveKey(null);
-    setError("");
-  }, [org.org_id]);
-
   async function launch() {
     setPhase("launching");
     setActiveKey(STAGE_KEYS[0]);
     setError("");
     try {
-      await api.launch(org.org_id, userEmail, userEmail || me.user_id);
+      await api.launch(userEmail, userEmail);
     } catch (e) {
       setError(errMsg(e));
       setPhase("idle");
@@ -107,10 +97,7 @@ export function LaunchView({ me, org, userEmail }: Props) {
               <Icon name="check-circle" size="xxl" />
             </div>
             <Text element="h2" variant="h4">
-              {org.name} is live
-            </Text>
-            <Text color="secondary">
-              Grafana opened in its own window. You can relaunch any time.
+              OpenCapital is live
             </Text>
             <Button variant="secondary" icon="external-link-alt" onClick={launch}>
               Relaunch

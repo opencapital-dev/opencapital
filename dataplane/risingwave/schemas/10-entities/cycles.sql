@@ -1,6 +1,5 @@
 CREATE VIEW IF NOT EXISTS e_cycles AS
 SELECT
-    org_id,
     portfolio_id                                           AS portfolio,
     instrument_id                                          AS instrument,
     (extract(epoch from close_ts) * 1000000)::bigint       AS ts,

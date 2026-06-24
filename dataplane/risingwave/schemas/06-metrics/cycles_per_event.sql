@@ -16,7 +16,6 @@
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS cycles_per_event AS
 SELECT
-    fpe.org_id                                             AS org_id,
     fpe.portfolio_id                                       AS portfolio_id,
     fpe.instrument_id                                      AS instrument_id,
     (c ->> 'cycle_seq')::INT                               AS cycle_seq,

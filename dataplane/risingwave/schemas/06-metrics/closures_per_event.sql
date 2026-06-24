@@ -12,7 +12,6 @@
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS closures_per_event AS
 SELECT
-    fpe.org_id                                             AS org_id,
     fpe.portfolio_id                                       AS portfolio_id,
     fpe.instrument_id                                      AS instrument_id,
     (c ->> 'lot_id')                                       AS lot_id,

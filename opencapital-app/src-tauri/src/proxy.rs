@@ -41,9 +41,6 @@ pub struct Shared {
     /// replaces its own handle on crash-restart.
     pub pg_child: Mutex<Option<std::process::Child>>,
     pub rw_child: Mutex<Option<std::process::Child>>,
-    pub cp_child: Mutex<Option<std::process::Child>>,
-    pub gw_child: Mutex<Option<std::process::Child>>,
-    pub rg_child: Mutex<Option<std::process::Child>>,
     /// On Windows the whole plane runs in one WSL distro; this is the
     /// long-lived `wsl … supervisor.sh` child the crash monitor wait()s on.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -52,6 +49,10 @@ pub struct Shared {
     /// superseded launch sees the mismatch and exits instead of respawning a
     /// grafana the relaunch already replaced.
     pub generation: std::sync::atomic::AtomicU64,
+    /// Set by the RunEvent::Exit teardown. Each supervisor checks it the
+    /// instant its child exits and returns instead of respawning, so on-close
+    /// child-killing isn't undone by the crash monitor.
+    pub shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {

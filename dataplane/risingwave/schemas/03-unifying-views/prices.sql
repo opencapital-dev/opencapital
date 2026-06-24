@@ -1,8 +1,8 @@
 -- ============================================================================
--- prices — VIEW over `data` filtered to the prices.* namespaces (no actors).
+-- prices — VIEW over `data_log` filtered to the prices.* namespaces.
 -- ----------------------------------------------------------------------------
 -- v1 was an MV doing a 2-way UNION across price_quote / price_ohlcv_bar
--- upsert tables. v6 reads from `data.v2` (via data_log) filtered by source_namespace:
+-- upsert tables. v6 reads from data_log filtered by source_namespace:
 --   * prices.quote   — bid/ask quotes → mid price
 --   * prices.ohlcv   — OHLCV bars     → close price
 --
@@ -18,12 +18,8 @@
 --                  "bar_cadence": "1m", "currency": "USD", "venue": "..."}
 -- ============================================================================
 
--- v6: org_id propagates so per-tenant logical views can scope downstream
--- reads. Prices land on `data.v2` from the gateway; the ingestor never
--- holds broker creds (ADR-0038).
 CREATE MATERIALIZED VIEW prices AS
     SELECT
-        org_id,
         portfolio_id,
         source_id AS instrument_id,
         observed_at AS price_ts,
@@ -37,7 +33,6 @@ CREATE MATERIALIZED VIEW prices AS
     WHERE source_namespace = 'prices.quote'
 UNION ALL
     SELECT
-        org_id,
         portfolio_id,
         source_id AS instrument_id,
         observed_at AS price_ts,

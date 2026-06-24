@@ -1,5 +1,5 @@
 -- ============================================================================
--- option_marks — VIEW over `data` filtered to the prices.option_mark namespace.
+-- option_marks — VIEW over `data_log` filtered to the prices.option_mark namespace.
 -- ----------------------------------------------------------------------------
 -- Statement-sourced option mark stream produced by reference-admin's
 -- data_io publisher (see ADR-0019). One row per `Open Positions` option
@@ -14,11 +14,8 @@
 --   prices.option_mark: {"close": <double>, "currency": "USD"}
 -- ============================================================================
 
--- v6: org_id propagates so per-tenant logical views can scope downstream
--- reads.
 CREATE MATERIALIZED VIEW option_marks AS
     SELECT
-        org_id,
         portfolio_id,
         source_id                                            AS instrument_id,
         observed_at                                          AS price_ts,

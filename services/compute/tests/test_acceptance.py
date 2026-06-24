@@ -1,6 +1,6 @@
-"""P1 wiring acceptance — register -> fetch -> call -> frame vs. direct library.
+"""P1 wiring acceptance — register -> sql() -> call -> frame vs. direct library.
 
-Proves the FULL compute path (ComputeServer + stub /v1/rows + real metric library)
+Proves the FULL compute path (ComputeServer + stubbed rwclient + real metric library)
 produces the same value as calling the metric library directly on the same canned
 rows — i.e. every layer of P1 is wired correctly end-to-end.
 
@@ -9,8 +9,8 @@ Two tests:
                             with one external flow.
   test_acceptance_series  — equity curve (cumulative_twr series) over the same data.
 
-Stub and server helpers are copied from test_endpoint.py; the canned data is
-intentionally richer than the minimal endpoint tests (3 NAV points + 1 flow).
+The stub patches ``rwclient.connect`` / ``rwclient.query`` so no live RisingWave
+is needed; the metric source calls sql() directly in its body.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import polars as pl
 import pytest
@@ -32,75 +31,8 @@ from compute.metrics import (
     xirr,
 )
 from compute.server import ComputeServer
-
-
-# ---------------------------------------------------------------------------
-# Stub gateway — identical pattern to test_endpoint.py
-# ---------------------------------------------------------------------------
-
-def _make_gateway(rows_by_selector: dict):
-    class _Stub(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length))
-            selector = req["selector"]
-            doc = rows_by_selector.get(selector, {"columns": ["ts"], "rows": []})
-            body = json.dumps(doc).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a: object) -> None:
-            pass
-
-    return _Stub
-
-
-def _serve_gateway(rows_by_selector: dict):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_gateway(rows_by_selector))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, f"http://127.0.0.1:{server.server_address[1]}"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _wait_ready(url: str, timeout: float = 2.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            urllib.request.urlopen(url, timeout=0.2)
-            return
-        except Exception:
-            time.sleep(0.05)
-    raise TimeoutError(f"server not ready at {url}")
-
-
-def _serve_compute(gateway_url: str):
-    port = _free_port()
-    server = ComputeServer(host="127.0.0.1", port=port, gateway_url=gateway_url)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{port}"
-    _wait_ready(base + "/health")
-    return server, base
-
-
-def _post_compute(base: str, body: dict) -> tuple[int, dict]:
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        base + "/compute", data=data, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+from compute import rwclient
+from compute.rwclient import _frame_from
 
 
 # ---------------------------------------------------------------------------
@@ -136,25 +68,95 @@ _FLOWS_ROWS = {
     "rows": [["org-1", "port-A", _D, "DEPOSIT", 600.0]],   # one external flow at t=1d
 }
 
-# Selectors as they appear stripped of @mode (what the stub matches on).
-_SEL_NAV   = "nav{portfolio=\"$p\"}"
-_SEL_FLOWS = "flows{portfolio=\"$p\"}"
-
-_STUB_ROWS = {_SEL_NAV: _NAV_ROWS, _SEL_FLOWS: _FLOWS_ROWS}
-
 # Window: full 3-day span.
 _WINDOW = {"from": 0, "to": 3 * _D}
 
 
 # ---------------------------------------------------------------------------
-# Decorated panel sources
+# rwclient stub helpers
+# ---------------------------------------------------------------------------
+
+class _FakeConn:
+    """Stub pg8000 connection for tests — has a no-op close()."""
+    def close(self):
+        pass
+
+
+def _make_query_stub(table_data: dict[str, dict]):
+    """Return a query stub that maps a simple table name to canned rows.
+
+    The stub inspects the SQL query for known table names (nav, flows, etc.)
+    and returns the matching canned frame.  Params are ignored.
+    Catalog introspection queries (rw_catalog / information_schema) return all
+    known table names as "rw" so Store.catalog() + auto-routing succeed.
+    """
+    known_tables = list(table_data.keys())
+
+    def _query(conn, sql: str, params: tuple = ()) -> pl.DataFrame:
+        if "rw_catalog" in sql:
+            return pl.DataFrame({"name": known_tables})
+        if "information_schema" in sql:
+            return pl.DataFrame({"name": []})
+        for name, doc in table_data.items():
+            if name in sql:
+                return _frame_from(doc["columns"], doc["rows"])
+        return pl.DataFrame()
+    return _query
+
+
+# ---------------------------------------------------------------------------
+# Compute server helpers
+# ---------------------------------------------------------------------------
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_ready(url: str, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=0.2)
+            return
+        except Exception:
+            time.sleep(0.05)
+    raise TimeoutError(f"server not ready at {url}")
+
+
+def _serve_compute(dsn: str = "dsn://stub"):
+    port = _free_port()
+    server = ComputeServer(host="127.0.0.1", port=port, dsn=dsn)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    _wait_ready(base + "/health")
+    return server, base
+
+
+def _post_compute(base: str, body: dict) -> tuple[int, dict]:
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        base + "/compute", data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+# ---------------------------------------------------------------------------
+# Decorated panel sources (new sql() contract)
 # ---------------------------------------------------------------------------
 
 # Scalar: windowed TWR total return.
 _SCALAR_SRC = r"""
-@bind(nav="nav{portfolio=\"$p\"} @window", flows="flows{portfolio=\"$p\"} @window")
 @metric(output="scalar")
-def total_return(nav, flows):
+def total_return():
+    nav = sql("SELECT * FROM nav WHERE portfolio = $1", "port-A")
+    flows = sql("SELECT * FROM flows WHERE portfolio = $1", "port-A")
     t0, t1 = window
     flow_ts = flows["ts"].to_list() if flows.height else []
     return twr(nav, flow_ts, t0, t1)
@@ -162,9 +164,10 @@ def total_return(nav, flows):
 
 # Series: daily equity curve via cumulative_twr.
 _SERIES_SRC = r"""
-@bind(nav="nav{portfolio=\"$p\"} @window", flows="flows{portfolio=\"$p\"} @window")
 @metric(output="series")
-def equity_curve(nav, flows):
+def equity_curve():
+    nav = sql("SELECT * FROM nav WHERE portfolio = $1", "port-A")
+    flows = sql("SELECT * FROM flows WHERE portfolio = $1", "port-A")
     t0, t1 = window
     flow_ts = flows["ts"].to_list() if flows.height else []
     grid = build_grid(t0, t1, "1d")
@@ -180,8 +183,7 @@ def equity_curve(nav, flows):
 
 def _nav_df() -> pl.DataFrame:
     cols, rows = _NAV_ROWS["columns"], _NAV_ROWS["rows"]
-    data = {col: [r[i] for r in rows] for i, col in enumerate(cols)}
-    return pl.DataFrame(data, schema_overrides={"ts": pl.Int64})
+    return _frame_from(cols, rows)
 
 
 def _flow_ts() -> list[int]:
@@ -202,15 +204,15 @@ def _expected_series() -> list[tuple[int, float]]:
 # Acceptance tests
 # ---------------------------------------------------------------------------
 
-def test_acceptance_scalar() -> None:
-    """Full register->fetch->call->frame path for a TWR scalar matches direct lib."""
-    gw, gw_url = _serve_gateway(_STUB_ROWS)
-    srv, base = _serve_compute(gw_url)
+def test_acceptance_scalar(monkeypatch) -> None:
+    """Full register->sql()->call->frame path for a TWR scalar matches direct lib."""
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+    monkeypatch.setattr(rwclient, "query", _make_query_stub({"nav": _NAV_ROWS, "flows": _FLOWS_ROWS}))
+    srv, base = _serve_compute()
     try:
-        status, body = _post_compute(base, {"source": _SCALAR_SRC, "jwt": "tok", "window": _WINDOW})
+        status, body = _post_compute(base, {"source": _SCALAR_SRC, "window": _WINDOW})
     finally:
         srv.shutdown()
-        gw.shutdown()
 
     assert status == 200, f"expected 200, got {status}: {body}"
     assert body["output"] == "scalar"
@@ -223,15 +225,15 @@ def test_acceptance_scalar() -> None:
     )
 
 
-def test_acceptance_series() -> None:
-    """Full register->fetch->call->frame path for cumulative_twr series matches direct lib."""
-    gw, gw_url = _serve_gateway(_STUB_ROWS)
-    srv, base = _serve_compute(gw_url)
+def test_acceptance_series(monkeypatch) -> None:
+    """Full register->sql()->call->frame path for cumulative_twr series matches direct lib."""
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+    monkeypatch.setattr(rwclient, "query", _make_query_stub({"nav": _NAV_ROWS, "flows": _FLOWS_ROWS}))
+    srv, base = _serve_compute()
     try:
-        status, body = _post_compute(base, {"source": _SERIES_SRC, "jwt": "tok", "window": _WINDOW})
+        status, body = _post_compute(base, {"source": _SERIES_SRC, "window": _WINDOW})
     finally:
         srv.shutdown()
-        gw.shutdown()
 
     assert status == 200, f"expected 200, got {status}: {body}"
     assert body["output"] == "series"
@@ -254,7 +256,7 @@ def test_acceptance_series() -> None:
 # Two equity curves (portfolio + benchmark) with known daily returns.
 # The panel calls cumulative_to_period_returns, builds r_p/r_b DataFrames,
 # calls rolling_regression_stats, and returns the beta series as
-# list[tuple[int, float|None]] — exercising the new list[tuple] framing path.
+# list[tuple[int, float|None]] — exercising the list[tuple] framing path.
 # ---------------------------------------------------------------------------
 
 # Daily cumulative returns for 6 days.
@@ -286,26 +288,17 @@ _BENCHMARK_CUM_ROWS = {
     ],
 }
 
-_SEL_PORTFOLIO_CUM = "cumret{portfolio=\"$p\"}"
-_SEL_BENCHMARK_CUM = "cumret{benchmark=\"$b\"}"
-
-_BETA_STUB_ROWS = {
-    _SEL_PORTFOLIO_CUM: _PORTFOLIO_CUM_ROWS,
-    _SEL_BENCHMARK_CUM: _BENCHMARK_CUM_ROWS,
-}
-
 _BETA_WINDOW = {"from": 0, "to": 5 * _D6}
 
 # The panel converts cumulative series → per-period return DataFrames, runs
 # rolling regression with lookback=3, and returns the beta series directly as
 # list[tuple[int, float|None]] — no manual pl.DataFrame wrapping.
 _BETA_SRC = r"""
-@bind(
-    portfolio="cumret{portfolio=\"$p\"} @window",
-    benchmark="cumret{benchmark=\"$b\"} @window",
-)
 @metric(output="series")
-def rolling_beta(portfolio, benchmark):
+def rolling_beta():
+    portfolio = sql("SELECT * FROM portfolio_cum WHERE portfolio = $1", "port-A")
+    benchmark = sql("SELECT * FROM benchmark_cum WHERE benchmark = $1", "bench-X")
+
     # cumulative_to_period_returns expects list[tuple[int, float|None]]
     port_cum = portfolio.rows()
     bench_cum = benchmark.rows()
@@ -330,8 +323,6 @@ def rolling_beta(portfolio, benchmark):
 
 def _expected_beta_series() -> list[tuple[int, float | None]]:
     """Direct library call on the same canned data."""
-    import polars as pl
-
     port_rows = _PORTFOLIO_CUM_ROWS["rows"]
     bench_rows = _BENCHMARK_CUM_ROWS["rows"]
 
@@ -355,17 +346,31 @@ def _expected_beta_series() -> list[tuple[int, float | None]]:
     return [(ts_col[i], s.beta if s is not None else None) for i, s in enumerate(stats)]
 
 
-def test_acceptance_beta_rolling_series() -> None:
+def _make_beta_query_stub():
+    def _query(conn, sql: str, params: tuple = ()) -> pl.DataFrame:
+        if "rw_catalog" in sql:
+            return pl.DataFrame({"name": ["portfolio_cum", "benchmark_cum"]})
+        if "information_schema" in sql:
+            return pl.DataFrame({"name": []})
+        if "portfolio_cum" in sql:
+            return _frame_from(_PORTFOLIO_CUM_ROWS["columns"], _PORTFOLIO_CUM_ROWS["rows"])
+        if "benchmark_cum" in sql:
+            return _frame_from(_BENCHMARK_CUM_ROWS["columns"], _BENCHMARK_CUM_ROWS["rows"])
+        return pl.DataFrame()
+    return _query
+
+
+def test_acceptance_beta_rolling_series(monkeypatch) -> None:
     """Full compute path for rolling beta framed as list[tuple] matches direct lib."""
-    gw, gw_url = _serve_gateway(_BETA_STUB_ROWS)
-    srv, base = _serve_compute(gw_url)
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+    monkeypatch.setattr(rwclient, "query", _make_beta_query_stub())
+    srv, base = _serve_compute()
     try:
         status, body = _post_compute(
-            base, {"source": _BETA_SRC, "jwt": "tok", "window": _BETA_WINDOW}
+            base, {"source": _BETA_SRC, "window": _BETA_WINDOW}
         )
     finally:
         srv.shutdown()
-        gw.shutdown()
 
     assert status == 200, f"expected 200, got {status}: {body}"
     assert body["output"] == "series"
@@ -405,18 +410,14 @@ _CASHFLOW_ROWS = {
     ],
 }
 
-_SEL_CASHFLOWS = "cashflow{portfolio=\"$p\"}"
-
-_XIRR_STUB_ROWS = {_SEL_CASHFLOWS: _CASHFLOW_ROWS}
-
 _XIRR_WINDOW = {"from": 0, "to": _XIRR_YEAR_US}
 
 # The panel builds signed flows (deposits negative, receipt positive)
 # and returns xirr(...) as a scalar directly.
 _XIRR_SRC = r"""
-@bind(flows="cashflow{portfolio=\"$p\"} @window")
 @metric(output="scalar")
-def portfolio_xirr(flows):
+def portfolio_xirr():
+    flows = sql("SELECT * FROM cashflow WHERE portfolio = $1", "port-A")
     ts_col = flows["ts"].to_list()
     amt_col = flows["amount"].to_list()
     n = len(ts_col)
@@ -442,17 +443,17 @@ def _expected_xirr() -> float | None:
     return xirr(signed)
 
 
-def test_acceptance_xirr_scalar() -> None:
+def test_acceptance_xirr_scalar(monkeypatch) -> None:
     """Full compute path for xirr scalar matches direct lib call on same cashflows."""
-    gw, gw_url = _serve_gateway(_XIRR_STUB_ROWS)
-    srv, base = _serve_compute(gw_url)
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+    monkeypatch.setattr(rwclient, "query", _make_query_stub({"cashflow": _CASHFLOW_ROWS}))
+    srv, base = _serve_compute()
     try:
         status, body = _post_compute(
-            base, {"source": _XIRR_SRC, "jwt": "tok", "window": _XIRR_WINDOW}
+            base, {"source": _XIRR_SRC, "window": _XIRR_WINDOW}
         )
     finally:
         srv.shutdown()
-        gw.shutdown()
 
     assert status == 200, f"expected 200, got {status}: {body}"
     assert body["output"] == "scalar"

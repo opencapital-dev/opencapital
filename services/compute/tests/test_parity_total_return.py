@@ -1,9 +1,9 @@
 """Headless parity proof for the total_return Python panel source.
 
 Drives the decorated total_return source through the REAL /compute path
-(in-process ComputeServer + stub /v1/rows gateway serving canned NAV + flows
-rows) and asserts the returned scalar equals the value computed by calling the
-metric library DIRECTLY on the same canned data.
+(in-process ComputeServer + stubbed rwclient serving canned NAV + flows rows)
+and asserts the returned scalar equals the value computed by calling the metric
+library DIRECTLY on the same canned data.
 
 The algorithm is the same as the numbat total_return panel
 (the metric reference):
@@ -25,13 +25,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import polars as pl
 import pytest
 
 from compute.metrics import build_grid, cumulative_twr
 from compute.server import ComputeServer
+from compute import rwclient
+from compute.rwclient import _frame_from
 
 
 # ---------------------------------------------------------------------------
@@ -72,22 +73,16 @@ _FLOWS_ROWS = {
     "rows": [["org-1", "port-A", _D, "DEPOSIT", 600.0]],
 }
 
-_SEL_NAV   = "nav{portfolio=\"$portfolio_id\"}"
-_SEL_FLOWS = "flows{portfolio=\"$portfolio_id\"}"
-
-_STUB_ROWS = {_SEL_NAV: _NAV_ROWS, _SEL_FLOWS: _FLOWS_ROWS}
-
 # Window deliberately opens one day BEFORE portfolio inception to exercise the
 # effective-start clamp (max(t0, first_nav_ts) = max(-1d, 0) = 0).
 _WINDOW = {"from": -_D, "to": 3 * _D}
 
-# The reference panel source — identical to
-# the metric reference with variable
-# names matching the canned selectors.
+# The reference panel source — uses sql() to pull data (new contract).
 _SOURCE = r"""
-@bind(nav="nav{portfolio=\"$portfolio_id\"} @asof", flows="flows{portfolio=\"$portfolio_id\"} @window")
 @metric(output="scalar")
-def total_return(nav, flows):
+def total_return():
+    nav = sql("SELECT * FROM nav WHERE portfolio = $1", "port-A")
+    flows = sql("SELECT * FROM flows WHERE portfolio = $1", "port-A")
     t0, t1 = window
     effective_start = t0 if nav.is_empty() else max(t0, nav["ts"][0])
     flow_ts = [r[0] for r in flows.select("ts").rows() if r[0] > effective_start]
@@ -98,33 +93,27 @@ def total_return(nav, flows):
 
 
 # ---------------------------------------------------------------------------
-# Stub gateway + compute server (same pattern as test_acceptance.py)
+# rwclient stub + compute server helpers
 # ---------------------------------------------------------------------------
 
-def _make_gateway(rows_by_selector: dict):
-    class _Stub(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length))
-            selector = req["selector"]
-            doc = rows_by_selector.get(selector, {"columns": ["ts"], "rows": []})
-            body = json.dumps(doc).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a: object) -> None:
-            pass
-
-    return _Stub
+class _FakeConn:
+    """Stub pg8000 connection for tests — has a no-op close()."""
+    def close(self):
+        pass
 
 
-def _serve_gateway(rows_by_selector: dict):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_gateway(rows_by_selector))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, f"http://127.0.0.1:{server.server_address[1]}"
+def _make_query_stub():
+    def _query(conn, sql: str, params: tuple = ()) -> pl.DataFrame:
+        if "rw_catalog" in sql:
+            return pl.DataFrame({"name": ["nav", "flows"]})
+        if "information_schema" in sql:
+            return pl.DataFrame({"name": []})
+        if "nav" in sql:
+            return _frame_from(_NAV_ROWS["columns"], _NAV_ROWS["rows"])
+        if "flows" in sql:
+            return _frame_from(_FLOWS_ROWS["columns"], _FLOWS_ROWS["rows"])
+        return pl.DataFrame()
+    return _query
 
 
 def _free_port() -> int:
@@ -144,9 +133,9 @@ def _wait_ready(url: str, timeout: float = 2.0) -> None:
     raise TimeoutError(f"server not ready at {url}")
 
 
-def _serve_compute(gateway_url: str):
+def _serve_compute():
     port = _free_port()
-    server = ComputeServer(host="127.0.0.1", port=port, gateway_url=gateway_url)
+    server = ComputeServer(host="127.0.0.1", port=port, dsn="dsn://stub")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
     _wait_ready(base + "/health")
@@ -171,9 +160,7 @@ def _post_compute(base: str, body: dict) -> tuple[int, dict]:
 # ---------------------------------------------------------------------------
 
 def _nav_df() -> pl.DataFrame:
-    cols, rows = _NAV_ROWS["columns"], _NAV_ROWS["rows"]
-    data = {col: [r[i] for r in rows] for i, col in enumerate(cols)}
-    return pl.DataFrame(data, schema_overrides={"ts": pl.Int64})
+    return _frame_from(_NAV_ROWS["columns"], _NAV_ROWS["rows"])
 
 
 def _expected_total_return() -> float | None:
@@ -192,7 +179,7 @@ def _expected_total_return() -> float | None:
 # Parity test
 # ---------------------------------------------------------------------------
 
-def test_parity_total_return() -> None:
+def test_parity_total_return(monkeypatch) -> None:
     """total_return panel source round-trips through real /compute and matches direct lib.
 
     Proves the decorated Python source computes the same value as calling
@@ -200,16 +187,16 @@ def test_parity_total_return() -> None:
     the same algorithm the numbat total_return panel uses (cum_twr_grid →
     total_return(cum)).
 
-    The stub gateway serves canned rows; ComputeServer runs in-process.
+    The stub rwclient serves canned rows; ComputeServer runs in-process.
     Effective-start clamping is exercised (window opens before portfolio inception).
     """
-    gw, gw_url = _serve_gateway(_STUB_ROWS)
-    srv, base = _serve_compute(gw_url)
+    monkeypatch.setattr(rwclient, "connect", lambda dsn: _FakeConn())
+    monkeypatch.setattr(rwclient, "query", _make_query_stub())
+    srv, base = _serve_compute()
     try:
-        status, body = _post_compute(base, {"source": _SOURCE, "jwt": "tok", "window": _WINDOW})
+        status, body = _post_compute(base, {"source": _SOURCE, "window": _WINDOW})
     finally:
         srv.shutdown()
-        gw.shutdown()
 
     assert status == 200, f"expected 200, got {status}: {body}"
     assert body["output"] == "scalar"

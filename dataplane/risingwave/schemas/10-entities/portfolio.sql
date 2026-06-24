@@ -1,6 +1,5 @@
 CREATE VIEW IF NOT EXISTS e_portfolio AS
 SELECT
-    org_id,
     scope_id                                          AS portfolio,
     (extract(epoch from event_ts) * 1000000)::bigint  AS ts,
     base_currency,

@@ -55,7 +55,7 @@ mod windows_impl {
     use tauri::{AppHandle, Emitter};
 
     use crate::config::AppConfig;
-    use crate::dataplane::{health_tcp, supervise, CP_PORT, GW_PORT, HEALTH_TIMEOUT, RG_PORT, RW_PORT};
+    use crate::dataplane::{health_tcp, supervise, HEALTH_TIMEOUT, RW_PORT};
     use crate::proxy::Shared;
     use crate::runtime;
 
@@ -82,16 +82,11 @@ mod windows_impl {
         progress("Starting in-distro data plane…");
         *shared.wsl_child.lock().unwrap() = Some(spawn_supervisor(cfg)?);
 
-        // The supervisor brings services up in order; health-check each on its
-        // host-reachable loopback port (WSL2 NAT forwards localhost).
-        for (name, port) in [
-            ("control-plane", CP_PORT),
-            ("risingwave", RW_PORT),
-            ("gateway", GW_PORT),
-            ("read-gateway", RG_PORT),
-        ] {
-            health_tcp(port, HEALTH_TIMEOUT).map_err(|e| format!("{name}: {e}"))?;
-        }
+        // The supervisor brings services up in order; health-check RisingWave
+        // on its host-reachable loopback port (WSL2 NAT forwards localhost).
+        // control-plane has been removed; portfolios DDL is now applied by
+        // bootstrap_control_db in dataplane.rs.
+        health_tcp(RW_PORT, HEALTH_TIMEOUT).map_err(|e| format!("risingwave: {e}"))?;
 
         let c = cfg.clone();
         supervise(app.clone(), shared.clone(), |s| &s.wsl_child, "wsl-dataplane", RW_PORT,
@@ -142,22 +137,18 @@ mod windows_impl {
         Ok(())
     }
 
-    /// spawn_supervisor runs the in-distro supervisor as the `dataplane` user,
-    /// forwarding the host's Kinde tenant + GHCR config into the distro via
-    /// WSLENV (so the in-distro control-plane validates the SAME Kinde tokens
-    /// the shell logs in with). The child is long-lived — it blocks on `wait`
-    /// inside the distro keeping services alive — so the crash monitor wait()s
-    /// on it like any other data-plane child.
+    /// spawn_supervisor runs the in-distro supervisor as the `dataplane` user.
+    /// GHCR config is forwarded via WSLENV for future plugin-registry use.
+    /// The child is long-lived — it blocks on `wait` inside the distro keeping
+    /// services alive — so the crash monitor wait()s on it like any other
+    /// data-plane child.
     fn spawn_supervisor(cfg: &AppConfig) -> Result<Child, String> {
         let log = log_file(cfg, "wsl-supervisor.log")?;
         let err = log.try_clone().map_err(|e| format!("clone log: {e}"))?;
-        let domain = cfg.kinde_domain.trim_end_matches('/');
 
         let mut cmd = wsl();
         cmd.args(["-d", DISTRO, "-u", "dataplane", "--", "/opt/opencapital/supervisor.sh"])
-            .env("WSLENV", "KINDE_DOMAIN/u:KINDE_AUDIENCE/u:REGISTRY_OWNER/u:REGISTRY_PASSWORD/u")
-            .env("KINDE_DOMAIN", domain)
-            .env("KINDE_AUDIENCE", &cfg.kinde_audience)
+            .env("WSLENV", "REGISTRY_OWNER/u:REGISTRY_PASSWORD/u")
             .env("REGISTRY_OWNER", "opencapital-dev");
         if let Ok(tok) = std::env::var("REGISTRY_PASSWORD") {
             cmd.env("REGISTRY_PASSWORD", tok);

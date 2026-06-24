@@ -1,17 +1,3 @@
-export type Org = {
-  org_id: string;
-  short_id: string;
-  name: string;
-  role: string;
-  base_currency: string;
-};
-
-export type MeOrgs = {
-  user_id: string;
-  email: string;
-  orgs: Org[];
-};
-
 export type KindeProfile = {
   id: string;
   preferred_email?: string;
@@ -19,8 +5,6 @@ export type KindeProfile = {
   last_name?: string;
   picture?: string;
 };
-
-export type VersionStatus = { version: string; validated: boolean };
 
 export type SourceInfo = {
   url: string;
@@ -49,6 +33,5 @@ export type PluginSource = {
 };
 
 export type Catalog = {
-  org_id: string;
   plugins: CatalogEntry[];
 };

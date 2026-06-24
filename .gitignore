@@ -63,3 +63,8 @@ lib/instance-bootstrap/instance-bootstrap
 
 # Compiled command binaries (built on demand from cmd/*).
 services/gateway/rekey-portfolio-events
+
+# SDD scratch + build artifacts
+.superpowers/
+services/compute/build/
+services/compute/dist/

@@ -30,7 +30,8 @@ struct SpawnSpec {
     bin: PathBuf,
     host: String,
     port: u16,
-    read_gateway_url: String,
+    risingwave_dsn: String,
+    postgres_dsn: String,
     log_path: PathBuf,
 }
 
@@ -49,7 +50,8 @@ pub fn start(app: &AppHandle, cfg: &AppConfig, shared: &Arc<Shared>) -> Result<u
         bin,
         host: "127.0.0.1".into(),
         port,
-        read_gateway_url: cfg.read_gateway_url.clone(),
+        risingwave_dsn: cfg.risingwave_dsn.clone(),
+        postgres_dsn: cfg.postgres_dsn.clone(),
         log_path,
     };
 
@@ -99,14 +101,26 @@ fn host_target_triple() -> &'static str {
     env!("TARGET_TRIPLE")
 }
 
+/// compute_env returns the environment variable pairs that the compute sidecar
+/// is launched with. Extracted as a pure helper so it can be unit-tested
+/// without needing a real binary or filesystem.
+fn compute_env(spec: &SpawnSpec) -> Vec<(String, String)> {
+    vec![
+        ("COMPUTE_HOST".into(), spec.host.clone()),
+        ("COMPUTE_PORT".into(), spec.port.to_string()),
+        ("RISINGWAVE_DSN".into(), spec.risingwave_dsn.clone()),
+        ("POSTGRES_DSN".into(), spec.postgres_dsn.clone()),
+    ]
+}
+
 fn spawn_compute(spec: &SpawnSpec) -> Result<Child, String> {
     let log = fs::File::create(&spec.log_path).map_err(|e| format!("open compute log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("clone log handle: {e}"))?;
     let mut cmd = Command::new(&spec.bin);
-    cmd.env("COMPUTE_HOST", &spec.host)
-        .env("COMPUTE_PORT", spec.port.to_string())
-        .env("READ_GATEWAY_URL", &spec.read_gateway_url)
-        .stdout(Stdio::from(log))
+    for (k, v) in compute_env(spec) {
+        cmd.env(k, v);
+    }
+    cmd.stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     cmd.spawn().map_err(|e| format!("spawn compute sidecar: {e}"))
 }
@@ -179,6 +193,43 @@ fn free_port() -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_spec(port: u16) -> SpawnSpec {
+        SpawnSpec {
+            bin: PathBuf::from("/nonexistent/compute"),
+            host: "127.0.0.1".into(),
+            port,
+            risingwave_dsn: "postgres://root:root@localhost:4566/dev?sslmode=disable".into(),
+            postgres_dsn: "postgres://postgres@127.0.0.1:5432/control_db?sslmode=disable".into(),
+            log_path: PathBuf::from("/tmp/compute.log"),
+        }
+    }
+
+    #[test]
+    fn compute_env_contains_risingwave_dsn() {
+        let spec = test_spec(9100);
+        let env = compute_env(&spec);
+        let val = env.iter().find(|(k, _)| k == "RISINGWAVE_DSN").map(|(_, v)| v.as_str());
+        assert_eq!(val, Some("postgres://root:root@localhost:4566/dev?sslmode=disable"));
+    }
+
+    #[test]
+    fn compute_env_contains_postgres_dsn_for_control_db() {
+        let spec = test_spec(9100);
+        let env = compute_env(&spec);
+        let val = env.iter().find(|(k, _)| k == "POSTGRES_DSN").map(|(_, v)| v.as_str());
+        assert_eq!(val, Some("postgres://postgres@127.0.0.1:5432/control_db?sslmode=disable"));
+    }
+
+    #[test]
+    fn compute_env_contains_host_and_port() {
+        let spec = test_spec(8765);
+        let env = compute_env(&spec);
+        let host = env.iter().find(|(k, _)| k == "COMPUTE_HOST").map(|(_, v)| v.as_str());
+        let port = env.iter().find(|(k, _)| k == "COMPUTE_PORT").map(|(_, v)| v.as_str());
+        assert_eq!(host, Some("127.0.0.1"));
+        assert_eq!(port, Some("8765"));
+    }
 
     #[test]
     fn free_port_returns_distinct_bindable_ports() {

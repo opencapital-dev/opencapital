@@ -11,7 +11,6 @@
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS instruments_used AS
     SELECT
-        org_id,
         portfolio_id,
         instrument_id,
         MIN(business_ts)   AS first_seen_ts,
@@ -22,4 +21,4 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS instruments_used AS
       AND instrument_id NOT LIKE 'CASH:%'
       AND instrument_id NOT LIKE 'FX:%'
       AND event_type IN ('TRADE', 'TRANSFER_IN', 'DIVIDEND')
-    GROUP BY org_id, portfolio_id, instrument_id;
+    GROUP BY portfolio_id, instrument_id;

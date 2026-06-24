@@ -1,22 +1,16 @@
 import { ReactNode } from "react";
 import { css } from "@emotion/css";
 import { GrafanaTheme2 } from "@grafana/data";
-import { Button, Dropdown, Icon, IconName, Menu, Text, useStyles2 } from "@grafana/ui";
+import { Dropdown, Icon, IconName, Menu, Text, useStyles2 } from "@grafana/ui";
 import { Brand } from "./Brand";
-import { OrgSwitcher } from "./OrgSwitcher";
-import type { Org } from "../types";
 
 export type NavKey = "launch" | "plugins" | "sources" | "settings";
 
 type Props = {
   displayName: string;
-  orgs: Org[];
-  selectedOrg: Org | null;
   nav: NavKey;
   busy: boolean;
   onNav: (key: NavKey) => void;
-  onSelectOrg: (org: Org) => void;
-  onCreateOrg: () => void;
   onLogout: () => void;
   children: ReactNode;
 };
@@ -30,13 +24,9 @@ const NAV: Array<{ key: NavKey; label: string; icon: IconName }> = [
 
 export function AppShell({
   displayName,
-  orgs,
-  selectedOrg,
   nav,
-  busy,
+  busy: _busy,
   onNav,
-  onSelectOrg,
-  onCreateOrg,
   onLogout,
   children,
 }: Props) {
@@ -55,13 +45,6 @@ export function AppShell({
       <header className={styles.topbar}>
         <Brand />
         <div className={styles.topRight}>
-          <OrgSwitcher
-            orgs={orgs}
-            selected={selectedOrg}
-            disabled={busy}
-            onSelect={onSelectOrg}
-            onCreate={onCreateOrg}
-          />
           <Dropdown overlay={userMenu} placement="bottom-end">
             <button className={styles.identity} type="button" title={displayName}>
               <span className={styles.avatar}>
@@ -93,29 +76,9 @@ export function AppShell({
         </nav>
 
         <main className={styles.content}>
-          {selectedOrg ? children : <NoOrg onCreate={onCreateOrg} />}
+          {children}
         </main>
       </div>
-    </div>
-  );
-}
-
-function NoOrg({ onCreate }: { onCreate: () => void }) {
-  const styles = useStyles2(getStyles);
-  return (
-    <div className={styles.noOrg}>
-      <span className={styles.noOrgIcon}>
-        <Icon name="folder-open" size="xxl" />
-      </span>
-      <div className={styles.noOrgCopy}>
-        <Text element="h2" variant="h4">
-          No workspace selected
-        </Text>
-        <Text color="secondary">Pick a workspace above, or create your first one.</Text>
-      </div>
-      <Button icon="plus" onClick={onCreate}>
-        New workspace
-      </Button>
     </div>
   );
 }
@@ -237,32 +200,6 @@ const getStyles = (theme: GrafanaTheme2) => {
       overflowY: "auto",
       overflowX: "hidden",
       padding: theme.spacing(4),
-    }),
-    noOrg: css({
-      height: "100%",
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "center",
-      justifyContent: "center",
-      gap: theme.spacing(3),
-      textAlign: "center",
-    }),
-    noOrgIcon: css({
-      display: "inline-flex",
-      alignItems: "center",
-      justifyContent: "center",
-      width: 72,
-      height: 72,
-      borderRadius: theme.shape.radius.circle,
-      color: theme.colors.primary.text,
-      background: theme.colors.primary.transparent,
-      boxShadow: `inset 0 0 0 1px ${theme.colors.primary.borderTransparent}`,
-    }),
-    noOrgCopy: css({
-      display: "flex",
-      flexDirection: "column",
-      gap: theme.spacing(0.5),
-      maxWidth: 360,
     }),
   };
 };

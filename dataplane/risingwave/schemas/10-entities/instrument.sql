@@ -1,7 +1,6 @@
 -- irr_annualized is absent from instrument_per_tick; excluded here.
 CREATE VIEW IF NOT EXISTS e_instrument AS
 SELECT
-    org_id,
     scope_id                                          AS portfolio,
     instrument_id                                     AS instrument,
     (extract(epoch from event_ts) * 1000000)::bigint  AS ts,

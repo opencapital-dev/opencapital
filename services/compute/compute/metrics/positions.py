@@ -1,6 +1,6 @@
 """Per-instrument position table reconstruction.
 
-Replaces the retired ``positions`` rw_template: the read-gateway now serves only
+Replaces the retired ``positions`` rw_template: RisingWave now serves only
 raw scoped views, so the per-instrument summary that fed the position_stats
 panels is reconstructed here from four normalized views.
 

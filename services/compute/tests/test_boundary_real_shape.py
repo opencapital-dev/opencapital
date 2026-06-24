@@ -1,9 +1,9 @@
-"""Regression guard: real /v1/rows view shape through gateway -> DataFrame -> metric.
+"""Regression guard: real RisingWave view shape through rwclient -> DataFrame -> metric.
 
 The P2 test suite historically fed metric functions the REDUCED shape
 (only [ts, value] or [ts]) rather than the real normalized view columns
-that the read-gateway actually emits. This test pins the live contract
-end-to-end so that any ts/column mismatch would surface here first.
+that RisingWave actually emits. This test pins the live contract end-to-end
+so that any ts/column mismatch would surface here first.
 
 Shapes verified:
   e_nav   : org_id, portfolio, ts (Int64 µs), value
@@ -18,15 +18,10 @@ A test that passed under the old shape (ts as string, value column named
 
 from __future__ import annotations
 
-import json
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
 import polars as pl
 import pytest
 
-from compute.contract import Binding, Window
-from compute.gateway import fetch_rows, _frame_from
+from compute.rwclient import _frame_from
 from compute.metrics.twr import asof, twr
 from compute.metrics.returns import cumulative_twr, build_grid
 
@@ -70,45 +65,6 @@ _E_FLOWS_PAYLOAD = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Stub gateway
-# ---------------------------------------------------------------------------
-
-_SEL_NAV   = "nav{portfolio=\"$p\"}"
-_SEL_FLOWS = "flows{portfolio=\"$p\"}"
-
-_STUB = {_SEL_NAV: _E_NAV_PAYLOAD, _SEL_FLOWS: _E_FLOWS_PAYLOAD}
-
-
-def _make_handler(rows_by_selector: dict):
-    class _Stub(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length))
-            doc = rows_by_selector.get(req["selector"], {"columns": ["ts"], "rows": []})
-            body = json.dumps(doc).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a: object) -> None:
-            pass
-
-    return _Stub
-
-
-def _serve(rows_by_selector: dict):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(rows_by_selector))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, f"http://127.0.0.1:{server.server_address[1]}"
-
-
-# ---------------------------------------------------------------------------
-# T8: boundary tests
-# ---------------------------------------------------------------------------
-
 def test_frame_from_real_nav_shape_ts_is_int64() -> None:
     """_frame_from emits Int64 ts and a value column from the real e_nav payload."""
     cols, rows = _E_NAV_PAYLOAD["columns"], _E_NAV_PAYLOAD["rows"]
@@ -133,21 +89,6 @@ def test_frame_from_real_flows_shape_ts_is_int64() -> None:
     assert df.schema["ts"] == pl.Int64
     assert set(df.columns) == {"org_id", "portfolio", "ts", "flow_type", "amt"}
     assert df["ts"][0] == _FLOW
-
-
-def test_fetch_rows_real_nav_shape_via_stub() -> None:
-    """fetch_rows through a stub returning real e_nav shape yields correct frame."""
-    server, base_url = _serve(_STUB)
-    try:
-        binding = Binding(_SEL_NAV, "window")
-        df = fetch_rows(base_url, "tok", binding, Window(_T0, _T1))
-    finally:
-        server.shutdown()
-
-    assert df.schema["ts"] == pl.Int64
-    assert "value" in df.columns
-    assert "org_id" in df.columns
-    assert df.height == 5
 
 
 def test_twr_metric_over_real_nav_shape() -> None:

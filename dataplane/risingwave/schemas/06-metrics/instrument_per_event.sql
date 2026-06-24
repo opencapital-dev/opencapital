@@ -19,23 +19,20 @@
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS instrument_per_event AS
 WITH fold_per_ts AS (
-    -- Collapse to one fold_per_event row per (org_id, portfolio_id,
+    -- Collapse to one fold_per_event row per (portfolio_id,
     -- business_ts) by picking the largest source_id at that business_ts.
     -- The OverWindow operator orders within a business_ts by source_id, so
-    -- the max-source_id row carries the latest cumulative state. v6 keys
-    -- the collapse on org_id too so the same portfolio_id in two orgs
-    -- does not race.
-    SELECT fpe.org_id, fpe.portfolio_id, fpe.business_ts, fpe.source_id, fpe.fold_result
+    -- the max-source_id row carries the latest cumulative state.
+    SELECT fpe.portfolio_id, fpe.business_ts, fpe.source_id, fpe.fold_result
     FROM fold_per_event fpe
     JOIN (
-        SELECT org_id, portfolio_id, business_ts, MAX(source_id) AS source_id
+        SELECT portfolio_id, business_ts, MAX(source_id) AS source_id
         FROM fold_per_event
-        GROUP BY org_id, portfolio_id, business_ts
-    ) m USING (org_id, portfolio_id, business_ts, source_id)
+        GROUP BY portfolio_id, business_ts
+    ) m USING (portfolio_id, business_ts, source_id)
 ),
 unpacked AS (
     SELECT
-        fpe.org_id                                                AS org_id,
         fpe.portfolio_id                                          AS scope_id,
         (ep ->> 'instrument_id')                                  AS instrument_id,
         fpe.business_ts                                           AS event_ts,
@@ -59,7 +56,6 @@ unpacked AS (
          jsonb_array_elements((fpe.fold_result).snapshot -> 'equity_positions') AS t(ep)
 )
 SELECT
-    u.org_id,
     u.scope_id,
     u.instrument_id,
     u.event_ts,
@@ -74,6 +70,5 @@ SELECT
     u.realized_forex_fifo_base,    u.realized_forex_avg_base
 FROM unpacked u
 LEFT JOIN instruments i
-    ON  i.org_id        = u.org_id
-    AND i.portfolio_id  = u.scope_id
+    ON  i.portfolio_id  = u.scope_id
     AND i.instrument_id = u.instrument_id;

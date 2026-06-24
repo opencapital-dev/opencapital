@@ -2,7 +2,6 @@
 -- amount_native is always a positive magnitude; direction is in the event type.
 CREATE VIEW IF NOT EXISTS e_flows AS
 SELECT
-    org_id,
     portfolio_id                                            AS portfolio,
     (extract(epoch from business_ts) * 1000000)::bigint     AS ts,
     COALESCE(payload ->> 'type', event_type)                AS flow_type,

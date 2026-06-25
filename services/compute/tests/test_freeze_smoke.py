@@ -174,6 +174,64 @@ def test_frozen_binary_plan_exercises_sqlglot() -> None:
         proc.wait(timeout=5)
 
 
+_REQUESTS_SOURCE = """\
+@metric(output="scalar")
+def requests_smoke():
+    import requests
+    return 1.0
+"""
+
+
+@pytest.mark.freeze
+@pytest.mark.timeout(60)
+def test_frozen_binary_has_requests() -> None:
+    """Prove that the ``requests`` package is bundled in the frozen binary.
+
+    POSTs a /compute source that does ``import requests`` at call time and
+    returns 1.0 as a scalar.  A 200 response + value 1.0 proves requests (and
+    its certifi dependency) survived the PyInstaller freeze.
+    """
+    binary = os.path.abspath(_BINARY)
+    assert os.path.isfile(binary), f"frozen binary not found: {binary!r} — run make compute-freeze first"
+
+    port = _free_port()
+    env = {**os.environ, "COMPUTE_PORT": str(port), "COMPUTE_HOST": "127.0.0.1"}
+
+    proc = subprocess.Popen(
+        [binary],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        health_url = f"http://127.0.0.1:{port}/health"
+        _wait_ready(health_url, timeout=30.0)
+
+        payload = json.dumps({
+            "source": _REQUESTS_SOURCE,
+            "jwt": "smoke-test-token",
+            "window": {"from": 0, "to": 999_999_999_999},
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/compute",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            result = json.loads(resp.read())
+
+        assert result.get("output") == "scalar", f"unexpected response: {result}"
+        # scalar output format: {"output": "scalar", "columns": ["value"], "rows": [[<val>]]}
+        rows = result.get("rows", [])
+        assert rows and rows[0][0] == 1.0, f"unexpected value in response: {result}"
+
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 # Source with an auto-routed @bind — triggers sqlglot.parse_one(sql, read="postgres")
 # inside store.run() before any DB catalog query is attempted.
 _DIALECT_SOURCE = """\

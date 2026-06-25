@@ -191,6 +191,7 @@ def test_namespace_surface_is_exactly_the_curated_set() -> None:
         set(metrics.__all__)
         | {"metric", "bind", "window", "pl", "sql", "rw", "pg"}
         | {"prod", "pairwise", "sorted", "math"}
+        | {"fetch_json"}
     )
     assert set(ns) == expected
 
@@ -206,6 +207,8 @@ def test_namespace_surface_is_exactly_the_curated_set() -> None:
     assert callable(ns["sql"])
     for name in metrics.__all__:
         assert ns[name] is getattr(metrics, name)
+    from compute.httpfetch import fetch_json as _fetch_json
+    assert ns["fetch_json"] is _fetch_json
 
 
 def test_source_can_call_injected_curated_names() -> None:

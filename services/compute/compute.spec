@@ -32,16 +32,21 @@ rt32_datas, rt32_binaries, rt32_hiddenimports = collect_all('_polars_runtime_32'
 # dialect subpackage is included so frozen imports never raise ModuleNotFoundError.
 sqlglot_hiddenimports = collect_submodules('sqlglot')
 
+req_datas, req_binaries, req_hiddenimports = collect_all('requests')
+certifi_datas, certifi_binaries, certifi_hiddenimports = collect_all('certifi')
+
 a = Analysis(
     ['main.py'],
     pathex=[_compute_pkg],
-    binaries=polars_binaries + rt32_binaries,
-    datas=polars_datas + rt32_datas,
+    binaries=polars_binaries + rt32_binaries + req_binaries + certifi_binaries,
+    datas=polars_datas + rt32_datas + req_datas + certifi_datas,
     hiddenimports=(
         polars_hiddenimports
         + rt32_hiddenimports
         + collect_submodules('compute')
         + sqlglot_hiddenimports
+        + req_hiddenimports
+        + certifi_hiddenimports
         + [
             '_polars_runtime_32',
             '_polars_runtime_32._polars_runtime',
@@ -50,6 +55,8 @@ a = Analysis(
             'polars._cpu_check',
             'pg8000',
             'sqlglot',
+            'requests',
+            'certifi',
         ]
     ),
     hookspath=[],

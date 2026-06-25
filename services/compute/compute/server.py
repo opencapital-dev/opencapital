@@ -57,11 +57,18 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             result = run_compute(body, self.server.dsn, self.server.pg_dsn)
+            self._send_json(200, result)
         except ComputeError as exc:
             log.warning("compute: %s", exc.message)
             self._send_json(exc.status, {"error": exc.message})
-            return
-        self._send_json(200, result)
+        except Exception as exc:
+            # Never let an unexpected error (e.g. a result that is not
+            # JSON-serializable, like a datetime cell) kill the handler thread and
+            # drop the connection — that reaches the caller as an opaque EOF with
+            # no diagnostic. Return a visible 500. _send_json serializes before
+            # writing any bytes, so on a serialization failure nothing was sent yet.
+            log.exception("compute: unexpected error")
+            self._send_json(500, {"error": f"compute internal error: {exc}"})
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))

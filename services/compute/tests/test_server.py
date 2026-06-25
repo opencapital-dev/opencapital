@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from http import HTTPStatus
 
@@ -58,3 +60,34 @@ def test_env_driven_bind(monkeypatch: pytest.MonkeyPatch) -> None:
     server = ComputeServer.from_env()
     assert server.server_address == ("127.0.0.1", port)
     server.server_close()
+
+
+def test_unserializable_result_returns_500_not_dropped_connection() -> None:
+    # A metric returning a non-JSON-serializable cell (datetime) must surface as a
+    # visible 500, not a dropped connection (which reaches the caller as EOF).
+    port = _free_port()
+    server = ComputeServer(
+        host="127.0.0.1", port=port,
+        dsn="postgres://x@127.0.0.1:1/x", pg_dsn="postgres://x@127.0.0.1:1/x",
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    _wait_ready(base + "/health")
+    src = (
+        '@metric(output="series")\n'
+        "def m():\n"
+        "    import datetime\n"
+        '    return pl.DataFrame({"ts": [datetime.datetime(2024, 1, 1)], "value": [1.0]})\n'
+    )
+    body = json.dumps({"source": src, "window": {"from": 0, "to": 1}}).encode()
+    req = urllib.request.Request(
+        base + "/compute", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        code = urllib.request.urlopen(req, timeout=5).status
+    except urllib.error.HTTPError as exc:
+        code = exc.code  # a 500 is raised as HTTPError
+    finally:
+        server.shutdown()
+    assert code == 500

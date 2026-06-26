@@ -39,7 +39,7 @@ jobs:
         run: |
           cp .oc-release/scripts/release/plugin.releaserc.json .releaserc.json
           npx --yes -p semantic-release@24 -p @semantic-release/exec \
-            -p @semantic-release/git -p conventional-changelog-conventionalcommits \
+            -p @semantic-release/git -p conventional-changelog-conventionalcommits@^9 \
             semantic-release --dry-run
 
   build:
@@ -116,5 +116,5 @@ jobs:
           git checkout -- package.json package-lock.json 2>/dev/null || true
           cp .oc-release/scripts/release/plugin.releaserc.json .releaserc.json
           npx --yes -p semantic-release@24 -p @semantic-release/exec \
-            -p @semantic-release/git -p conventional-changelog-conventionalcommits \
+            -p @semantic-release/git -p conventional-changelog-conventionalcommits@^9 \
             semantic-release

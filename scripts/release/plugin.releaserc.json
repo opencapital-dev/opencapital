@@ -1,0 +1,24 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    ["@semantic-release/commit-analyzer", {
+      "preset": "conventionalcommits",
+      "releaseRules": [
+        { "breaking": true, "release": "major" },
+        { "type": "feat", "release": "minor" },
+        { "type": "fix", "release": "patch" }
+      ]
+    }],
+    ["@semantic-release/release-notes-generator", { "preset": "conventionalcommits" }],
+    ["@semantic-release/exec", {
+      "verifyReleaseCmd": "echo \"version=${nextRelease.version}\" >> \"$GITHUB_OUTPUT\"; echo \"released=true\" >> \"$GITHUB_OUTPUT\"",
+      "prepareCmd": "bash .oc-release/scripts/release/oc-plugin-version-prepend.sh ${nextRelease.version}"
+    }],
+    ["@semantic-release/git", {
+      "assets": ["oc-plugin.json"],
+      "message": "chore(release): ${nextRelease.version} [skip ci]"
+    }],
+    "@semantic-release/github"
+  ]
+}

@@ -9,13 +9,42 @@ name: opencapital-release
 
 on:
   push:
-    tags: ["opencapital-v*"]
+    branches: [main]
+    paths:
+      - "opencapital-app/**"
+      - "services/compute/**"
+      - "dataplane/**"
+      - "plugins.json"
+      - "Makefile"
+      - ".github/workflows/opencapital-release.yml"
 
 permissions:
   contents: write
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.sr.outputs.version }}
+      released: ${{ steps.sr.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: compute next version (dry-run)
+        id: sr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp scripts/release/app.releaserc.json .releaserc.json
+          npx --yes -p semantic-release@24 -p @semantic-release/exec \
+            -p @semantic-release/git -p conventional-changelog-conventionalcommits \
+            semantic-release --dry-run
+
   build:
+    needs: version
+    if: needs.version.outputs.released == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -33,15 +62,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Assert tag matches tauri.conf.json version
+      - name: Write release version into tauri.conf.json
         shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME#opencapital-v}"
-          cfg=$(node -p "require('./opencapital-app/src-tauri/tauri.conf.json').version")
-          echo "tag=$tag config=$cfg"
-          if [ "$tag" != "$cfg" ]; then
-            echo "::error::tag $tag != tauri.conf.json version $cfg"; exit 1
-          fi
+        run: bash scripts/release/write-tauri-version.sh "${{ needs.version.outputs.version }}"
 
       - uses: actions/setup-node@v4
         with:
@@ -100,7 +123,9 @@ jobs:
           bin=opencapital-app/src-tauri/binaries/compute-aarch64-apple-darwin
           COMPUTE_HOST=127.0.0.1 COMPUTE_PORT=8765 "$bin" &
           pid=$!
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 1; done
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1; then break; else sleep 1; fi
+          done
           test "$(curl -fsS http://127.0.0.1:8765/health)" = "ok"
           kill $pid
 
@@ -219,32 +244,33 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [version, build]
+    if: needs.version.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: Build latest.json and publish to opencapital
+      - name: Build latest.json
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASES_REPO: ${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          version="${REF_NAME#opencapital-v}"
-          tag="v${version}"
+          version="$VERSION"
+          tag="opencapital-v${version}"
           base="https://github.com/${RELEASES_REPO}/releases/download/${tag}"
           cd artifacts
-
-          mac_bundle=$(ls *.app.tar.gz 2>/dev/null | head -n1 || true)
-          mac_sig=$(ls *.app.tar.gz.sig 2>/dev/null | head -n1 || true)
-          win_bundle=$(ls *-setup.exe 2>/dev/null | head -n1 || true)
-          win_sig=$(ls *-setup.exe.sig 2>/dev/null | head -n1 || true)
-
+          mac_bundle=$(find . -maxdepth 1 -name '*.app.tar.gz' | sed 's|^\./||' | head -n1)
+          mac_sig=$(find . -maxdepth 1 -name '*.app.tar.gz.sig' | sed 's|^\./||' | head -n1)
+          win_bundle=$(find . -maxdepth 1 -name '*-setup.exe' | sed 's|^\./||' | head -n1)
+          win_sig=$(find . -maxdepth 1 -name '*-setup.exe.sig' | sed 's|^\./||' | head -n1)
           platforms="{}"
           if [ -n "$mac_bundle" ] && [ -n "$mac_sig" ]; then
             platforms=$(echo "$platforms" | jq \
@@ -256,18 +282,15 @@ jobs:
               --arg sig "$(cat "$win_sig")" --arg url "${base}/${win_bundle}" \
               '. + {"windows-x86_64": {signature: $sig, url: $url}}')
           fi
-
           jq -n --arg v "$version" --arg notes "OpenCapital $version" \
                 --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "$platforms" \
             '{version: $v, notes: $notes, pub_date: $date, platforms: $p}' > latest.json
           cat latest.json
-
-          # Gather assets via find (ls with multiple globs exits non-zero on any
-          # missing pattern, which aborts under `set -e`).
-          assets=()
-          while IFS= read -r f; do assets+=("$f"); done < <(find . -maxdepth 1 -type f \
-            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \
-               -o -name '*-setup.exe' -o -name '*-setup.exe.sig' -o -name 'latest.json' \))
-          echo "assets: ${assets[*]}"
-          gh release create "$tag" --repo "$RELEASES_REPO" \
-            --title "OpenCapital $version" --notes "OpenCapital $version" "${assets[@]}"
+      - name: Finalize (tag + tauri bump + GitHub Release w/ assets)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp scripts/release/app.releaserc.json .releaserc.json
+          npx --yes -p semantic-release@24 -p @semantic-release/exec \
+            -p @semantic-release/git -p conventional-changelog-conventionalcommits \
+            semantic-release

@@ -1,0 +1,120 @@
+name: plugin-release
+
+# Reusable 3-job release pipeline for any oc-plugin-* repo. Called from each
+# plugin's tiny publish.yml on push:main. semantic-release computes the version
+# from Conventional Commits, the matrix builds the Go backend natively, the
+# publish job pushes+signs to GHCR (BEFORE semantic-release, so oc-plugin.json
+# only ever lists published versions), then semantic-release tags + bumps
+# oc-plugin.json [skip ci] + cuts a GitHub Release.
+on:
+  workflow_call:
+    inputs:
+      id: { required: true, type: string }
+      owner: { required: true, type: string }
+      platforms: { required: true, type: string }
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    outputs:
+      version: ${{ steps.sr.outputs.version }}
+      released: ${{ steps.sr.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: opencapital-dev/opencapital
+          path: .oc-release
+          sparse-checkout: scripts/release
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: compute next version (dry-run)
+        id: sr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ID: ${{ inputs.id }}
+          OWNER: ${{ inputs.owner }}
+        run: |
+          cp .oc-release/scripts/release/plugin.releaserc.json .releaserc.json
+          npx --yes -p semantic-release@24 -p @semantic-release/exec \
+            -p @semantic-release/git -p conventional-changelog-conventionalcommits@^9 \
+            semantic-release --dry-run
+
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            targets: "build:darwinARM64 build:darwin"
+          - os: windows-latest
+            targets: "build:windows"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - uses: magefile/mage-action@v3
+        with: { install-only: true }
+      - name: build backend
+        shell: bash
+        run: |
+          for t in ${{ matrix.targets }}; do mage $t; done
+          ls -la dist/gpx_*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ matrix.os }}
+          path: dist/gpx_*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: needs.version.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: write, packages: write, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: opencapital-dev/opencapital
+          path: .oc-release
+          sparse-checkout: scripts/release
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: build frontend (produces dist/plugin.json + assets)
+        run: |
+          npm pkg set version=${{ needs.version.outputs.version }}
+          npm ci && npm run build
+      - uses: actions/download-artifact@v4
+        with: { path: /tmp/backends }
+      - name: collect backend binaries into dist/
+        run: |
+          cp /tmp/backends/*/gpx_* dist/
+          ls -la dist/
+      # GHCR push + sign FIRST so oc-plugin.json only records published versions.
+      - name: push + sign (GHCR)
+        uses: opencapital-dev/oc-plugin-publish-action@v1
+        with:
+          dir: .
+          id: ${{ inputs.id }}
+          owner: ${{ inputs.owner }}
+          version: v${{ needs.version.outputs.version }}
+          platforms: ${{ inputs.platforms }}
+          record_manifest: "false"
+      # Drop the ephemeral package.json bump so semantic-release sees a clean tree.
+      - name: finalize (tag + oc-plugin.json bump + GitHub Release)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ID: ${{ inputs.id }}
+          OWNER: ${{ inputs.owner }}
+        run: |
+          git checkout -- package.json package-lock.json 2>/dev/null || true
+          cp .oc-release/scripts/release/plugin.releaserc.json .releaserc.json
+          npx --yes -p semantic-release@24 -p @semantic-release/exec \
+            -p @semantic-release/git -p conventional-changelog-conventionalcommits@^9 \
+            semantic-release

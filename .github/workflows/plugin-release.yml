@@ -16,7 +16,9 @@ on:
 jobs:
   version:
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    # contents: write — @semantic-release/git verifyConditions runs a
+    # `git push --dry-run` even in --dry-run mode, which needs push scope.
+    permissions: { contents: write }
     outputs:
       version: ${{ steps.sr.outputs.version }}
       released: ${{ steps.sr.outputs.released }}

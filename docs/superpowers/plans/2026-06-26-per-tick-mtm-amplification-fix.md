@@ -4,7 +4,7 @@
 
 **Goal:** Collapse the price grid to one datapoint per (instrument, day) with today live, so the per-tick MtM MVs stop amplifying on import — fixed at the source (ingestor) + simplified MVs, with exact daily-close numbers.
 
-**Architecture:** (1) Live ingestor upserts one `data_log` quote row per (instrument, day) instead of appending every tick. (2) `prices`/`option_marks` MVs dedup to 1/(instrument, day), today live. (3) The three per-tick MVs simplify over the daily grid (drop event-time ticks; `portfolio_per_tick` becomes an aggregation). (4) Drop `fx_filled`/`snapshot_at_day`. Correctness gate: new daily output equals the golden snapshot **at each day's last tick** (~1e-6).
+**Architecture:** (1) Live ingestor upserts one `data_log` quote row per (instrument, day) instead of appending every tick. (2) `prices`/`option_marks` MVs dedup to 1/(instrument, day), today live. (3) The three per-tick MVs simplify over the daily grid (drop event-time ticks; FX/fold marks via day-keyed equi-joins to `fx_filled`/`snapshot_at_day`; `portfolio_per_tick` becomes an aggregation). (4) Keep `fx_filled`/`snapshot_at_day` (equi-join inputs — needed because the daily grid's per-key fan-out is still 9k/6k, over RW's threshold). Correctness gate: new daily output equals the golden snapshot **at each day's last tick** (~1e-6).
 
 **Tech Stack:** Go (yfinance ingestor), RisingWave streaming SQL (`psql -h localhost -p 4566 -U root -d dev`).
 
@@ -140,11 +140,9 @@ WHERE abs(coalesce(n.equity_value_base,0)-coalesce(g.equity_value_base,0)) > 1e-
 
 ---
 
-### Task 6: Delete `fx_filled` + `snapshot_at_day` (`opencapital`)
+### Task 6: REMOVED — keep `fx_filled` + `snapshot_at_day`
 
-- [ ] **Step 1:** `git rm dataplane/risingwave/schemas/04-fx/fx_filled.sql dataplane/risingwave/schemas/05-fold/snapshot_at_day.sql` and their test files (`fx_filled_check.sql`, `snapshot_at_day_check.sql`).
-- [ ] **Step 2:** Drop from the engine: `psql … -c "DROP MATERIALIZED VIEW IF EXISTS snapshot_at_day; DROP MATERIALIZED VIEW IF EXISTS fx_filled;"` (snapshot_at_day first if it depends on fx_filled — it doesn't; order free).
-- [ ] **Step 3: Commit.**
+Measurement showed the daily grid's per-key ASOF fan-out is still 9,333 (USD FX) / 6,095 (fold) — over RW's 2048 threshold. So the per-tick MVs equi-join `fx_filled` (pair, day) and `snapshot_at_day` (portfolio, day) to localize the fan-out. Both MVs are KEPT (schema files `04-fx/fx_filled.sql`, `05-fold/snapshot_at_day.sql` stay; the cutover recreates them in dependency order before the per-tick MVs).
 
 ---
 

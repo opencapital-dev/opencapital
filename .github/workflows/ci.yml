@@ -1,4 +1,7 @@
 name: ci
+
+# PR gate: lint + tests only, no release build. The Tauri app bundle is built
+# and published on merge by opencapital-release.yml.
 on:
   pull_request:
   push:
@@ -24,9 +27,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: opencapital-app/src-tauri
-      - name: build --lib
-        working-directory: opencapital-app/src-tauri
-        run: cargo build --lib
+      # test --lib compiles the lib as part of testing; no separate build step
+      # (the full Tauri bundle is built only on merge, by opencapital-release.yml).
       - name: test --lib
         working-directory: opencapital-app/src-tauri
         run: cargo test --lib

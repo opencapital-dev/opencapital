@@ -8,6 +8,10 @@ name: opencapital-release
 # per-platform (pyinstaller can't cross-compile).
 
 on:
+  # Manual re-trigger: lets a maintainer re-run the release on the current main
+  # (e.g. when an in-flight release was skipped because main advanced mid-build —
+  # semantic-release bails with "local branch is behind the remote").
+  workflow_dispatch:
   push:
     branches: [main]
     paths:

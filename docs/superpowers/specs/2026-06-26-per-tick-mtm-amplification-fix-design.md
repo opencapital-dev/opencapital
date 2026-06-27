@@ -45,24 +45,37 @@ the per-tick ASOFs cheap, removing the amplification at the source.
 
 ## Design
 
-### 1. Ingestor — live-quote key → per day (`oc-plugin-yfinance-app/pkg/plugin/live.go`)
+### 1. Ingestor — replace the websocket subscriber with a minute poller (`oc-plugin-yfinance-app`)
 
-`data_log` has `PRIMARY KEY (rw_key)`, so an INSERT with an existing key upserts. The OHLCV
-backfill already exploits this (`backfill_worker.go`: `rw_key` uses `bar.Date`, one row/day).
-The live path does not — `publishTick` puts the tick millisecond in the key, so every tick is
-a new row. Change it to the day:
+Drop the realtime websocket entirely (`live.go`'s `yflive.WebSocket`, `Connect`/`ListenAsync`/
+`Subscribe`/`Unsubscribe`, the `github.com/wnjoon/go-yfinance/pkg/live` import). Yahoo is polled
+for the current price on a timer instead. This is strictly simpler (no connect/reconnect/async
+listen) and uses the same REST path as backfill, so the currency is consistent — it also
+retires the ws minor-unit (pence/pound) classification hack (`pence-pound-live-quote-nav-inflation`).
+
+- **`yfclient.FetchQuote(ctx, symbol) (price float64, currency string, err error)`** — lightweight
+  current price via `t.FastInfo()` (`LastPrice`, falling back to `PreviousClose`). FastInfo is
+  already used inside `FetchBars`.
+- **`QuotePoller`** replaces `LiveSubscriber`, keeping the same `SetSymbols(ctx, targets)`
+  interface (still fed by the existing `discovery.go` loop). A `time.NewTicker(60s)` loop: for
+  each tracked target, `FetchQuote(canonicalSymbol)` → normalize unit against the
+  backfill-captured currency → **upsert** the day's single `data_log` quote row:
 
 ```go
-// publishTick: key per (instrument, day) → each tick UPSERTS the day's single row;
-// today's row moves live, past days freeze at their last (close) tick.
-dayUs := time.UnixMicro(observedAtUs).UTC().Truncate(24 * time.Hour).UnixMicro()
-rwKey := datakey.DataKey(s.pluginID, QuoteNamespace, tgt.PortfolioID, tgt.InstrumentID, dayUs)
-// row's observed_at stays = observedAtUs (actual tick time) so today's point's timestamp advances
+// rw_key per (instrument, day): each poll UPSERTS the day's row (data_log PK(rw_key)).
+// observed_at = now (the poll time) so today's point advances; past days freeze at the
+// last poll before rollover (the close).
+dayUs := nowUs.Truncate-to-UTC-day
+rwKey := datakey.DataKey(pluginID, QuoteNamespace, portfolioID, instrumentID, dayUs)
 ```
 
-Result: live quote writes drop from ~38 k/day to **1 row/instrument/day**, eliminating the
-ingestion-barrier churn that drives the wedge. No retention job needed. (Optional later:
-throttle upsert frequency to cut same-row changelog churn.)
+`data_log` has `PRIMARY KEY (rw_key)`, and the OHLCV backfill already upserts one row/day
+(`backfill_worker.go` keys on `bar.Date`). With the poller, live quotes become **1 row per
+(instrument, day)** that updates each minute (today moves), eliminating the ~38 k/day append
+churn that drives the wedge. No retention job needed.
+
+Net ingestor effect: less code (no ws), more robust (REST + timer), consistent currency, and a
+daily-by-construction `data_log`.
 
 ### 2. `prices` MV → daily dedup (`dataplane/risingwave/schemas/03-unifying-views/prices.sql`)
 
@@ -134,9 +147,10 @@ The current golden snapshot is still the oracle, restricted to daily-close granu
 
 ## Rollout
 
-- **Ingestor** (`oc-plugin-yfinance-app`): ship the `live.go` key change; new live quotes start
-  upserting per day. Existing intraday quote rows remain in `data_log` until compacted (the
-  `prices` dedup already hides them; optional one-time purge of old `prices.quote` rows).
+- **Ingestor** (`oc-plugin-yfinance-app`): ship the `QuotePoller` (ws removed); new quotes
+  upsert per day on a 60s timer. Existing intraday quote rows remain in `data_log` until
+  compacted (the `prices` dedup already hides them; optional one-time purge of old
+  `prices.quote` rows).
 - **MVs** (`opencapital`): migration drops the three per-tick MVs + `fx_filled` +
   `snapshot_at_day`, rewrites `prices`/`option_marks`/per-tick, recreates. Source tables
   retained → rebuild from existing data, no loss. `apply.sh` baseline files updated for fresh
@@ -165,7 +179,10 @@ The current golden snapshot is still the oracle, restricted to daily-close granu
 
 ## Affected files
 
-- `oc-plugin-yfinance-app/pkg/plugin/live.go` — live-quote rw_key → day.
+- `oc-plugin-yfinance-app/pkg/plugin/yfclient.go` — add `FetchQuote` (FastInfo current price).
+- `oc-plugin-yfinance-app/pkg/plugin/live.go` — replace `LiveSubscriber` (ws) with `QuotePoller` (60s timer, FetchQuote → upsert daily row); remove `yflive`/ws.
+- `oc-plugin-yfinance-app/pkg/plugin/app.go` — wire `QuotePoller` (start/stop) in place of the ws subscriber.
+- `oc-plugin-yfinance-app/go.mod` — drop `go-yfinance/pkg/live` usage (ws).
 - `dataplane/risingwave/schemas/03-unifying-views/prices.sql` — daily dedup.
 - `dataplane/risingwave/schemas/03-unifying-views/option_marks.sql` — daily dedup (consistency).
 - `dataplane/risingwave/schemas/06-metrics/instrument_per_tick.sql` — daily grid, drop event-ticks.

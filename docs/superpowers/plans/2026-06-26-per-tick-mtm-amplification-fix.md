@@ -23,29 +23,32 @@
 
 ---
 
-### Task 1: Ingestor — live-quote rw_key per day (`oc-plugin-yfinance-app`)
+### Task 1: Ingestor — replace ws subscriber with a minute poller (`oc-plugin-yfinance-app`)
 
 **Files:**
-- Modify: `oc-plugin-yfinance-app/pkg/plugin/live.go` (`publishTick`)
-- Test: `oc-plugin-yfinance-app/pkg/plugin/live_test.go` (or `live_units_test.go`)
+- Modify: `oc-plugin-yfinance-app/pkg/plugin/yfclient.go` (add `FetchQuote`)
+- Modify: `oc-plugin-yfinance-app/pkg/plugin/live.go` (`LiveSubscriber` → `QuotePoller`; remove ws)
+- Modify: `oc-plugin-yfinance-app/pkg/plugin/app.go` (wire poller start/stop)
+- Modify: `oc-plugin-yfinance-app/pkg/plugin/discovery.go` (calls `SetSymbols` — keep, retype to poller)
+- Test: `oc-plugin-yfinance-app/pkg/plugin/live_test.go` (+ `yfclient` test if practical)
 
 **Interfaces:**
-- Produces: live quotes write 1 `data_log` row per (instrument, day); row's `observed_at` = actual tick time; rw_key uses the day.
+- Produces: `QuotePoller` with `SetSymbols(ctx, []TickerMapping)`, `Start(ctx)`, `Close()` (same surface as `LiveSubscriber`). On a 60s timer it fetches each tracked symbol's current price and **upserts** one `data_log` quote row per (instrument, day) — key uses the UTC day; `observed_at` = poll time.
+- Produces: `YfClient.FetchQuote(ctx, symbol) (price float64, currency string, err error)`.
 
-- [ ] **Step 1: Failing test** — assert the live quote rw_key is day-truncated. Add to the live test file: build two ticks for the same instrument/portfolio on the same UTC day at different times; assert they produce the **same** rw_key (so they upsert), and ticks on different days produce different keys. Use `datakey.DataKey` with the day-truncated micros as the expectation.
+- [ ] **Step 1: Branch** — `cd /Users/ignacioballester/trading-code/oc-plugin-yfinance-app && git checkout -b fix/quote-poller` (off current `basic-data-rename`; reuse if exists).
 
-- [ ] **Step 2: Run it — fails** (current code uses tick micros → different keys). `cd oc-plugin-yfinance-app && go test ./pkg/plugin/ -run TestLiveQuote -v` → FAIL.
+- [ ] **Step 2: Failing test** — assert two polls for the same instrument/portfolio on the same UTC day produce the **same** rw_key (upsert), different days differ. Extract a pure helper `func quoteDayKey(pluginID, portfolio, instrument string, atUs int64) string` returning `datakey.DataKey(pluginID, QuoteNamespace, portfolio, instrument, <UTC-day-trunc micros>)` and test it. Run: `go test ./pkg/plugin/ -run TestQuoteDayKey -v` → FAIL (helper missing).
 
-- [ ] **Step 3: Implement** — in `publishTick`, compute the day bucket and use it in the key (keep `observed_at` = actual tick time in the INSERT):
-```go
-dayUs := time.UnixMicro(observedAtUs).UTC().Truncate(24 * time.Hour).UnixMicro()
-rwKey := datakey.DataKey(s.pluginID, QuoteNamespace, tgt.PortfolioID, tgt.InstrumentID, dayUs)
-```
-(The INSERT keeps `to_timestamp(observedAtUs/1e6)` for `observed_at`.)
+- [ ] **Step 3: `FetchQuote`** — add to `yfclient.go` using `t.FastInfo()` → `pickPositive(fi.LastPrice, fi.PreviousClose, fi.RegularMarketPreviousClose)` + the FastInfo currency. Mirror `FetchBars`'s ticker/QPS handling.
 
-- [ ] **Step 4: Run tests** — `go test ./pkg/plugin/ -run TestLiveQuote -v` PASS; then `go test ./pkg/plugin/...` (full package) green.
+- [ ] **Step 4: `QuotePoller`** — rewrite `live.go`: keep `symbolTarget`, `desiredSymbols`, `canonicalSymbol`, `canonicalUnit`, `SetSymbols` (same set-diff bookkeeping minus ws subscribe/unsubscribe). Replace ws with: `Start(ctx)` launches a `time.NewTicker(60s)` goroutine; each tick snapshots `bySymbol`, and for each target calls `client.FetchQuote`, normalizes the unit (reuse `liveUnit`/`normalizeTickValue` against `tgt.Currency`), and upserts via the existing INSERT using `quoteDayKey(...)` and `observed_at = now`. `Close()` stops the ticker. Remove the `yflive` import + all `ws.*` calls.
 
-- [ ] **Step 5: Commit** — `cd oc-plugin-yfinance-app && git add pkg/plugin/live.go pkg/plugin/*_test.go && git commit -m "fix(live): upsert one quote per (instrument, day); today moves live"` (this repo's own branch; --no-gpg-sign if signing fails).
+- [ ] **Step 5: Wire** — in `app.go`, replace `NewLiveSubscriber`/`live.Start` with `NewQuotePoller`/`poller.Start`; `Close()` on shutdown. `discovery.go` keeps calling `SetSymbols` (retype the param to `*QuotePoller`).
+
+- [ ] **Step 6: Run tests** — `go test ./pkg/plugin/ -run TestQuoteDayKey -v` PASS; then `go build ./... && go test ./pkg/plugin/...` green, output pristine. (If a yfinance-network test would flake, keep `FetchQuote` covered by a thin interface/fake, not a live call.)
+
+- [ ] **Step 7: Commit** — `git add pkg/plugin/ go.mod go.sum && git commit -m "feat(ingest): poll yfinance for current price every 60s; upsert one quote/(instrument,day); remove websocket"` (--no-gpg-sign if signing fails).
 
 ---
 

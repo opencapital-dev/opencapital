@@ -1,76 +1,108 @@
 -- ============================================================================
--- cash_per_tick — dense per-(portfolio, currency, tick) cash MV.
+-- cash_per_tick — daily-close cash, one row per (scope, currency, day).
 -- ----------------------------------------------------------------------------
--- v5 simplification: reads `fold_per_event` directly (no snapshots
--- durable table in between). `cash_state` is built from
--- `(fold_result).snapshot.cash_positions` with ASOF fx_rates at the
--- per-event business_ts. The outer MV ASOF-joins fx_rates again at the
--- tick to mark cash_value_base + unrealized_fx_avg_base at the latest FX.
+-- v6 rewrite: DAILY GRID via day-keyed EQUI-JOIN (no amplifying ASOF).
 --
--- Tick grid: every FX tick for currency→base_currency UNION every cash
--- event_ts.
+-- The previous v5 ran over an intraday tick grid (every fx_rates tick UNION
+-- every cash event business_ts) and resolved the FX mark with an ASOF JOIN
+-- keyed on (from_ccy, to_ccy) only. That ASOF fanned every tick out across all
+-- pairs sharing a leg (USD→base fan-out far over RW's 2048 barrier), amplifying
+-- the streaming update and freezing the barriers on import.
+--
+-- v6 collapses the grid to one row per (currency, calendar day) and swaps the
+-- amplifying ASOF for a bounded equi-join:
+--   * Grid: unnest the END-OF-DAY fold snapshot `snapshot_at_day` directly.
+--     Cash persists in every snapshot once deposited, so one row per
+--     (portfolio, currency, day) falls straight out of the unnest — no held-set
+--     cross join is needed (unlike instrument_per_tick). The day subsumes the
+--     old intraday (fx-tick UNION cash-event) grid.
+--   * FX: equi-join `fx_filled` on (from_ccy, to_ccy, day) — the daily forward-
+--     filled rate — replacing `ASOF fx_rates ON (from_ccy, to_ccy)`. The
+--     `CASE WHEN currency = base_currency THEN 1.0 ELSE fx.rate END` guard
+--     stays.
+--   * The intraday event-time / fx-tick branch is removed entirely.
+--
+-- cash_value_base is the daily mark (balance × daily FX). It also serves as the
+-- cost-basis numerator inside unrealized_fx_avg_base, so the two daily marks
+-- cancel and unrealized_fx_avg_base ≡ 0 — matching the gold oracle, whose
+-- unrealized_fx_avg_base is identically ~0 (the event-time inner/outer FX marks
+-- cancelled there too). The NULLIF(cash_value_native, 0) guard is preserved.
+--
+-- event_ts output = the calendar `day` (cast to timestamptz at day
+-- granularity), consistent with the FX `day` key. The column contract (names +
+-- order) matches v5 so downstream consumers stay unchanged.
+--
+-- NOTE: deposits_cumulative_native / withdrawals_cumulative_native read the
+-- `deposits_native` / `withdrawals_native` JSON keys, which the fold snapshot
+-- does not emit (the real keys are *_cumulative_native). This reproduces v5's
+-- pre-existing behaviour exactly: both columns are NULL in v5, the gold oracle,
+-- and here. Left unchanged so the rewrite is a pure grid/FX swap.
 -- ============================================================================
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS cash_per_tick AS
-WITH fold_per_ts AS (
-    -- One fold row per (portfolio_id, business_ts): max source_id
-    -- wins. Prevents the lateral over cash_positions from double-counting
-    -- when multiple events share a business_ts.
-    SELECT fpe.portfolio_id, fpe.business_ts, fpe.fold_result
-    FROM fold_per_event fpe
-    JOIN (
-        SELECT portfolio_id, business_ts, MAX(source_id) AS source_id
-        FROM fold_per_event
-        GROUP BY portfolio_id, business_ts
-    ) m USING (portfolio_id, business_ts, source_id)
-),
-cash_state AS (
+WITH cash_daily AS (
+    -- One row per (portfolio, currency, day): unnest the end-of-day fold
+    -- snapshot's cash_positions. The daily snapshot subsumes the old intraday
+    -- (fx-tick UNION cash-event) grid.
     SELECT
-        u.portfolio_id                                         AS scope_id,
-        (u.cp ->> 'currency')                                  AS currency,
-        (u.portfolio_core ->> 'base_currency')                 AS base_currency,
-        u.business_ts                                          AS event_ts,
-        (u.cp ->> 'cash_value_native')::DOUBLE PRECISION       AS balance_native,
-        (u.cp ->> 'cash_value_native')::DOUBLE PRECISION       AS cash_value_native,
-        (u.cp ->> 'cash_value_native')::DOUBLE PRECISION
-            * (CASE WHEN (u.cp ->> 'currency')
-                       = (u.portfolio_core ->> 'base_currency')
+        s.portfolio_id                                          AS scope_id,
+        (cp ->> 'currency')                                     AS currency,
+        (s.snapshot -> 'portfolio_core' ->> 'base_currency')    AS base_currency,
+        s.day                                                   AS tick_day,
+        (cp ->> 'cash_value_native')::DOUBLE PRECISION          AS balance_native,
+        (cp ->> 'cash_value_native')::DOUBLE PRECISION          AS cash_value_native,
+        (cp ->> 'realized_interest_native')::DOUBLE PRECISION   AS realized_interest_native,
+        (cp ->> 'realized_interest_base')::DOUBLE PRECISION     AS realized_interest_base,
+        (cp ->> 'realized_dividends_native')::DOUBLE PRECISION  AS realized_dividends_native,
+        (cp ->> 'realized_dividends_base')::DOUBLE PRECISION    AS realized_dividends_base,
+        (cp ->> 'realized_fx_fifo_base')::DOUBLE PRECISION      AS realized_fx_fifo_base,
+        (cp ->> 'realized_fx_avg_base')::DOUBLE PRECISION       AS realized_fx_avg_base,
+        (cp ->> 'fees_native')::DOUBLE PRECISION                AS fees_native,
+        (cp ->> 'fees_base')::DOUBLE PRECISION                  AS fees_base,
+        (cp ->> 'deposits_native')::DOUBLE PRECISION            AS deposits_cumulative_native,
+        (cp ->> 'withdrawals_native')::DOUBLE PRECISION         AS withdrawals_cumulative_native
+    FROM snapshot_at_day s,
+         jsonb_array_elements(s.snapshot -> 'cash_positions') AS cp
+),
+with_state AS (
+    -- Day-keyed equi-join the daily forward-filled FX (replaces the amplifying
+    -- ASOF fx_rates ON (from_ccy, to_ccy)).
+    SELECT
+        c.scope_id,
+        c.currency,
+        c.base_currency,
+        c.tick_day,
+        c.balance_native,
+        c.cash_value_native,
+        c.balance_native
+            * (CASE WHEN c.currency = c.base_currency
                     THEN 1.0 ELSE fx.rate END)                 AS cash_value_base,
-        (u.cp ->> 'realized_interest_native')::DOUBLE PRECISION  AS realized_interest_native,
-        (u.cp ->> 'realized_interest_base')::DOUBLE PRECISION    AS realized_interest_base,
-        (u.cp ->> 'realized_dividends_native')::DOUBLE PRECISION AS realized_dividends_native,
-        (u.cp ->> 'realized_dividends_base')::DOUBLE PRECISION   AS realized_dividends_base,
-        (u.cp ->> 'realized_fx_fifo_base')::DOUBLE PRECISION   AS realized_fx_fifo_base,
-        (u.cp ->> 'realized_fx_avg_base')::DOUBLE PRECISION    AS realized_fx_avg_base,
-        (u.cp ->> 'fees_native')::DOUBLE PRECISION             AS fees_native,
-        (u.cp ->> 'fees_base')::DOUBLE PRECISION               AS fees_base,
-        (u.cp ->> 'deposits_native')::DOUBLE PRECISION         AS deposits_cumulative_native,
-        (u.cp ->> 'withdrawals_native')::DOUBLE PRECISION      AS withdrawals_cumulative_native
-    FROM (
-        SELECT
-            fpe.portfolio_id,
-            fpe.business_ts,
-            (fpe.fold_result).snapshot -> 'portfolio_core' AS portfolio_core,
-            cp
-        FROM fold_per_ts fpe,
-             jsonb_array_elements((fpe.fold_result).snapshot -> 'cash_positions') AS cp
-    ) u
-    ASOF LEFT JOIN fx_rates fx
-        ON  fx.from_ccy = (u.cp ->> 'currency')
-        AND fx.to_ccy   = (u.portfolio_core ->> 'base_currency')
-        AND u.business_ts >= fx.ts
+        fx.rate                                                AS fx_rate,
+        c.realized_interest_native,
+        c.realized_interest_base,
+        c.realized_dividends_native,
+        c.realized_dividends_base,
+        c.realized_fx_fifo_base,
+        c.realized_fx_avg_base,
+        c.fees_native,
+        c.fees_base,
+        c.deposits_cumulative_native,
+        c.withdrawals_cumulative_native
+    FROM cash_daily c
+    LEFT JOIN fx_filled fx
+        ON  fx.from_ccy = c.currency
+        AND fx.to_ccy   = c.base_currency
+        AND fx.day      = c.tick_day
 )
 SELECT
     'portfolio'                                       AS scope_type,
     with_state.scope_id,
     with_state.currency,
     with_state.base_currency,
-    with_state.tick_ts                                AS event_ts,
+    with_state.tick_day::timestamptz                  AS event_ts,
     with_state.balance_native,
     with_state.cash_value_native,
-    with_state.balance_native
-        * (CASE WHEN with_state.currency = with_state.base_currency
-                THEN 1.0 ELSE fx.rate END)            AS cash_value_base,
+    with_state.cash_value_base,
     with_state.realized_interest_native,
     with_state.realized_interest_base,
     with_state.realized_dividends_native,
@@ -83,46 +115,10 @@ SELECT
     with_state.withdrawals_cumulative_native,
     CASE WHEN with_state.currency = with_state.base_currency THEN 0.0
          ELSE with_state.balance_native
-              * (fx.rate
+              * (with_state.fx_rate
                  - COALESCE(with_state.cash_value_base
                             / NULLIF(with_state.cash_value_native, 0),
-                            fx.rate))
+                            with_state.fx_rate))
     END                                               AS unrealized_fx_avg_base
-FROM (
-    SELECT
-        sc.scope_id, sc.currency, sc.base_currency,
-        t.tick_ts,
-        cs.balance_native,
-        cs.cash_value_native,
-        cs.cash_value_base,
-        cs.realized_interest_native,
-        cs.realized_interest_base,
-        cs.realized_dividends_native,
-        cs.realized_dividends_base,
-        cs.realized_fx_fifo_base,
-        cs.realized_fx_avg_base,
-        cs.fees_native,
-        cs.fees_base,
-        cs.deposits_cumulative_native,
-        cs.withdrawals_cumulative_native
-    FROM (SELECT DISTINCT scope_id, currency, base_currency FROM cash_state) sc
-    JOIN (
-        -- Tick grid: every FX tick UNION every cash event.
-        SELECT from_ccy AS currency, to_ccy AS base_currency, ts AS tick_ts
-        FROM fx_rates
-        UNION ALL
-        SELECT DISTINCT currency, base_currency, event_ts AS tick_ts
-        FROM cash_state
-    ) t
-        ON t.currency = sc.currency
-       AND t.base_currency = sc.base_currency
-    ASOF LEFT JOIN cash_state cs
-        ON  cs.scope_id = sc.scope_id
-        AND cs.currency = sc.currency
-        AND t.tick_ts   >= cs.event_ts
-) with_state
-ASOF LEFT JOIN fx_rates fx
-    ON  fx.from_ccy = with_state.currency
-    AND fx.to_ccy   = with_state.base_currency
-    AND with_state.tick_ts >= fx.ts
+FROM with_state
 WHERE with_state.balance_native IS NOT NULL;

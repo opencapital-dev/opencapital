@@ -1,13 +1,17 @@
 -- ============================================================================
--- prices — VIEW over `data_log` filtered to the prices.* namespaces.
+-- prices — deduped VIEW over `data_log` filtered to the prices.* namespaces.
 -- ----------------------------------------------------------------------------
 -- v1 was an MV doing a 2-way UNION across price_quote / price_ohlcv_bar
 -- upsert tables. v6 reads from data_log filtered by source_namespace:
 --   * prices.quote   — bid/ask quotes → mid price
 --   * prices.ohlcv   — OHLCV bars     → close price
 --
--- The mid/close projection plus currency stamp matches v1's `prices` MV
--- column contract so the metrics_* MVs (ASOF prices) stay unchanged.
+-- v7 (this file) adds a daily dedup: one row per (portfolio, instrument, day)
+-- = the observation with the latest observed_at that day. Today's row
+-- re-ranks live as new quotes arrive (no day-close lag).
+--
+-- Column contract: (portfolio_id, instrument_id, price_ts, kind, price, currency)
+-- Consumers (metrics_* MVs, ASOF joins) depend on this contract; do not reorder.
 --
 -- Payload JSON shape (advisory; documented in
 -- infra/risingwave/plugins/prices/payload_schema.json):
@@ -18,26 +22,53 @@
 --                  "bar_cadence": "1m", "currency": "USD", "venue": "..."}
 -- ============================================================================
 
-CREATE MATERIALIZED VIEW prices AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS prices AS
+WITH obs AS (
     SELECT
         portfolio_id,
-        source_id AS instrument_id,
-        observed_at AS price_ts,
-        'QUOTE' AS kind,
+        source_id                                                              AS instrument_id,
+        observed_at,
         (
-            (payload::jsonb ->> 'bid_price')::DOUBLE PRECISION
-          + (payload::jsonb ->> 'ask_price')::DOUBLE PRECISION
-        ) / 2.0 AS price,
-        payload::jsonb ->> 'currency' AS currency
+            (CAST(payload AS JSONB) ->> 'bid_price')::DOUBLE PRECISION
+          + (CAST(payload AS JSONB) ->> 'ask_price')::DOUBLE PRECISION
+        ) / 2.0                                                                AS price,
+        CAST(payload AS JSONB) ->> 'currency'                                  AS currency,
+        'QUOTE'                                                                AS kind
     FROM data_log
     WHERE source_namespace = 'prices.quote'
-UNION ALL
+
+    UNION ALL
+
     SELECT
         portfolio_id,
-        source_id AS instrument_id,
-        observed_at AS price_ts,
-        'OHLCV_BAR' AS kind,
-        (payload::jsonb ->> 'close')::DOUBLE PRECISION AS price,
-        payload::jsonb ->> 'currency' AS currency
+        source_id                                                              AS instrument_id,
+        observed_at,
+        CAST((CAST(payload AS JSONB) ->> 'close') AS DOUBLE PRECISION)         AS price,
+        CAST(payload AS JSONB) ->> 'currency'                                  AS currency,
+        'OHLCV_BAR'                                                            AS kind
     FROM data_log
-    WHERE source_namespace = 'prices.ohlcv';
+    WHERE source_namespace = 'prices.ohlcv'
+),
+ranked AS (
+    SELECT
+        portfolio_id,
+        instrument_id,
+        observed_at,
+        price,
+        currency,
+        kind,
+        row_number() OVER (
+            PARTITION BY portfolio_id, instrument_id, date_trunc('day', observed_at)
+            ORDER BY observed_at DESC
+        ) AS rn
+    FROM obs
+)
+SELECT
+    portfolio_id,
+    instrument_id,
+    observed_at  AS price_ts,
+    kind,
+    price,
+    currency
+FROM ranked
+WHERE rn = 1;

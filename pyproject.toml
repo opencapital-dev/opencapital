@@ -39,8 +39,12 @@ dev = [
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
+# Root project is a dev-environment dependency set only (the Python code lives in
+# services/compute, imported via tool.pytest pythonpath). No importable package at
+# the root, so declare none — `packages = ["lib"]` referenced a dir that never existed
+# and broke `pip install -e ".[dev]"`.
 [tool.setuptools]
-packages = ["lib"]
+py-modules = []
 
 [tool.ruff]
 line-length = 100

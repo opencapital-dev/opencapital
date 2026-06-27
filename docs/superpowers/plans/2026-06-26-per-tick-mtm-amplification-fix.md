@@ -82,7 +82,9 @@ SELECT (SELECT max(c) FROM (SELECT count(*) c FROM prices_candidate GROUP BY por
 
 **Files:** Modify `dataplane/risingwave/schemas/06-metrics/instrument_per_tick.sql`; Test reuses golden + a daily-close diff.
 
-**Interfaces:** Consumes `prices_daily` (Task 2 candidate) + `fold_per_event` + `fx_rates`. Produces `instrument_per_tick` = 1 row/(instrument, day), exact daily-close MtM.
+**Interfaces:** Consumes `prices_daily` + `fx_filled(from_ccy,to_ccy,day,rate)` + `snapshot_at_day(portfolio_id,day,snapshot)` + `fold_per_event`. Produces `instrument_per_tick` = 1 row/(held instrument, day), exact daily-close MtM, with NO ASOF amplification (FX/fold marks are day-keyed EQUI-joins).
+
+**Why equi-joins (measured):** on the daily grid the raw FX ASOF still fans out 9,333 (USD pair) and the fold ASOF 6,095 (portfolio) — both far over RW's 2048 threshold. Day-keyed equi-joins to `fx_filled`/`snapshot_at_day` cut each fan-out to ~instruments-on-that-day. Lossless on the daily grid (1 price/day).
 
 - [ ] **Step 1: Daily-close diff query** `dataplane/risingwave/test/daily_close_diff.sql` (parameterized `-v new=… -v gold=…`):
 ```sql
@@ -98,7 +100,13 @@ WHERE abs(coalesce(n.equity_value_base,0)-coalesce(g.equity_value_base,0)) > 1e-
 ```
 (Add the reverse: every gold daily-close key present in `new`.)
 
-- [ ] **Step 2: Build `instrument_per_tick_new` over `prices_daily`** — copy the deployed `instrument_per_tick` body; (a) `FROM prices` → `FROM prices_daily` (both the ticks source and the price ASOF); (b) **remove the event-time ticks branch** of the `ticks` CTE (keep only price/option ticks); keep the fold ASOF and fx ASOF as-is (now over the daily grid). `SET BACKGROUND_DDL=true`, apply, poll to 0.
+- [ ] **Step 2: Build `instrument_per_tick_new`** over the daily grid, replacing the amplifying ASOFs with day-keyed equi-joins. Start from the deployed `instrument_per_tick` body and:
+  - **Grid:** dense (held instrument × day). Days per portfolio = the union of `prices_daily` days and the days the instrument is **held** per the fold (so a held-but-unpriced day still emits a row — the failed v1 missed this). Build it as: `portfolio_instruments × portfolio_day_calendar`, where `portfolio_day_calendar` = distinct days from `prices_daily` ∪ distinct `date_trunc('day', business_ts)` from `fold_per_ts`. **Remove the intraday event-time tick branch** (the day subsumes it).
+  - **Price:** ASOF `prices_daily` keyed on `instrument_id` with `day >= price_ts::date` (instrument-keyed → selective, carries the last close forward on unpriced days). Keep `option_marks` ASOF likewise.
+  - **FX mark:** replace `ASOF fx_rates ON (pair) …` with `LEFT JOIN fx_filled fx ON fx.from_ccy=<currency> AND fx.to_ccy=<base_currency> AND fx.day = <day>`.
+  - **Fold state:** replace the `held_at_tick` `ASOF fold_per_ts ON (portfolio_id)` with `LEFT JOIN snapshot_at_day s ON s.portfolio_id=<portfolio> AND s.day=<day>`, using `s.snapshot` (end-of-day snapshot — correct for a daily close mark).
+  - Keep all projections/CASE-guards/column names IDENTICAL. `SET BACKGROUND_DDL=true`, apply, poll to 0.
+  - Note from the failed attempt: align `event_ts` output + the FX/fold `day` to `date_trunc('day', prices_daily.price_ts)` consistently so the equi-join keys match and the daily-close diff lines up.
 
 - [ ] **Step 3: Run the daily-close diff** `-v new=instrument_per_tick_new -v gold=gold_instrument_per_tick` → iterate to `mismatches=0` and no missing keys. Drill into any diffs.
 

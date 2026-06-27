@@ -1,29 +1,46 @@
 -- ============================================================================
--- instrument_per_tick — dense per-(scope, instrument, tick_ts) MtM.
+-- instrument_per_tick — daily-close MtM, one row per (scope, instrument, day).
 -- ----------------------------------------------------------------------------
--- v5 rewrite: held-at-tick semantics. Reads `fold_per_event` directly as
--- the source of truth (no more snapshots durable table or
--- instrument_per_event cross-section). For every price tick, ASOFs the
--- latest fold_per_event row for the portfolio at-or-before tick_ts, and
--- lateral-unnests its equity_positions array filtered to the tick's
--- instrument_id. A closed instrument is absent from equity_positions
--- (v5 fold drops qty<=0 entries) → no row materialises → no phantom.
+-- v6 rewrite: DAILY GRID via day-keyed EQUI-JOINS (no amplifying ASOFs).
 --
--- Multiple fold_per_event rows can share a business_ts (multiple events
--- at the same ts). The OverWindow operator orders within a business_ts
--- by source_id, so the row with the largest source_id carries the
--- latest cumulative state. ASOF picks that row.
+-- The previous v5 ran over an intraday tick grid (every price tick + every
+-- fold-event business_ts) and resolved fold state / FX with ASOF JOINs. The
+-- FX ASOF keyed on (from_ccy, to_ccy) only — every tick fanned out across all
+-- pairs sharing the same leg (USD→base fan-out ~9.3k > RW's 2048 barrier),
+-- amplifying ~17k rows/update on import and freezing the streaming barriers.
 --
--- Column contract matches the previous v4 instrument_per_tick output so
--- portfolio_per_tick and downstream consumers stay unchanged.
+-- v6 collapses the grid to one row per (held instrument, calendar day) and
+-- swaps the two amplifying ASOFs for bounded equi-joins:
+--   * Grid: portfolio_instruments (held set) × portfolio_day_calendar
+--     (priced days ∪ fold-event days), joined on portfolio_id. Every active
+--     day, every held instrument emits a row — INCLUDING held-but-unpriced
+--     days (the instrument's last close is carried forward by the price ASOF).
+--   * Fold state: equi-join `snapshot_at_day` on (portfolio_id, day) — the
+--     end-of-day fold snapshot — replacing `ASOF fold_per_ts ON (portfolio_id)`.
+--   * FX: equi-join `fx_filled` on (from_ccy, to_ccy, day) — daily forward-
+--     filled rate — replacing `ASOF fx_rates ON (from_ccy, to_ccy)`.
+--   * Price/option: ASOF the daily close keyed on (portfolio, instrument),
+--     inequality on price_ts::date — instrument-keyed (selective, NOT
+--     amplifying), carrying the last close forward onto unpriced days.
+--   * The intraday event-time tick branch is removed entirely.
+--
+-- DEPENDENCY: this MV assumes `prices` is the DAILY form (1 row per
+-- (portfolio, instrument, day); price_ts = the day's last observation). The
+-- price ASOF compares on price_ts::date and so is only well-defined when at
+-- most one prices row exists per (portfolio, instrument, day). The `prices`
+-- cutover to a daily MV is a prerequisite. `option_marks` may remain intraday
+-- — the option_daily CTE arg-maxes the last close per (instrument, day).
+--
+-- event_ts is the calendar `day` (cast to timestamptz at day granularity), so
+-- the daily semantics are explicit and the equi-join keys line up. The column
+-- contract (names + order) matches v5 so downstream consumers (e_instrument)
+-- stay unchanged.
 -- ============================================================================
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS instrument_per_tick AS
 WITH fold_per_ts AS (
-    -- One fold row per (portfolio_id, business_ts): max source_id
-    -- at that ts carries the latest cumulative state. Prevents ASOF +
-    -- lateral from double-counting when multiple events share a
-    -- business_ts.
+    -- One fold row per (portfolio_id, business_ts): the max source_id at that
+    -- ts carries the latest cumulative state.
     SELECT fpe.portfolio_id, fpe.business_ts, fpe.instrument_id, fpe.fold_result
     FROM fold_per_event fpe
     JOIN (
@@ -32,38 +49,61 @@ WITH fold_per_ts AS (
         GROUP BY portfolio_id, business_ts
     ) m USING (portfolio_id, business_ts, source_id)
 ),
-ticks AS (
-    -- Prices / option_marks from their unifying MVs;
-    -- the fold-driven branch carries portfolio_id from fold_per_ts.
-    SELECT instrument_id, price_ts AS tick_ts FROM prices
-    UNION ALL
-    SELECT instrument_id, price_ts AS tick_ts FROM option_marks
-    UNION ALL
-    -- Event-time ticks: every fold_per_event row that names an instrument
-    -- gives that instrument a fresh state row, so per-trade MtM rows show
-    -- up in instrument_per_tick at the trade business_ts.
-    SELECT DISTINCT instrument_id, business_ts AS tick_ts
+portfolio_day_calendar AS (
+    -- Days a portfolio is active: union of priced days and fold-event days.
+    -- A held-but-unpriced day must still emit a row, so fold days are unioned
+    -- in even when no price landed.
+    SELECT DISTINCT portfolio_id, price_ts::date AS day
+      FROM prices
+    UNION
+    SELECT DISTINCT portfolio_id, date_trunc('day', business_ts)::date AS day
       FROM fold_per_ts
-     WHERE instrument_id IS NOT NULL
 ),
 portfolio_instruments AS (
-    -- All (portfolio, instrument) pairs that fold has ever seen with qty>0.
+    -- All (portfolio, instrument) pairs fold has ever seen with qty>0.
     SELECT DISTINCT fpe.portfolio_id, (ep ->> 'instrument_id') AS instrument_id
       FROM fold_per_ts fpe,
            jsonb_array_elements((fpe.fold_result).snapshot -> 'equity_positions') AS t(ep)
 ),
-held_at_tick AS (
+grid AS (
+    -- Dense daily grid: every held instrument × every active day for its
+    -- portfolio.
+    SELECT pi.portfolio_id, pi.instrument_id, cal.day
+      FROM portfolio_instruments pi
+      JOIN portfolio_day_calendar cal
+        ON cal.portfolio_id = pi.portfolio_id
+),
+held_at_day AS (
+    -- Equi-join the end-of-day fold snapshot for (portfolio, day). Replaces
+    -- the amplifying ASOF fold_per_ts ON (portfolio_id).
     SELECT
-        pi.portfolio_id,
-        pi.instrument_id,
-        t.tick_ts,
-        (fpe.fold_result).snapshot AS snap
-    FROM portfolio_instruments pi
-    JOIN ticks t
-        ON  t.instrument_id = pi.instrument_id
-    ASOF LEFT JOIN fold_per_ts fpe
-        ON  fpe.portfolio_id = pi.portfolio_id
-        AND t.tick_ts >= fpe.business_ts
+        g.portfolio_id,
+        g.instrument_id,
+        g.day                        AS tick_ts,
+        s.snapshot                   AS snap
+    FROM grid g
+    LEFT JOIN snapshot_at_day s
+        ON  s.portfolio_id = g.portfolio_id
+        AND s.day          = g.day
+),
+prices_keyed AS (
+    -- Daily close keyed for an instrument-selective ASOF on day >= price_day.
+    SELECT portfolio_id, instrument_id, price_ts::date AS price_day, price
+    FROM prices
+),
+option_daily AS (
+    -- Last option close per (portfolio, instrument, day) for the option ASOF.
+    SELECT portfolio_id, instrument_id, price_day, close
+    FROM (
+        SELECT portfolio_id, instrument_id,
+               price_ts::date AS price_day, close,
+               row_number() OVER (
+                   PARTITION BY portfolio_id, instrument_id, price_ts::date
+                   ORDER BY price_ts DESC
+               ) AS rn
+        FROM option_marks
+    ) t
+    WHERE rn = 1
 ),
 unpacked AS (
     SELECT
@@ -85,7 +125,7 @@ unpacked AS (
         (ep ->> 'realized_equity_avg_base')::DOUBLE PRECISION     AS realized_equity_avg_base,
         (ep ->> 'realized_forex_fifo_base')::DOUBLE PRECISION     AS realized_forex_fifo_base,
         (ep ->> 'realized_forex_avg_base')::DOUBLE PRECISION      AS realized_forex_avg_base
-    FROM held_at_tick h,
+    FROM held_at_day h,
          jsonb_array_elements(h.snap -> 'equity_positions') AS t(ep)
     WHERE ep ->> 'instrument_id' = h.instrument_id
       AND (ep ->> 'quantity')::DOUBLE PRECISION > 0
@@ -105,7 +145,7 @@ SELECT
     with_state.scope_id,
     with_state.instrument_id,
     with_state.kind,
-    with_state.tick_ts                                AS event_ts,
+    with_state.tick_ts::timestamptz                   AS event_ts,
     with_state.quantity,
     with_state.direction,
     with_state.currency,
@@ -163,15 +203,15 @@ SELECT
            - with_state.avg_cost_avg_base)
         * with_state.contract_multiplier              AS unrealized_forex_avg_base
 FROM with_state
-ASOF LEFT JOIN prices px
+ASOF LEFT JOIN prices_keyed px
     ON  px.portfolio_id  = with_state.scope_id
     AND px.instrument_id = with_state.instrument_id
-    AND with_state.tick_ts >= px.price_ts
-ASOF LEFT JOIN option_marks om
+    AND with_state.tick_ts >= px.price_day
+ASOF LEFT JOIN option_daily om
     ON  om.portfolio_id  = with_state.scope_id
     AND om.instrument_id = with_state.instrument_id
-    AND with_state.tick_ts >= om.price_ts
-ASOF LEFT JOIN fx_rates fx
+    AND with_state.tick_ts >= om.price_day
+LEFT JOIN fx_filled fx
     ON  fx.from_ccy = with_state.currency
     AND fx.to_ccy   = with_state.base_currency
-    AND with_state.tick_ts >= fx.ts;
+    AND fx.day      = with_state.tick_ts;
